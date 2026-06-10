@@ -1,0 +1,17 @@
+[
+  "chatgpt.com",
+  "*.chatgpt.com",
+  "openai.com",
+  "*.openai.com",
+  "claude.ai",
+  "*.claude.ai",
+  "anthropic.com",
+  "*.anthropic.com",
+  "poe.com",
+  "*.poe.com",
+  "openrouter.ai",
+  "*.openrouter.ai",
+  "perplexity.ai",
+  "*.perplexity.ai",
+  "notebooklm.google.com"
+]

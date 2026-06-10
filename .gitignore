@@ -1,0 +1,18 @@
+generated/*
+!generated/.gitkeep
+
+# Release artifacts built by scripts/package.sh
+/dist/
+
+*.backup.*
+*.tmp
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.DS_Store

@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      # actions/setup-python v6.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches VERSION
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          file_version="$(cat VERSION)"
+          if [ "$tag" != "v$file_version" ]; then
+            echo "::error::Tag $tag does not match VERSION (expected v$file_version). Bump VERSION and __version__ first." >&2
+            exit 1
+          fi
+          echo "Releasing $tag"
+
+      - name: Build and verify artifacts
+        run: |
+          ./scripts/package.sh --check
+
+      - name: Attest release artifacts
+        # actions/attest v4.1.0
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          python3 scripts/changelog_release_notes.py "${GITHUB_REF_NAME}" > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG section for ${GITHUB_REF_NAME} is empty." >&2
+            exit 1
+          fi
+          echo "----- release notes -----"
+          cat release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md

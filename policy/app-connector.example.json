@@ -1,0 +1,75 @@
+{
+  "tagOwners": {
+    "tag:ai-egress-jp": [
+      "autogroup:admin"
+    ]
+  },
+  "autoApprovers": {
+    "routes": {
+      "0.0.0.0/0": [
+        "tag:ai-egress-jp"
+      ],
+      "::/0": [
+        "tag:ai-egress-jp"
+      ]
+    }
+  },
+  "grants": [
+    {
+      "src": [
+        "autogroup:member"
+      ],
+      "dst": [
+        "autogroup:internet"
+      ],
+      "ip": [
+        "*"
+      ]
+    },
+    {
+      "src": [
+        "autogroup:member"
+      ],
+      "dst": [
+        "tag:ai-egress-jp"
+      ],
+      "ip": [
+        "tcp:53",
+        "udp:53"
+      ]
+    }
+  ],
+  "nodeAttrs": [
+    {
+      "target": [
+        "*"
+      ],
+      "app": {
+        "tailscale.com/app-connectors": [
+          {
+            "name": "AI-Egress-JP",
+            "connectors": [
+              "tag:ai-egress-jp"
+            ],
+            "domains": [
+              "chatgpt.com",
+              "*.chatgpt.com",
+              "openai.com",
+              "*.openai.com",
+              "claude.ai",
+              "*.claude.ai",
+              "anthropic.com",
+              "*.anthropic.com",
+              "poe.com",
+              "*.poe.com",
+              "openrouter.ai",
+              "*.openrouter.ai",
+              "perplexity.ai",
+              "*.perplexity.ai"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

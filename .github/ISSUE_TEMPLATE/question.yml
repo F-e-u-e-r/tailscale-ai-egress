@@ -1,0 +1,27 @@
+name: Question / how-to
+description: Ask whether something is expected or how to do it.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Many questions are answered in
+        [docs/Troubleshooting.md](https://github.com/F-e-u-e-r/tailscale-ai-egress/blob/main/docs/Troubleshooting.md) and
+        [SUPPORT.md](https://github.com/F-e-u-e-r/tailscale-ai-egress/blob/main/SUPPORT.md). Please skim those first.
+        Do not paste secrets.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: |
+        What have you tried? If routing behaves unexpectedly, attach
+        `./check-client-routes.sh --json` and/or `./diagnose.sh --json`.
+      render: json
+    validations:
+      required: false

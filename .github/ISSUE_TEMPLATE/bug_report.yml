@@ -1,0 +1,84 @@
+name: Bug report
+description: Report something that does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do **not** include secrets: auth keys
+        (`tskey-auth-...`), API tokens (`tskey-api-...`), or OAuth client
+        secrets. The diagnostics already redact known token patterns, but
+        double-check before pasting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      placeholder: |
+        1. ./bootstrap.sh --domain-pack minimal
+        2. ./check-client-routes.sh
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics output
+      description: |
+        Paste `./diagnose.sh --json` (VPS host) and/or
+        `./check-client-routes.sh --json` (client). This is the single most
+        useful thing for triage.
+      render: json
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Toolkit version
+      description: Output of `./bootstrap.sh --version` (or any entrypoint `--version`).
+      placeholder: tailscale-ai-egress bootstrap.sh 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: tailscale-version
+    attributes:
+      label: Tailscale version
+      description: Output of `tailscale version` (first line).
+    validations:
+      required: false
+  - type: dropdown
+    id: role
+    attributes:
+      label: Where did this happen?
+      options:
+        - VPS connector host
+        - Client device
+        - Both
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and provider
+      description: e.g. "AWS Lightsail Ubuntu 24.04 LTS" or "macOS 15, App Store client".
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - App Connector only
+        - Connector failover (same region)
+        - Exit-node fallback
+        - Advanced policy automation
+        - Not sure
+    validations:
+      required: true

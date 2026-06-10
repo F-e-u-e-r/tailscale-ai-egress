@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest an improvement within the project's scope.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please skim [docs/Stability.md](https://github.com/F-e-u-e-r/tailscale-ai-egress/blob/main/docs/Stability.md)
+        and the out-of-scope list in [CONTRIBUTING.md](https://github.com/F-e-u-e-r/tailscale-ai-egress/blob/main/CONTRIBUTING.md).
+        The 1.x surface is intentionally frozen, and some categories (GUI,
+        telemetry, extra proxy protocols, automatic VPS purchasing) are
+        deliberately excluded.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see? CLI flags, behavior, or docs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This does not require a GUI, telemetry, a project-operated server, an extra proxy protocol, or automatic VPS purchasing.
+          required: true
+        - label: This does not break the frozen 1.x CLI surface, plan manifest schema major version, or domain pack names.
+          required: true
