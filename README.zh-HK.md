@@ -4,6 +4,8 @@
 
 > `README.md` 是最新內容的主要來源。本中文文件使用香港繁體中文；台灣讀者可能會見到少量用語差異，例如「網絡」和「網路」。
 
+> **Stable v1.x.** 1.0 的 command surface 已凍結，詳見 [docs/Stability.md](docs/Stability.md)；v1.1 新增 opt-in failover 與 health-monitoring helpers（`failover-exit-node.sh`、`monitor-connectors.sh`），不會改變原有 command surface。所有 entrypoint 都支援 `--version` 和 `--help`。
+
 這個 repo 會幫你建立一台個人用 Tailscale App Connector，將指定 AI 相關 domains 經一台 VPS 的固定出口 IP 連出去，同時讓一般網絡流量繼續使用本地網絡或你慣用的 exit node。
 
 ## 預設路徑
@@ -68,6 +70,8 @@ flowchart LR
 | 只把指定 AI domains 經一台 VPS（預設） | **App Connector** | `./bootstrap.sh`，然後貼上產生的 snippet（Manual Guided Mode） |
 | 同一地區內，其中一台 VPS 離線時仍保持 AI egress | **同區 connector failover** | 用相同 `CONNECTOR_TAG` bootstrap 第二台 VPS；見 [docs/Failover.md](docs/Failover.md) |
 | 臨時把所有流量都經 VPS（僅緊急用） | **Exit-node fallback** | `./enable-exit-node.sh`；之後用 `./disable-exit-node.sh` 停用 |
+| 主 exit node 離線時自動切換到備援 | **Exit-node failover（v1.1）** | `./failover-exit-node.sh --watch --apply`；見 [docs/Failover.md](docs/Failover.md) |
+| 監察一對主／備 connector（online 與可達性） | **Connector HA monitor（v1.1）** | `./monitor-connectors.sh --once`；見 [docs/Failover.md](docs/Failover.md) |
 | 讓 installer 經 API 直接改你的 tailnet policy，而不是手動貼上 | **Advanced Admin Automation** | 在 Advanced Mode prompt opt in，或執行 `policy_tool.py plan` 再 `apply-plan` |
 
 Manual Guided Mode 是建議的 policy 設定路徑。Advanced Admin Automation 只在你明確 opt in 時啟用，而且永遠預設為「否」，即使已有 API credential。1.x 凍結了甚麼見 [docs/Stability.md](docs/Stability.md)。

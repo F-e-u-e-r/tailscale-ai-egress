@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
+VERSION="${VERSION:-1.1.0}"
+
+HEALTH="$ROOT_DIR/scripts/health_check.py"
+
+# Config precedence: explicit environment > generated/failover.env > default.
+GENERATED_DIR="${GENERATED_DIR:-$ROOT_DIR/generated}"
+FAILOVER_ENV="${FAILOVER_ENV:-$GENERATED_DIR/failover.env}"
+PRIMARY_CONNECTOR="${PRIMARY_CONNECTOR:-}"
+FALLBACK_CONNECTOR="${FALLBACK_CONNECTOR:-}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-}"
+PING_TIMEOUT="${PING_TIMEOUT:-}"
+REQUIRE_ROUTES="${REQUIRE_ROUTES:-}"
+
+WATCH=0
+JSON=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./monitor-connectors.sh [--once|--watch] [--json]
+
+Read-only health monitor for an App Connector high-availability pair. Tailscale
+itself performs connector failover (oldest connector = primary, oldest-first,
+all plans). This tool only OBSERVES: it never switches anything.
+
+It reports, for the primary and fallback connector, online + tailnet
+reachability, and -- only if a Tailscale API token is configured -- the
+device.created ordering (to confirm the intended primary is the oldest). With
+no token it prints "ordering=unavailable" and still runs the health checks.
+
+Exit status: 0 if both connectors are online and reachable, 1 if degraded.
+
+Options:
+  --once       Run a single check (default). Useful from cron for alerting.
+  --watch      Loop forever, checking every CHECK_INTERVAL seconds.
+  --json       Emit a JSON report instead of text.
+  --version    Print the tailscale-ai-egress version and exit.
+  -h, --help   Show this help.
+
+Configuration (environment or generated/failover.env):
+  PRIMARY_CONNECTOR, FALLBACK_CONNECTOR   connector hostname / MagicDNS / IP
+  CHECK_INTERVAL (30)   PING_TIMEOUT (5)   REQUIRE_ROUTES (1)
+  TAILSCALE_API_KEY (optional)            enables device.created ordering
+EOF
+}
+
+usage_error() {
+  printf 'error: %s\n' "$*" >&2
+  usage >&2
+  exit 2
+}
+
+show_version() {
+  printf 'tailscale-ai-egress monitor-connectors.sh %s\n' "$VERSION"
+}
+
+note() { printf '%s\n' "$*"; }
+die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+read_failover_env() {
+  [ -n "$FAILOVER_ENV" ] && [ -r "$FAILOVER_ENV" ] || return 0
+  local key value
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      ''|\#*) continue ;;
+    esac
+    value="${value%$'\r'}"
+    case "$value" in
+      '"'*'"') value="${value#\"}"; value="${value%\"}" ;;
+      *) value="${value%%[[:space:]]\#*}" ;;
+    esac
+    while [ "${value%[[:space:]]}" != "$value" ]; do value="${value%[[:space:]]}"; done
+    case "$key" in
+      PRIMARY_CONNECTOR) [ -n "$PRIMARY_CONNECTOR" ] || PRIMARY_CONNECTOR="$value" ;;
+      FALLBACK_CONNECTOR) [ -n "$FALLBACK_CONNECTOR" ] || FALLBACK_CONNECTOR="$value" ;;
+      CHECK_INTERVAL) [ -n "$CHECK_INTERVAL" ] || CHECK_INTERVAL="$value" ;;
+      PING_TIMEOUT) [ -n "$PING_TIMEOUT" ] || PING_TIMEOUT="$value" ;;
+      REQUIRE_ROUTES) [ -n "$REQUIRE_ROUTES" ] || REQUIRE_ROUTES="$value" ;;
+    esac
+  done < "$FAILOVER_ENV"
+}
+
+apply_defaults() {
+  CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
+  PING_TIMEOUT="${PING_TIMEOUT:-5}"
+  REQUIRE_ROUTES="${REQUIRE_ROUTES:-1}"
+}
+
+# Upper bound for the seconds-valued config so an absurd CHECK_INTERVAL cannot
+# reach `sleep` and spin the watcher.
+MAX_SLEEP_SECONDS=86400  # 1 day
+
+# Rejects empty, a bare/leading/trailing dot, non-numeric characters, and
+# multiple dots (so ".", ".5", "5.", "nan", "inf", "1e3" are all rejected), plus
+# 0/negatives and values above MAX_SLEEP_SECONDS. The Python health engine
+# re-validates the values it receives.
+require_pos_number() {
+  case "$2" in
+    ''|.*|*.|*[!0-9.]*|*.*.*) die "$1 must be a positive number (got: '$2')" ;;
+  esac
+  awk -v v="$2" 'BEGIN { exit (v + 0 > 0) ? 0 : 1 }' || die "$1 must be greater than 0 (got: '$2')"
+  awk -v v="$2" -v max="$MAX_SLEEP_SECONDS" 'BEGIN { exit (v + 0 <= max) ? 0 : 1 }' \
+    || die "$1 must be at most $MAX_SLEEP_SECONDS seconds (got: '$2')"
+}
+
+require_bool() {
+  case "$2" in
+    0|1) ;;
+    *) die "$1 must be 0 or 1 (got: '$2')" ;;
+  esac
+}
+
+validate_config() {
+  require_pos_number CHECK_INTERVAL "$CHECK_INTERVAL"
+  require_pos_number PING_TIMEOUT "$PING_TIMEOUT"
+  require_bool REQUIRE_ROUTES "$REQUIRE_ROUTES"
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --once) shift ;;
+      --watch) WATCH=1; shift ;;
+      --json) JSON=1; shift ;;
+      --version) show_version; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage_error "unknown argument: $1" ;;
+    esac
+  done
+}
+
+preflight() {
+  have python3 || die "python3 is required to run the health engine."
+  have tailscale || die "Tailscale CLI is not installed or not on PATH."
+  [ -f "$HEALTH" ] || die "missing health engine: $HEALTH"
+  [ -n "$PRIMARY_CONNECTOR" ] || die "PRIMARY_CONNECTOR is not set (configure $FAILOVER_ENV or the environment)."
+  [ -n "$FALLBACK_CONNECTOR" ] || die "FALLBACK_CONNECTOR is not set (configure $FAILOVER_ENV or the environment)."
+}
+
+run_check() {
+  local args
+  args=(
+    connectors
+    --primary "$PRIMARY_CONNECTOR"
+    --fallback "$FALLBACK_CONNECTOR"
+    --ping-timeout "$PING_TIMEOUT"
+    --require-routes "$REQUIRE_ROUTES"
+  )
+  if [ "$JSON" = "1" ]; then
+    args+=(--json)
+  fi
+  python3 "$HEALTH" "${args[@]}"
+}
+
+main() {
+  parse_args "$@"
+  read_failover_env
+  apply_defaults
+  validate_config
+  preflight
+  if [ "$WATCH" = "1" ]; then
+    note "[watch] connector monitor started (interval=${CHECK_INTERVAL}s)"
+    while true; do
+      run_check || true
+      sleep "$CHECK_INTERVAL" || die "sleep for CHECK_INTERVAL='$CHECK_INTERVAL' failed; refusing to busy-loop"
+    done
+  else
+    run_check
+  fi
+}
+
+main "$@"

@@ -1,0 +1,24 @@
+# Tailscale AI Egress — connector high-availability monitor (Linux/systemd)
+#
+# Install:
+#   sudo cp docs/examples/systemd/monitor-connectors.service /etc/systemd/system/
+#   # edit User=, WorkingDirectory=, EnvironmentFile=, ExecStart= paths below
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now monitor-connectors.service
+
+[Unit]
+Description=Tailscale AI Egress connector HA monitor (read-only)
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/opt/tailscale-ai-egress
+EnvironmentFile=-/opt/tailscale-ai-egress/generated/failover.env
+ExecStart=/opt/tailscale-ai-egress/monitor-connectors.sh --watch
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

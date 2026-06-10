@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tailscale AI Egress - exit-node failover controller (macOS/launchd)
+
+  Install (per-user):
+    cp docs/examples/launchd/com.tailscale-ai-egress.failover-exit-node.plist \
+       ~/Library/LaunchAgents/
+    # edit the paths below to match your checkout
+    launchctl load ~/Library/LaunchAgents/com.tailscale-ai-egress.failover-exit-node.plist
+
+  The script reads generated/failover.env itself, so no EnvironmentFile is needed.
+  On macOS, `tailscale set --exit-node` does not require root.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tailscale-ai-egress.failover-exit-node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/tailscale-ai-egress/failover-exit-node.sh</string>
+    <string>--watch</string>
+    <string>--apply</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/you/tailscale-ai-egress</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/tailscale-ai-egress-failover.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/tailscale-ai-egress-failover.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

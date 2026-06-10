@@ -33,13 +33,13 @@ jobs:
 
       - name: Check shell syntax
         run: |
-          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh; do
+          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh; do
             bash -n "$file"
           done
 
       - name: Lint shell scripts
         run: |
-          shellcheck bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh
+          shellcheck bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh
 
       - name: Lint and type-check Python
         run: |

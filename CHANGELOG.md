@@ -7,12 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Version numbers refer to the toolkit as a whole. The single source of truth is
 the [`VERSION`](VERSION) file, mirrored by `__version__` in
-[`scripts/policy_tool.py`](scripts/policy_tool.py). Every shell entrypoint and
-`policy_tool.py` reports it with `--version`.
+[`scripts/policy_tool.py`](scripts/policy_tool.py) and
+[`scripts/health_check.py`](scripts/health_check.py). Every shell entrypoint and
+both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
 No changes yet.
+
+## [1.1.0] - 2026-06-10
+
+Adds optional, opt-in high-availability tooling: a ping-driven exit-node
+failover controller and a connector high-availability monitor. The 1.0 command
+surface is unchanged; everything here is additive and off by default.
+
+### Added
+
+- `scripts/health_check.py`: a standard-library health/ping engine with `probe`
+  (tailnet ping plus an optional short-timeout HTTP egress check), `verdict`
+  (stateful primary/fallback decision with hysteresis, cooldown, and a
+  fallback-verified decision matrix), `record-switch`, `active-role`, and
+  `connectors` subcommands.
+- `failover-exit-node.sh`: client-side (macOS + Linux) exit-node failover
+  controller. Observe-first; it mutates `tailscale set --exit-node` only with
+  `--apply`, behind a controller-level lock, with live-state reconciliation and
+  a post-switch readback. `RESTORE_PRIMARY=0/1` controls auto-switch-back.
+- `monitor-connectors.sh`: read-only App Connector high-availability monitor
+  (online plus reachability, and optional `device.created` ordering when an API
+  token is configured; it degrades gracefully without one and never switches).
+- `examples/failover.env.example` plus `docs/examples/` systemd, launchd, and
+  cron units for running the controller and monitor automatically.
+- Failover documentation: oldest-first native connector primary selection and
+  the new exit-node failover flow in [docs/Failover.md](docs/Failover.md).
+
+### Hardening
+
+- Strict, bounded configuration validation for `failover-exit-node.sh`,
+  `monitor-connectors.sh`, and `health_check.py`: non-numeric, out-of-range, or
+  absurdly large values (a bare `.`, `nan`/`inf`, and seconds values above the
+  `86400`-second/one-day cap) are rejected with a clear error before any probing
+  or switching. Environment-variable defaults are validated the same way as
+  command-line flags, and `TAILSCALE_STATUS_TIMEOUT` is bounded to `(0, 86400]`.
+- Fail-closed safety: a missing/malformed `BackendState` or any non-`Running`
+  backend is treated as "do not switch", including the post-switch readback, so a
+  stopped backend can no longer be recorded as a successful switch.
+- Robust controller lock and apply path: the lock holder is identified by process
+  start time so a recycled PID cannot make a stale lock block failover forever; a
+  failing interval/readback sleep refuses to busy-loop; and a state-persistence
+  failure after a switch is reported as a non-zero result, not a false success.
+
+### Notes
+
+- App Connector failover stays Tailscale-native (oldest connector = primary,
+  oldest-first, all plans); this release does not reassign connectors via the
+  policy API.
 
 ## [1.0.0] - 2026-06-08
 
@@ -130,5 +178,6 @@ are summarized from project history.
 - `bootstrap.sh` connector setup, `diagnose.sh`, `check-client-routes.sh`,
   `rollback.sh`, the common domain list, and Manual Guided Mode policy snippets.
 
-[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.0
 [1.0.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.0.0

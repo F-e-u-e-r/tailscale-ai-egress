@@ -14,9 +14,10 @@ git clean -ndx           # review what is untracked/ignored
 
 ## 2. Version bump
 
-- [ ] Update [`VERSION`](../VERSION) and `__version__` in
-      [`scripts/policy_tool.py`](../scripts/policy_tool.py) to the new version
-      (they must match; a unit test enforces it).
+- [ ] Update [`VERSION`](../VERSION) and `__version__` in both
+      [`scripts/policy_tool.py`](../scripts/policy_tool.py) and
+      [`scripts/health_check.py`](../scripts/health_check.py) to the new version
+      (they must match; unit tests enforce it).
 - [ ] Move the `## [Unreleased]` notes in [`CHANGELOG.md`](../CHANGELOG.md) into a
       new `## [X.Y.Z] - YYYY-MM-DD` section and update the compare/tag links.
 
@@ -25,7 +26,8 @@ git clean -ndx           # review what is untracked/ignored
 ```bash
 # Shell syntax
 for f in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
-         enable-exit-node.sh install.sh restore-connector.sh rollback.sh \
+         enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh \
+         install.sh restore-connector.sh rollback.sh \
          scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh \
          scripts/maintainer/apply-github-ruleset.sh; do
   bash -n "$f"
@@ -33,7 +35,8 @@ done
 
 # Shell lint
 shellcheck bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
-  enable-exit-node.sh install.sh restore-connector.sh rollback.sh \
+  enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh \
+         install.sh restore-connector.sh rollback.sh \
   scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh \
   scripts/maintainer/apply-github-ruleset.sh
 

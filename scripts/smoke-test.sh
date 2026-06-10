@@ -12,7 +12,8 @@ cd "$ROOT_DIR"
 PY="python3"
 TOOL="$PY scripts/policy_tool.py"
 ENTRYPOINTS=(bootstrap.sh check-client-routes.sh diagnose.sh enable-exit-node.sh
-  disable-exit-node.sh restore-connector.sh rollback.sh install.sh)
+  disable-exit-node.sh failover-exit-node.sh monitor-connectors.sh
+  restore-connector.sh rollback.sh install.sh)
 FAILS=0
 
 step() {

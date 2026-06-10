@@ -1,0 +1,7 @@
+# Tailscale AI Egress — cron examples (run `crontab -e` and add a line)
+#
+# Exit-node failover: evaluate and act every minute. Drop --apply to observe only.
+* * * * * cd /opt/tailscale-ai-egress && ./failover-exit-node.sh --once --apply >>/var/log/tailscale-ai-egress-failover.log 2>&1
+#
+# Connector HA monitor: check every 5 minutes (exit status 1 = degraded, for alerting).
+*/5 * * * * cd /opt/tailscale-ai-egress && ./monitor-connectors.sh --once >>/var/log/tailscale-ai-egress-monitor.log 2>&1

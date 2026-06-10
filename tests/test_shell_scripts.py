@@ -18,6 +18,8 @@ class ShellScriptTests(unittest.TestCase):
             "diagnose.sh",
             "disable-exit-node.sh",
             "enable-exit-node.sh",
+            "failover-exit-node.sh",
+            "monitor-connectors.sh",
             "install.sh",
             "restore-connector.sh",
             "rollback.sh",

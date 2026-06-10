@@ -4,7 +4,7 @@ Languages: English | [繁體中文（香港）](README.zh-HK.md)
 
 A small bootstrap toolkit for creating a personal Tailscale App Connector that routes selected AI-related domains through a chosen VPS egress IP, while keeping normal traffic on the user's local network or preferred exit node.
 
-> **Stable v1.0.** The command surface is frozen for the 1.x series — see [docs/Stability.md](docs/Stability.md). Every entrypoint supports `--version` and `--help`. Licensed under [MIT](LICENSE). New here? Jump to [Which Mode Should I Use?](#which-mode-should-i-use) and the [Quick Start](#quick-start).
+> **Stable v1.x.** The 1.0 command surface is frozen — see [docs/Stability.md](docs/Stability.md); v1.1 adds opt-in failover and health-monitoring helpers (`failover-exit-node.sh`, `monitor-connectors.sh`) without changing it. Every entrypoint supports `--version` and `--help`. Licensed under [MIT](LICENSE). New here? Jump to [Which Mode Should I Use?](#which-mode-should-i-use) and the [Quick Start](#quick-start).
 
 ## Default Path
 
@@ -68,6 +68,8 @@ Most people should start with the **App Connector default** and never change it.
 | Route only selected AI domains through one VPS (the default) | **App Connector** | `./bootstrap.sh`, then paste the generated snippet (Manual Guided Mode) |
 | Keep AI egress working if one VPS goes down, in the same region | **Same-region connector failover** | Bootstrap a second VPS with the same `CONNECTOR_TAG`; see [docs/Failover.md](docs/Failover.md) |
 | Temporarily send all traffic through the VPS (emergency only) | **Exit-node fallback** | `./enable-exit-node.sh`; stop later with `./disable-exit-node.sh` |
+| Automatically fail an exit node over to a backup when the primary goes down | **Exit-node failover (v1.1)** | `./failover-exit-node.sh --watch --apply`; see [docs/Failover.md](docs/Failover.md) |
+| Monitor a primary/fallback connector pair (online + reachability) | **Connector HA monitor (v1.1)** | `./monitor-connectors.sh --once`; see [docs/Failover.md](docs/Failover.md) |
 | Have the installer edit your tailnet policy through the API instead of pasting | **Advanced Admin Automation** | Opt in at the Advanced Mode prompt, or run `policy_tool.py plan` then `apply-plan` |
 
 Manual Guided Mode is the recommended path for policy setup. Advanced Admin Automation is opt-in only and always defaults to "no", even when API credentials are already present. See [docs/Stability.md](docs/Stability.md) for what is frozen in the 1.x series.

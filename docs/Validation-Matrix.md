@@ -59,9 +59,10 @@ the 1.0 validated set.
 | Mode | Coverage | Last validated | Notes |
 | --- | --- | --- | --- |
 | App Connector only | Automated (diagnose + client route) + Manual | _pending_ | Baseline domain expected to stay local |
-| Same-region connector failover | Manual | _pending_ | See [Failover.md](Failover.md) |
+| Same-region connector failover | Automated (monitor logic) + Manual | _pending_ | See [Failover.md](Failover.md) |
 | Exit-node fallback enabled | Automated (enable helper) + Manual | _pending_ | Baseline traffic expected via exit node |
 | Exit-node fallback disabled | Automated (disable helper) + Manual | _pending_ | Connector tag must remain present |
+| Exit-node primary/fallback failover | Automated (controller + health engine) + Manual | _pending_ | macOS/Linux controller; see [Failover.md](Failover.md) |
 | Advanced policy plan/apply/restore | Automated (mocked API) + Manual (one real dry-run credential) | _pending_ | See [Tailscale-API-mode.md](Tailscale-API-mode.md) |
 
 ## What CI already covers
@@ -75,6 +76,9 @@ These run on every push (no real infrastructure needed):
   across connector-only, exit-node, userspace-networking, and failure states on
   both macOS and Linux `uname` paths.
 - Exit-node enable/disable and connector-restore helpers via fake `tailscale`.
+- The failover health engine, controller locking and switching, live-state
+  reconciliation, fail-closed behavior, numeric configuration bounds, and
+  connector monitor via fake `tailscale`.
 - Credential-free smoke test, docs link check, packaging check, and syntax/lint
   coverage for the real-environment evidence collector.
 
@@ -82,6 +86,21 @@ The Manual rows above are what remains for a human to confirm on real hardware
 before tagging a release.
 
 ## Release validation log
+
+### v1.1.0 release candidate - 2026-06-10
+
+- Local platform: macOS, Python 3.11.
+- Passed shell syntax and `shellcheck` for all release-checklist scripts.
+- Passed 300 unit tests with `python3 -B -m unittest discover -s tests`.
+- Passed credential-free smoke tests, docs link checks, and
+  `scripts/package.sh --check`; both release archives passed checksum and
+  content verification.
+- Failover safety regressions cover unavailable or non-running Tailscale state,
+  ambiguous/recreated node identity, route authority, controller lock liveness,
+  bounded configuration, failed readback/state persistence, and observe-only
+  operation.
+- Live App Connector and exit-node failover runs remain **pending** because they
+  require real connector hosts, clients, and a live tailnet.
 
 ### v1.0.0 release candidate - 2026-06-08
 

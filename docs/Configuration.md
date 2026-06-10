@@ -59,6 +59,64 @@ set both `CONNECTOR_TAG` and `CONNECTOR_HOSTNAME`.
 explicit `CONNECTOR_TAG`, then `REGION`, then the identity file, then a unique
 matching status tag. Ambiguous or conflicting tags are rejected.
 
+## Failover and Health Monitoring (v1.1.0)
+
+`failover-exit-node.sh` and `monitor-connectors.sh` read their settings from the
+environment first, then `generated/failover.env`, then built-in defaults. Copy
+the example and edit it:
+
+```bash
+cp examples/failover.env.example generated/failover.env
+```
+
+```bash
+# Exit-node failover controller (failover-exit-node.sh)
+PRIMARY_EXIT_NODE=home-mac          # hostname / MagicDNS name / Tailscale IP
+FALLBACK_EXIT_NODE=ai-egress-us-01
+PROBE_TARGET=https://ipinfo.io      # egress probe URL (example; use your own if preferred)
+CHECK_INTERVAL=30                   # seconds between cycles in --watch mode
+FAIL_THRESHOLD=3                    # consecutive ping failures before a node is DOWN
+OK_THRESHOLD=3                      # consecutive successes before a node is UP
+COOLDOWN=60                         # seconds to wait after a switch before another
+PING_TIMEOUT=5                      # per-node `tailscale ping` timeout (seconds)
+PROBE_HTTP_TIMEOUT=5                # egress HTTP probe timeout (seconds)
+RESTORE_PRIMARY=1                   # 1 = switch back when primary recovers, 0 = stay on fallback
+ENSURE_PRIMARY=0                    # 1 = select primary when no exit node is selected yet
+READBACK_DELAY=1                    # seconds before the post-switch readback
+
+# Connector HA monitor (monitor-connectors.sh)
+PRIMARY_CONNECTOR=ai-egress-jp-web-01
+FALLBACK_CONNECTOR=ai-egress-jp-aws-01
+REQUIRE_ROUTES=1                    # 1 = degrade when neither connector advertises routes
+```
+
+All numeric settings are validated when the controller or monitor starts: an
+out-of-range or non-numeric value (including a bare `.`, `nan`/`inf`, or an
+absurdly large number) is rejected with a clear error before any probing or
+switching. The seconds-valued settings (`CHECK_INTERVAL`, `PING_TIMEOUT`,
+`PROBE_HTTP_TIMEOUT`, `COOLDOWN`, `READBACK_DELAY`) must be at most `86400`
+(one day) — `CHECK_INTERVAL`/`PING_TIMEOUT`/`PROBE_HTTP_TIMEOUT` must be `> 0`,
+while `COOLDOWN`/`READBACK_DELAY` also accept `0`. `FAIL_THRESHOLD` and
+`OK_THRESHOLD` are integers `>= 1`, and `RESTORE_PRIMARY`, `ENSURE_PRIMARY`, and
+`REQUIRE_ROUTES` are `0` or `1`. Running `health_check.py` directly applies the
+same validation to these values when read from the environment.
+
+Advanced tunables (rarely needed):
+
+```bash
+TAILSCALE_STATUS_TIMEOUT=15   # `tailscale status --json` timeout, seconds in (0, 86400]; out-of-range falls back to 15
+LOCK_WAIT=30                  # seconds to wait for the controller lock before giving up (non-negative integer)
+LOCK_DIR=generated/failover.lock.d   # controller lock directory
+```
+
+The controller is observe-first: it only runs `tailscale set --exit-node` when
+you pass `--apply`. Run state lives in `generated/failover-state.json` (guarded
+by `generated/failover.lock.d`); both stay local and are never committed. The
+optional `device.created` ordering check in `monitor-connectors.sh` uses
+`TAILSCALE_API_KEY` when present and otherwise reports `ordering=unavailable`
+without failing. See [Failover](Failover.md) for the full workflow and the
+`docs/examples/` directory for systemd, launchd, and cron units.
+
 ## Recommended Auth Key Settings
 
 When the installer asks for `Tailscale node auth key`, use a pre-authentication auth key from the Tailscale Admin Console Keys page. It should start with `tskey-auth-...`. Do not paste a `tskey-api-...` API token here; API tokens are only for Admin Console policy updates.

@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import unittest
@@ -17,6 +18,8 @@ ENTRYPOINTS = [
     "diagnose.sh",
     "disable-exit-node.sh",
     "enable-exit-node.sh",
+    "failover-exit-node.sh",
+    "monitor-connectors.sh",
     "install.sh",
     "restore-connector.sh",
     "rollback.sh",
@@ -74,6 +77,14 @@ class VersionConsistencyTests(unittest.TestCase):
             with self.subTest(script=script):
                 text = (ROOT / script).read_text(encoding="utf-8")
                 self.assertIn(expected, text)
+
+    def test_shell_entrypoints_are_executable(self):
+        for script in ENTRYPOINTS:
+            with self.subTest(script=script):
+                self.assertTrue(
+                    os.access(ROOT / script, os.X_OK),
+                    f"{script} lacks the executable bit (chmod +x / git update-index --chmod=+x)",
+                )
 
 
 class StabilityFreezeTests(unittest.TestCase):

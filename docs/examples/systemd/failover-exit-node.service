@@ -1,0 +1,28 @@
+# Tailscale AI Egress — exit-node failover controller (Linux/systemd)
+#
+# Install:
+#   sudo cp docs/examples/systemd/failover-exit-node.service /etc/systemd/system/
+#   # edit User=, WorkingDirectory=, EnvironmentFile=, ExecStart= paths below
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now failover-exit-node.service
+
+[Unit]
+Description=Tailscale AI Egress exit-node failover controller
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Exit-node selection is node-global. Run as a user allowed to change Tailscale
+# without sudo: once, run `sudo tailscale set --operator=youruser`, and keep
+# AI_EGRESS_USE_SUDO=0 below. (Alternatively use User=root and drop that line.)
+User=youruser
+Environment=AI_EGRESS_USE_SUDO=0
+WorkingDirectory=/opt/tailscale-ai-egress
+EnvironmentFile=-/opt/tailscale-ai-egress/generated/failover.env
+ExecStart=/opt/tailscale-ai-egress/failover-exit-node.sh --watch --apply
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

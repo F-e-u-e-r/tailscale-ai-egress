@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.1.0}"
 PREFIX="tailscale-ai-egress-$VERSION"
 
 OUT_DIR="$ROOT_DIR/dist"
@@ -122,8 +122,10 @@ if [ "$CHECK" = "1" ]; then
   tar -xzf "$OUT_DIR/$PREFIX.tar.gz" -C "$verify_dir"
   required=(VERSION LICENSE README.md SECURITY.md PRIVACY.md CHANGELOG.md
     bootstrap.sh check-client-routes.sh diagnose.sh enable-exit-node.sh
-    disable-exit-node.sh restore-connector.sh rollback.sh install.sh
+    disable-exit-node.sh failover-exit-node.sh monitor-connectors.sh
+    restore-connector.sh rollback.sh install.sh
     policy/default-ai-domains.json scripts/policy_tool.py
+    scripts/health_check.py examples/failover.env.example
     scripts/validation-e2e.sh)
   missing=""
   for req in "${required[@]}"; do
