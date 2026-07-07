@@ -1,10 +1,17 @@
 import os
 import hashlib
 import json
+import select
+import signal
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+try:
+    import pty
+except ImportError:  # pragma: no cover - non-Unix platforms
+    pty = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -549,6 +556,110 @@ exit 0
             )
 
         self.assertIn("tailscale up --reset --hostname=ai-egress-jp-01", result.stdout)
+
+    def test_bootstrap_noninteractive_hostname_prefix_is_not_treated_as_same(self):
+        # A different host whose name merely contains the configured hostname must
+        # NOT be matched as "same host". Exact whitespace-field matching rejects
+        # both a trailing-digit case (ai-egress-jp-011, which a bare substring
+        # match would wrongly accept) and a hyphen-prefixed case
+        # (foo-ai-egress-jp-01, which a `grep -qwF` word match would wrongly
+        # accept). Both must be treated as configured differently.
+        for other_host in ("ai-egress-jp-011", "foo-ai-egress-jp-01"):
+            with self.subTest(other_host=other_host):
+                with tempfile.TemporaryDirectory() as tmp:
+                    env = self._bootstrap_dry_run_env(
+                        tmp, self_status=f"100.64.0.2 {other_host} tag:ai-egress-jp"
+                    )
+                    env["GENERATED_DIR"] = tmp
+                    result = subprocess.run(
+                        ["bash", str(ROOT / "bootstrap.sh"), "--dry-run", "--domain-pack", "common"],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("configured differently", result.stderr)
+
+    def test_dev_tty_prompt_helpers_print_prompt_before_read(self):
+        # Regression guard for the /dev/tty fallback: it must print the prompt to
+        # the tty explicitly, not rely on `read -p ... </dev/tty` whose prompt
+        # (written to stderr) is swallowed when stdin is piped.
+        for name in ("bootstrap.sh", "enable-exit-node.sh", "restore-connector.sh"):
+            with self.subTest(script=name):
+                text = (ROOT / name).read_text(encoding="utf-8")
+                self.assertNotIn('read -r -p "$prompt" answer </dev/tty', text)
+                self.assertNotIn('read -r -s -p "$prompt" answer </dev/tty', text)
+                self.assertIn("printf '%s' \"$prompt\" >/dev/tty", text)
+
+    @unittest.skipUnless(pty is not None, "pty is unavailable on this platform")
+    def test_read_line_prompt_visible_when_stdin_piped_but_tty_available(self):
+        # End-to-end: source the real bootstrap.sh under a pseudo-terminal, call
+        # read_line with stdin redirected from /dev/null (not a tty) while a
+        # controlling tty exists. The prompt must reach the tty and the typed
+        # answer must be captured. The pre-fix code swallowed the prompt.
+        script = (
+            f'source "{ROOT / "bootstrap.sh"}"\n'
+            'answer="$(read_line "PROMPT_MARKER> " </dev/null)"\n'
+            'printf "CAPTURED[%s]\\n" "$answer" >/dev/tty\n'
+        )
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - child process
+            os.execvp("bash", ["bash", "-c", script])
+            os._exit(127)
+
+        output = b""
+        try:
+            os.write(fd, b"typed-answer\n")
+            while True:
+                try:
+                    ready, _, _ = select.select([fd], [], [], 10)
+                except OSError:
+                    break
+                if not ready:
+                    break
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                output += data
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            os.close(fd)
+
+        text = output.decode(errors="replace")
+        self.assertIn("PROMPT_MARKER>", text)
+        self.assertIn("CAPTURED[typed-answer]", text)
+
+    def test_monitor_usage_marks_api_key_environment_only(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "monitor-connectors.sh"), "--help"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Environment only", result.stdout)
+        self.assertIn("TAILSCALE_API_KEY", result.stdout)
+
+    def test_install_local_checkout_announces_itself(self):
+        # From a checkout, install.sh must announce that it runs the local
+        # bootstrap.sh instead of doing it silently.
+        result = subprocess.run(
+            ["bash", str(ROOT / "install.sh"), "--help"],
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+        )
+        self.assertIn("executing local checkout", result.stderr)
 
     def _helper_env(self, tmp, *, status_json=None, connector_set_supported=True, status_after_mutation=None):
         fake_bin = Path(tmp) / "bin"

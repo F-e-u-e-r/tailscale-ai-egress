@@ -3,7 +3,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 
 HEALTH="$ROOT_DIR/scripts/health_check.py"
 
@@ -44,7 +44,12 @@ Options:
 Configuration (environment or generated/failover.env):
   PRIMARY_CONNECTOR, FALLBACK_CONNECTOR   connector hostname / MagicDNS / IP
   CHECK_INTERVAL (30)   PING_TIMEOUT (5)   REQUIRE_ROUTES (1)
+
+Environment only (NOT read from generated/failover.env):
   TAILSCALE_API_KEY (optional)            enables device.created ordering
+                                          Export it in the environment (e.g. via
+                                          systemd EnvironmentFile=); this script
+                                          does not parse it from failover.env.
 EOF
 }
 

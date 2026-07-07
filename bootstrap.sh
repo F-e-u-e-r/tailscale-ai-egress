@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 
 REGION="${REGION:-}"
 REGION_UPPER=""
@@ -202,7 +202,11 @@ read_line() {
   if [ -t 0 ]; then
     read -r -p "$prompt" answer
   elif ( : </dev/tty ) 2>/dev/null; then
-    if ! read -r -p "$prompt" answer </dev/tty 2>/dev/null; then
+    # `read -p` writes the prompt to stderr; when stdin is not a tty we redirect
+    # from /dev/tty, so print the prompt to /dev/tty explicitly (mirrors
+    # rollback.sh) instead of relying on -p, which would be swallowed here.
+    printf '%s' "$prompt" >/dev/tty
+    if ! read -r answer </dev/tty; then
       return 1
     fi
   else
@@ -218,7 +222,8 @@ read_secret() {
     read -r -s -p "$prompt" answer
     printf '\n' >&2
   elif ( : </dev/tty ) 2>/dev/null; then
-    if ! read -r -s -p "$prompt" answer </dev/tty 2>/dev/null; then
+    printf '%s' "$prompt" >/dev/tty
+    if ! read -r -s answer </dev/tty; then
       return 1
     fi
     printf '\n' >/dev/tty 2>/dev/null || true
@@ -754,7 +759,7 @@ tailscale_up_connector() {
 
   if [ -n "$self_status" ]; then
     if printf '%s
-' "$self_status" | grep -qF "$CONNECTOR_HOSTNAME"; then
+' "$self_status" | awk -v h="$CONNECTOR_HOSTNAME" '{ for (i = 1; i <= NF; i++) if ($i == h) found = 1 } END { exit found ? 0 : 1 }'; then
       if [ "${BOOTSTRAP_RESET_ACK:-0}" = "1" ]; then
         note "BOOTSTRAP_RESET_ACK=1 set; re-running tailscale up --reset for $CONNECTOR_HOSTNAME."
         needs_reset=1

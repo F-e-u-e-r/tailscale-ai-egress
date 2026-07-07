@@ -31,7 +31,7 @@ from typing import Any
 
 
 API_BASE = "https://api.tailscale.com/api/v2"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 # Frozen for the v1.x series. Plan bundles produced by v0.4 use the same major
 # version and remain readable by v1.x tooling; see docs/Stability.md.
 MANIFEST_SCHEMA_VERSION = 1
@@ -1060,6 +1060,10 @@ def write_text_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
         tmp.write_text(text, encoding="utf-8")
+        # The sole caller writes the plan manifest, which carries policy detail.
+        # Set 0600 on the temp before the atomic replace so a later status
+        # rewrite cannot widen the manifest back to the process umask.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError as exc:
         try:
@@ -1086,15 +1090,19 @@ def update_manifest_status(plan_dir: Path, manifest: dict[str, Any], status: str
 
 
 def write_plan_directory(final_dir: Path, files: dict[str, str]) -> Path:
+    # Plan bundles contain the full tailnet policy; keep them private (0700 dir,
+    # 0600 files) rather than at the process umask on shared hosts.
     tmp_dir = final_dir.parent / f".tmp.{final_dir.name}.{os.getpid()}.{secrets.token_hex(4)}"
     try:
         final_dir.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir.mkdir()
+        os.chmod(tmp_dir, 0o700)
         for name, content in files.items():
             target = tmp_dir / name
             if target.parent != tmp_dir:
                 raise PolicyError(f"Invalid plan artifact path: {name}")
             target.write_text(content, encoding="utf-8")
+            os.chmod(target, 0o600)
         os.replace(tmp_dir, final_dir)
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1116,10 +1124,14 @@ def diff_summary(diff_text: str) -> dict[str, int]:
 
 
 def write_backup(backup_dir: Path, text: str) -> Path:
+    # The backup holds the full tailnet policy; keep the directory and file
+    # private (0700/0600) rather than at the process umask on shared hosts.
     backup_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(backup_dir, 0o700)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = backup_dir / f"tailnet-policy.backup.{stamp}.hujson"
     path.write_text(text, encoding="utf-8")
+    os.chmod(path, 0o600)
     return path
 
 

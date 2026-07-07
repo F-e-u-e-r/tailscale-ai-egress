@@ -65,7 +65,8 @@
               "openrouter.ai",
               "*.openrouter.ai",
               "perplexity.ai",
-              "*.perplexity.ai"
+              "*.perplexity.ai",
+              "notebooklm.google.com"
             ]
           }
         ]
