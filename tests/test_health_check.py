@@ -734,6 +734,34 @@ class ConnectorOrderingUnitTests(unittest.TestCase):
         node_id, ips = hc.resolve_identity(status, "primary-vps")
         self.assertEqual(hc.node_routes(status, node_id, ips), [])
 
+    def test_fetch_devices_encodes_tailnet_in_url(self):
+        # A tailnet name with reserved characters must be percent-encoded into a
+        # single path segment, never allowed to rewrite the request path.
+        captured = {}
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"devices": []}'
+
+        def _fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return _FakeResp()
+
+        env = {"TAILSCALE_API_KEY": "tskey-api-example", "TAILSCALE_TAILNET": "ex/ample#tn?x"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(hc.urllib.request, "urlopen", side_effect=_fake_urlopen):
+                result = hc.fetch_devices_via_api()
+
+        self.assertEqual(result, [])
+        self.assertIn("/tailnet/ex%2Fample%23tn%3Fx/devices", captured["url"])
+        self.assertNotIn("ex/ample", captured["url"])
+
 
 class ConnectorsCliTests(unittest.TestCase):
     def setUp(self):

@@ -33,13 +33,14 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 # Kept in lock-step with the VERSION file (checked by tests/test_release_metadata.py).
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 STATE_SCHEMA_VERSION = 1
 
@@ -867,7 +868,11 @@ def fetch_devices_via_api() -> Optional[list[Any]]:  # pragma: no cover - networ
     if not token:
         return None
     tailnet = os.environ.get("TAILSCALE_TAILNET", "-")
-    url = f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/devices"
+    # Encode the tailnet in the path segment so reserved characters (/, #, ?) in
+    # the operator-supplied name cannot rewrite the request path; matches
+    # policy_tool.tailnet_path().
+    quoted_tailnet = urllib.parse.quote(tailnet, safe="")
+    url = f"https://api.tailscale.com/api/v2/tailnet/{quoted_tailnet}/devices"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:

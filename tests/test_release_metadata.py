@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -97,6 +98,18 @@ class StabilityFreezeTests(unittest.TestCase):
         ):
             with self.subTest(file_name=file_name):
                 self.assertTrue((ROOT / "policy" / file_name).is_file())
+
+    def test_example_app_connector_covers_default_ai_domains(self):
+        # The example policy must stay in sync with the default domain list so it
+        # does not drift (e.g. missing notebooklm.google.com).
+        default_domains = set(json.loads((ROOT / "policy" / "default-ai-domains.json").read_text(encoding="utf-8")))
+        example = json.loads((ROOT / "policy" / "app-connector.example.json").read_text(encoding="utf-8"))
+        example_domains: set = set()
+        for attr in example.get("nodeAttrs", []):
+            for connector in attr.get("app", {}).get("tailscale.com/app-connectors", []):
+                example_domains.update(connector.get("domains", []))
+        missing = default_domains - example_domains
+        self.assertEqual(missing, set(), f"app-connector.example.json is missing default domains: {sorted(missing)}")
 
 
 class ChangelogTests(unittest.TestCase):

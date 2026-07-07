@@ -257,6 +257,55 @@ class FailoverControllerTests(unittest.TestCase):
         self.assertIn("removing stale controller lock", result.stderr)
         self.assertFalse(self.lock_dir.exists())  # released after run
 
+    def test_stale_lock_reclaim_leaves_no_stale_residue(self):
+        # The stale-lock reclaim renames the directory to a private ".stale.$$"
+        # name before deleting it (atomic, so racing controllers cannot both win
+        # and delete a fresh lock). The temporary rename target must not survive.
+        self.set_active("primary-vps")
+        self.lock_dir.mkdir(parents=True)
+        old = time.time() - 1000
+        os.utime(self.lock_dir, (old, old))
+        result = self.run_controller("--once")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("removing stale controller lock", result.stderr)
+        residue = list(self.gen_dir.glob("failover.lock.d.stale.*"))
+        self.assertEqual(residue, [], f"stale-rename residue left behind: {residue}")
+
+    def test_acquire_lock_reclaims_stale_lock_via_atomic_rename(self):
+        # The TOCTOU window between two controllers reclaiming the same stale lock
+        # cannot be reproduced deterministically in a unit test, so guard the
+        # mechanism: reclaim must go through `mv "$LOCK_DIR" ...` (atomic rename),
+        # not a plain `rm -rf "$LOCK_DIR"`. Reverting to direct removal drops this
+        # substring and fails the test.
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('mv "$LOCK_DIR"', text)
+
+    def test_stale_lock_mv_failure_falls_through_to_bounded_wait(self):
+        # Force the atomic rename to fail (shadow `mv` with one that always exits
+        # 1) while the lock is stale. Reclaim must then fall through to the
+        # bounded LOCK_WAIT path and exit, not spin: the pre-fix `mv ...; continue`
+        # would loop without accounting and never terminate.
+        self.set_active("primary-vps")
+        self.lock_dir.mkdir(parents=True)
+        old = time.time() - 1000
+        os.utime(self.lock_dir, (old, old))  # stale by age (no pid file recorded)
+        fake_mv = self.fake_bin / "mv"
+        fake_mv.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_mv.chmod(0o755)
+        try:
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "--once"],
+                env=self._controller_env(LOCK_WAIT="2"),
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("acquire_lock spun on mv failure instead of honoring LOCK_WAIT")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not acquire controller lock", result.stderr)
+
     def test_lock_released_after_normal_run(self):
         self.set_active("primary-vps")
         self.run_controller("--once")

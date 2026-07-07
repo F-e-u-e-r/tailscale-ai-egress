@@ -8,7 +8,7 @@ BRANCH="${TAILSCALE_AI_EGRESS_BRANCH:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 
 if [ "${1:-}" = "--version" ]; then
   printf 'tailscale-ai-egress install.sh %s\n' "$VERSION"
@@ -16,6 +16,7 @@ if [ "${1:-}" = "--version" ]; then
 fi
 
 if [ -f "./bootstrap.sh" ] && [ -d "./scripts" ] && [ -d "./policy" ]; then
+  printf 'install.sh: executing local checkout in %s (./bootstrap.sh)\n' "$(pwd)" >&2
   ./bootstrap.sh "$@"
   exit $?
 fi

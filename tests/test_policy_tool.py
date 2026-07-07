@@ -683,6 +683,39 @@ class PolicyToolTests(unittest.TestCase):
 
         replace.assert_called_once()
 
+    def test_plan_directory_written_with_private_permissions(self):
+        # Plan bundles carry the full tailnet policy; the directory must be 0700
+        # and each artifact 0600, regardless of the process umask. Force a
+        # permissive umask so a reverted (no-chmod) implementation would fail.
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
+        with tempfile.TemporaryDirectory() as tmp:
+            final_dir = Path(tmp) / "plan.20260527T143022Z-a1b2c3d4"
+            tool.write_plan_directory(final_dir, {"manifest.json": "{}\n", "merged.json": "{}\n"})
+            self.assertEqual(final_dir.stat().st_mode & 0o777, 0o700)
+            for name in ("manifest.json", "merged.json"):
+                self.assertEqual((final_dir / name).stat().st_mode & 0o777, 0o600, name)
+
+    def test_backup_written_with_private_permissions(self):
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
+        with tempfile.TemporaryDirectory() as tmp:
+            backup_dir = Path(tmp) / "generated"
+            path = tool.write_backup(backup_dir, "{}\n")
+            self.assertEqual(backup_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_manifest_status_rewrite_keeps_private_permissions(self):
+        # A later status update rewrites manifest.json via write_text_atomic; the
+        # atomic replace must not widen the manifest back to the process umask.
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_dir = Path(tmp) / "plan.20260527T143022Z-a1b2c3d4"
+            tool.write_plan_directory(plan_dir, {"manifest.json": "{}\n"})
+            tool.update_manifest_status(plan_dir, {"schema_version": 1}, "applied", "applied_at")
+            self.assertEqual((plan_dir / "manifest.json").stat().st_mode & 0o777, 0o600)
+
     def test_valid_plan_artifacts_reports_unwritable_output_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(Path, "mkdir", side_effect=OSError("permission denied")):

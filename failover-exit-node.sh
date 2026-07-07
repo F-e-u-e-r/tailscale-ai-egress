@@ -3,7 +3,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.1.1}"
 
 # Initialised early so the cleanup trap is safe even on Bash 3.2 early exits.
 tmp_files=()
@@ -288,11 +288,21 @@ is_stale_lock() {
 acquire_lock() {
   mkdir -p "$GENERATED_DIR"
   local waited=0
+  local stale_name=""
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     if is_stale_lock; then
       warn "removing stale controller lock $LOCK_DIR"
-      rm -rf "$LOCK_DIR"
-      continue
+      # Claim the stale lock atomically: rename it to a private, collision-proof
+      # name before removing it. If two controllers both judge the lock stale,
+      # only one rename can succeed; the loser's mv fails (the directory was
+      # already renamed, or a fresh lock now sits there) and falls through to the
+      # bounded wait below. That way it can neither delete a fresh lock the
+      # winner just created (TOCTOU) nor spin without LOCK_WAIT accounting.
+      stale_name="$LOCK_DIR.stale.$$.$RANDOM"
+      if mv "$LOCK_DIR" "$stale_name" 2>/dev/null; then
+        rm -rf "$stale_name"
+        continue
+      fi
     fi
     waited=$((waited + 1))
     if [ "$waited" -ge "$LOCK_WAIT" ]; then

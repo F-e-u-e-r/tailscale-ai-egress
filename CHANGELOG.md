@@ -15,6 +15,44 @@ both Python CLIs report it with `--version`.
 
 No changes yet.
 
+## [1.1.1] - 2026-07-08
+
+Patch release: correctness, consistency, and hardening fixes from an external
+review. No CLI surface changes; every entrypoint and both Python CLIs keep their
+1.1 behavior and flags.
+
+### Fixed
+
+- `bootstrap.sh`, `enable-exit-node.sh`, `restore-connector.sh`: the
+  `read_line`/`read_secret` `/dev/tty` fallback now prints the prompt to
+  `/dev/tty` (mirroring `rollback.sh`) instead of relying on `read -p`, whose
+  prompt goes to stderr and was swallowed when stdin is piped but a controlling
+  terminal is available (e.g. `curl … | bash`). Security-relevant prompts (auth
+  key, Advanced Mode confirmation, `APPLY <plan-id>`) are now visible again.
+- `scripts/health_check.py`: URL-encode the tailnet in the devices API path so a
+  tailnet name containing reserved characters cannot rewrite the request path;
+  matches `policy_tool.tailnet_path()`.
+- `failover-exit-node.sh`: remove a stale controller lock atomically (rename
+  then delete) so two controllers that simultaneously judge a lock stale cannot
+  both enter the apply cycle (TOCTOU).
+- `bootstrap.sh`: match the running connector hostname as an exact
+  whitespace-delimited field (via `awk`) so `ai-egress-jp-01` no longer matches
+  a different host such as `ai-egress-jp-011` or `foo-ai-egress-jp-01` and skips
+  `tailscale up` in non-interactive mode.
+- `policy/app-connector.example.json`: add `notebooklm.google.com` to match
+  `policy/default-ai-domains.json`.
+
+### Changed
+
+- `scripts/policy_tool.py`: policy plan bundles and backups are now written with
+  private permissions (0700 directories, 0600 files) instead of at the process
+  umask, since both contain the full tailnet policy.
+- `monitor-connectors.sh`: clarify in `--help` that `TAILSCALE_API_KEY` is read
+  from the environment only and is not parsed from `generated/failover.env`.
+- `install.sh`: print a note to stderr when it executes a local checkout, so the
+  local-vs-remote install path is visible.
+- CI: add Python 3.13 to the test matrix.
+
 ## [1.1.0] - 2026-06-10
 
 Adds optional, opt-in high-availability tooling: a ping-driven exit-node
@@ -178,6 +216,7 @@ are summarized from project history.
 - `bootstrap.sh` connector setup, `diagnose.sh`, `check-client-routes.sh`,
   `rollback.sh`, the common domain list, and Manual Guided Mode policy snippets.
 
-[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.1
 [1.1.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.0
 [1.0.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.0.0
