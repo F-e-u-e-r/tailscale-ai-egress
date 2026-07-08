@@ -28,8 +28,14 @@ jobs:
 
       - name: Install shellcheck
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+          # `apt-get update` can exit non-zero because a pre-configured
+          # third-party runner repo (e.g. Microsoft azure-cli) has a transiently
+          # invalid signature, even though the Ubuntu sources holding shellcheck
+          # are fine. Tolerate that (with retries + a visible warning) but keep
+          # the install strict, so a genuine failure to install shellcheck still
+          # fails CI.
+          sudo apt-get update -o Acquire::Retries=3 || echo "::warning::apt-get update had a non-fatal third-party repo failure; continuing because the shellcheck install stays strict"
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 shellcheck
 
       - name: Check shell syntax
         run: |
