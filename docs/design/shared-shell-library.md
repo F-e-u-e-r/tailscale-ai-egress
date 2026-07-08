@@ -58,9 +58,12 @@ reserves names and contracts only.
 
 1. **Skeleton (done):** reserve `scripts/lib/common.sh`, the source-only guard,
    and the `ai_egress_*` convention. Lint + a source-only test in CI.
-2. **First helper — `ai_egress_run_root`:** the smallest, most self-contained
-   helper. Extract it, migrate `enable-exit-node.sh` only, and add a parity test
-   (below). Leave the other two scripts on their inline copies.
+2. **First helper — `ai_egress_run_root` (done):** the smallest, most
+   self-contained helper. Extracted into `scripts/lib/common.sh` and adopted by
+   `enable-exit-node.sh` only, with a parity test (below) and a missing-library
+   guard. `disable-exit-node.sh` and `restore-connector.sh` still carry their
+   (byte-identical) inline copies; they migrate in follow-up steps. CI runs
+   `shellcheck -x` so the sourced library is followed.
 3. **`ai_egress_have` / logging helpers:** trivial, low-risk; migrate all three
    consumers.
 4. **`ai_egress_read_line` / `ai_egress_read_secret`:** migrate one consumer at a

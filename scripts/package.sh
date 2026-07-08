@@ -126,7 +126,7 @@ if [ "$CHECK" = "1" ]; then
     restore-connector.sh rollback.sh install.sh
     policy/default-ai-domains.json scripts/policy_tool.py
     scripts/health_check.py examples/failover.env.example
-    scripts/validation-e2e.sh)
+    scripts/validation-e2e.sh scripts/lib/common.sh)
   missing=""
   for req in "${required[@]}"; do
     [ -f "$verify_dir/$PREFIX/$req" ] || missing="$missing $req"

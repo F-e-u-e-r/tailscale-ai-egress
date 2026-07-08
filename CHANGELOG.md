@@ -27,6 +27,14 @@ both Python CLIs report it with `--version`.
   (not parsed from `failover.env`); its exit status is ignored and cannot change
   the switch outcome.
 
+### Changed
+
+- Internal refactor (no behavior change): `enable-exit-node.sh` now sources the
+  shared `scripts/lib/common.sh` for `run_root` (as `ai_egress_run_root`), the
+  first step of the shared-shell-library migration. `scripts/lib/common.sh` is
+  therefore now a runtime dependency of `enable-exit-node.sh` and is verified in
+  the release package. CI lints with `shellcheck -x`.
+
 ## [1.1.1] - 2026-07-08
 
 Patch release: correctness, consistency, and hardening fixes from an external
