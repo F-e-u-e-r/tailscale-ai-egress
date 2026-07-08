@@ -1822,6 +1822,132 @@ exit 0
         self.assertEqual(checks["connector-advertised"]["details"]["advertised"], True)
         self.assertEqual(checks["exit-node-advertised"]["details"]["advertised"], False)
 
+    def test_diagnose_custom_connector_tag_flag_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:custom-egress"], "AllowedIPs": []}},
+                status_text="100.64.0.1 custom-host tag:custom-egress",
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains),
+                 "--connector-tag", "tag:custom-egress", "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["details"]["advertised"], True)
+
+    def test_diagnose_custom_connector_tag_from_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:custom-egress"], "AllowedIPs": []}},
+                status_text="100.64.0.1 custom-host tag:custom-egress",
+            )
+            env["CONNECTOR_TAG"] = "tag:custom-egress"
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains), "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["details"]["advertised"], True)
+
+    def test_diagnose_connector_tag_from_identity_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            gen = Path(tmp) / "generated"
+            gen.mkdir()
+            (gen / "connector-identity.env").write_text("CONNECTOR_TAG=tag:custom-egress\n", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:custom-egress"], "AllowedIPs": []}},
+                status_text="100.64.0.1 custom-host tag:custom-egress",
+            )
+            env["GENERATED_DIR"] = str(gen)
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains), "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["details"]["advertised"], True)
+
+    def test_diagnose_connector_tag_from_identity_file_without_trailing_newline(self):
+        # Guards the `|| [ -n "$key" ]` read loop: a hand-written identity file
+        # whose final CONNECTOR_TAG line lacks a trailing newline must still be
+        # read (a plain `while read` would drop it and fall back to the convention).
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            gen = Path(tmp) / "generated"
+            gen.mkdir()
+            (gen / "connector-identity.env").write_text("CONNECTOR_TAG=tag:custom-egress", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:custom-egress"], "AllowedIPs": []}},
+                status_text="100.64.0.1 custom-host tag:custom-egress",
+            )
+            env["GENERATED_DIR"] = str(gen)
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains), "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["details"]["advertised"], True)
+
+    def test_diagnose_custom_tag_expected_ignores_ai_egress_convention(self):
+        # When a specific tag is expected, matching is exact: a stray tag:ai-egress-*
+        # no longer auto-counts as the connector.
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:ai-egress-jp"], "AllowedIPs": []}},
+                status_text="100.64.0.1 ai-egress-jp-01 tag:ai-egress-jp",
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains),
+                 "--connector-tag", "tag:custom-egress", "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["status"], "warn")
+
+    def test_diagnose_rejects_invalid_connector_tag(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "diagnose.sh"), "--connector-tag", "notatag"],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        # Assert the validator-specific message so this fails if the flag/validator
+        # is removed (an unknown option also exits 2).
+        self.assertIn("must be tag:", result.stderr)
+        self.assertIn("got: notatag", result.stderr)
+
+    def test_diagnose_custom_tag_text_fallback_is_exact(self):
+        # The status-text fallback must be an exact field match: an expected tag of
+        # tag:custom-egress must NOT match a different tag:custom-egress-extra.
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            env = self._diagnose_env(
+                tmp,
+                status_json={"Self": {"Online": True, "Tags": ["tag:custom-egress-extra"], "AllowedIPs": []}},
+                status_text="100.64.0.1 custom-host tag:custom-egress-extra",
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains),
+                 "--connector-tag", "tag:custom-egress", "--json"],
+                env=env, text=True, capture_output=True, check=True,
+            )
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        self.assertEqual(checks["connector-advertised"]["status"], "warn")
+
     def test_diagnose_json_reports_exit_node_only_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             domains = Path(tmp) / "domains.txt"
@@ -1894,7 +2020,7 @@ exit 0
         self.assertIn("== VPS-side diagnostics ==", result.stdout)
         self.assertIn("== Tailscale ==", result.stdout)
         self.assertIn("[OK] Tailscale status is available.", result.stdout)
-        self.assertIn("[OK] Connector advertised: expected ai-egress tag is present.", result.stdout)
+        self.assertIn("[OK] Connector advertised: expected connector tag is present.", result.stdout)
 
     def test_diagnose_fails_when_tailscale_not_installed(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -197,6 +197,49 @@ class FailoverControllerTests(unittest.TestCase):
         self.assertIn("+ tailscale set --exit-node=fallback-vps", result.stdout)
         self.assertEqual(self.read_active(), "primary-vps")  # never mutated
 
+    def test_notify_hook_fires_on_switch(self):
+        self.set_active("primary-vps")
+        notify_out = self.gen_dir / "notify.out"
+        cmd = f'printf "%s|%s|%s|%s" "$FAILOVER_EVENT" "$FAILOVER_ROLE" "$FAILOVER_LABEL" "$FAILOVER_REASON" > "{notify_out}"'
+        result = self.run_controller("--once", "--apply", FAKE_UNREACHABLE="primary-vps", FAILOVER_NOTIFY_CMD=cmd)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.read_active(), "fallback-vps")
+        self.assertTrue(notify_out.exists(), "notify hook did not run on switch")
+        event, role, label, reason = notify_out.read_text(encoding="utf-8").split("|")
+        self.assertEqual(event, "switched")
+        self.assertEqual(role, "fallback")
+        self.assertEqual(label, "fallback-vps")
+        self.assertTrue(reason, "notify reason should be non-empty")
+
+    def test_notify_hook_failure_does_not_change_outcome(self):
+        # A failing hook (nonzero exit) must never change the controller result.
+        self.set_active("primary-vps")
+        result = self.run_controller("--once", "--apply", FAKE_UNREACHABLE="primary-vps", FAILOVER_NOTIFY_CMD="exit 7")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.read_active(), "fallback-vps")
+
+    def test_notify_hook_not_fired_on_dry_run(self):
+        self.set_active("primary-vps")
+        notify_out = self.gen_dir / "notify.out"
+        cmd = f'echo fired > "{notify_out}"'
+        result = self.run_controller("--once", "--apply", "--dry-run", FAKE_UNREACHABLE="primary-vps", FAILOVER_NOTIFY_CMD=cmd)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.read_active(), "primary-vps")  # dry-run never switches
+        self.assertFalse(notify_out.exists(), "notify hook fired on a dry run")
+
+    def test_notify_hook_reports_failed_event_on_readback_mismatch(self):
+        # A failed switch (readback mismatch via FAKE_SET_NOOP) must notify
+        # event=failed, so a regression that only notifies on success is caught.
+        self.set_active("primary-vps")
+        notify_out = self.gen_dir / "notify.out"
+        cmd = f'printf "%s" "$FAILOVER_EVENT" > "{notify_out}"'
+        result = self.run_controller(
+            "--once", "--apply", FAKE_UNREACHABLE="primary-vps", FAKE_SET_NOOP="1", FAILOVER_NOTIFY_CMD=cmd
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(notify_out.exists(), "notify hook did not run on a failed switch")
+        self.assertEqual(notify_out.read_text(encoding="utf-8"), "failed")
+
     def test_healthy_primary_no_switch(self):
         self.set_active("primary-vps")
         result = self.run_controller("--once", "--apply")

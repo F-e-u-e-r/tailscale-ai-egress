@@ -13,7 +13,19 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- `diagnose.sh`: `--connector-tag <tag>` plus custom connector-tag detection.
+  The expected connector tag is resolved by precedence — `--connector-tag`, then
+  the `CONNECTOR_TAG` environment variable, then
+  `generated/connector-identity.env`, then the historical `tag:ai-egress-*`
+  convention — so hosts using a non-`ai-egress-*` tag are detected. Behavior is
+  unchanged when no tag is provided.
+- `failover-exit-node.sh`: opt-in `FAILOVER_NOTIFY_CMD` hook, run after a real
+  switch attempt with `FAILOVER_EVENT` (`switched`|`failed`), `FAILOVER_ROLE`,
+  `FAILOVER_LABEL`, and `FAILOVER_REASON` in the environment. Environment only
+  (not parsed from `failover.env`); its exit status is ignored and cannot change
+  the switch outcome.
 
 ## [1.1.1] - 2026-07-08
 
