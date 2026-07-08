@@ -12,19 +12,26 @@ JSON_OUTPUT=0
 JSON_EVENTS_FILE=""
 STATUS_JSON=""
 STATUS_TEXT=""
+GENERATED_DIR="${GENERATED_DIR:-$ROOT_DIR/generated}"
+CONNECTOR_TAG_ENV="${CONNECTOR_TAG:-}" # optional expected connector tag from the environment
+CONNECTOR_TAG_FLAG=""                  # optional expected connector tag from --connector-tag
+CONNECTOR_TAG=""                       # resolved expected tag; empty => tag:ai-egress-* convention
 tmp_files=()
 
 usage() {
   cat <<'EOF'
-Usage: ./diagnose.sh [--domain-pack name] [--domains-file path] [--json] [--version]
+Usage: ./diagnose.sh [--domain-pack name] [--domains-file path] [--connector-tag tag] [--json] [--version]
 
 VPS-side diagnostics for a Tailscale AI App Connector host. Run
 check-client-routes.sh on a client device to verify client routing.
-Connector detection currently follows the tag:ai-egress-* convention.
+Connector tag detection precedence: --connector-tag, then the CONNECTOR_TAG
+environment variable, then generated/connector-identity.env, then the
+tag:ai-egress-* convention.
 
 Options:
   --domain-pack name  Use the common domain pack.
   --domains-file path Use a custom domain file. Conflicts with --domain-pack.
+  --connector-tag tag Expected connector tag (default: tag:ai-egress-* convention).
   --json              Emit schema_version=1 JSON instead of text.
   --version           Print the tailscale-ai-egress version and exit.
   -h, --help          Show this help.
@@ -57,6 +64,60 @@ trap 'cleanup; exit 143' TERM
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+valid_connector_tag() {
+  case "$1" in
+    tag:*) ;;
+    *) return 1 ;;
+  esac
+  local name="${1#tag:}"
+  case "$name" in
+    ""|*[!a-z0-9-]*|-*|*-|*--*) return 1 ;;
+  esac
+  return 0
+}
+
+read_identity_connector_tag() {
+  local file="$1" key value
+  [ -r "$file" ] || return 0
+  # `|| [ -n "$key" ]` so a final line without a trailing newline is not dropped.
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      CONNECTOR_TAG) printf '%s' "$value"; return 0 ;;
+    esac
+  done <"$file"
+}
+
+resolve_connector_tag() {
+  # Precedence: --connector-tag flag > CONNECTOR_TAG env > connector-identity.env
+  # > empty (which keeps the historical tag:ai-egress-* convention). An explicit
+  # but malformed flag is a hard error; a malformed env/file value warns and
+  # falls back to the convention.
+  local candidate="" source=""
+  if [ -n "$CONNECTOR_TAG_FLAG" ]; then
+    candidate="$CONNECTOR_TAG_FLAG"; source="flag"
+  elif [ -n "$CONNECTOR_TAG_ENV" ]; then
+    candidate="$CONNECTOR_TAG_ENV"; source="environment"
+  else
+    candidate="$(read_identity_connector_tag "$GENERATED_DIR/connector-identity.env")"
+    [ -n "$candidate" ] && source="identity file"
+  fi
+
+  CONNECTOR_TAG=""
+  [ -n "$candidate" ] || return 0
+
+  if valid_connector_tag "$candidate"; then
+    CONNECTOR_TAG="$candidate"
+  elif [ "$source" = "flag" ]; then
+    usage_error "--connector-tag must be tag:<lowercase-alphanumeric-hyphens> (got: $candidate)"
+  else
+    warn "ignoring invalid connector tag from $source ('$candidate'); using the tag:ai-egress-* convention"
+  fi
 }
 
 record() {
@@ -175,6 +236,11 @@ parse_args() {
         domains_file_set=1
         shift 2
         ;;
+      --connector-tag)
+        [ -n "${2:-}" ] || usage_error "--connector-tag requires a tag."
+        CONNECTOR_TAG_FLAG="$2"
+        shift 2
+        ;;
       --json)
         JSON_OUTPUT=1
         shift
@@ -259,7 +325,7 @@ parse_route_interface() {
 
 tailscale_json_value() {
   local mode="$1"
-  STATUS_JSON_PAYLOAD="$STATUS_JSON" python3 - "$mode" <<'PY'
+  STATUS_JSON_PAYLOAD="$STATUS_JSON" EXPECTED_CONNECTOR_TAG="$CONNECTOR_TAG" python3 - "$mode" <<'PY'
 import json
 import os
 import sys
@@ -269,10 +335,14 @@ data = json.loads(os.environ["STATUS_JSON_PAYLOAD"])
 self_node = data.get("Self") or {}
 
 if mode == "connector-tag":
-    tags = self_node.get("Tags") or []
-    # Project diagnostics currently treat tag:ai-egress-* as the connector convention.
-    # Custom connector tags can still work, but they are not detected here yet.
-    print("1" if any(str(tag).startswith("tag:ai-egress-") for tag in tags) else "0")
+    tags = [str(tag) for tag in (self_node.get("Tags") or [])]
+    expected = os.environ.get("EXPECTED_CONNECTOR_TAG", "")
+    if expected:
+        # A specific connector tag was resolved (flag/env/identity file): match it
+        # exactly. Otherwise fall back to the tag:ai-egress-* naming convention.
+        print("1" if expected in tags else "0")
+    else:
+        print("1" if any(tag.startswith("tag:ai-egress-") for tag in tags) else "0")
 elif mode == "exit-node":
     allowed_ips = self_node.get("AllowedIPs") or []
     recursive_values = []
@@ -388,12 +458,21 @@ check_tailscale_modes() {
     return 0
   fi
 
+  local connector_present=0
   if [ -n "$STATUS_JSON" ] && have python3 && [ "$(tailscale_json_value connector-tag 2>/dev/null || printf '0')" = "1" ]; then
-    record OK "Connector advertised: expected ai-egress tag is present." "connector-advertised" '{"advertised":true}'
+    connector_present=1
+  elif [ -n "$CONNECTOR_TAG" ]; then
+    # Exact whitespace-delimited field match: grep -w treats ':' and '-' as word
+    # boundaries, so it would wrongly match tag:custom-egress inside
+    # tag:custom-egress-extra. awk compares whole fields instead.
+    printf '%s\n' "$STATUS_TEXT" | awk -v t="$CONNECTOR_TAG" '{ for (i = 1; i <= NF; i++) if ($i == t) found = 1 } END { exit found ? 0 : 1 }' && connector_present=1
   elif printf '%s\n' "$STATUS_TEXT" | grep -q 'tag:ai-egress-'; then
-    record OK "Connector advertised: expected ai-egress tag is present." "connector-advertised" '{"advertised":true}'
+    connector_present=1
+  fi
+  if [ "$connector_present" = "1" ]; then
+    record OK "Connector advertised: expected connector tag is present." "connector-advertised" '{"advertised":true}'
   else
-    record WARN "Connector advertised: unknown; expected ai-egress tag was not visible in Tailscale status." "connector-advertised" '{"advertised":null}'
+    record WARN "Connector advertised: unknown; expected connector tag was not visible in Tailscale status." "connector-advertised" '{"advertised":null}'
   fi
 
   if [ -n "$STATUS_JSON" ] && have python3 && [ "$(tailscale_json_value exit-node 2>/dev/null || printf '0')" = "1" ]; then
@@ -490,6 +569,7 @@ EOF
 
 main() {
   parse_args "$@"
+  resolve_connector_tag
   if [ "$JSON_OUTPUT" = "1" ]; then
     have python3 || usage_error "--json requires python3."
     JSON_EVENTS_FILE="$(mktemp)"

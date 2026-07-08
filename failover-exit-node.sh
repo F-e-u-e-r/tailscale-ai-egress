@@ -29,6 +29,9 @@ RESTORE_PRIMARY="${RESTORE_PRIMARY:-}"
 ENSURE_PRIMARY="${ENSURE_PRIMARY:-}"
 STATE_FILE="${STATE_FILE:-}"
 READBACK_DELAY="${READBACK_DELAY:-}"
+# Opt-in notification hook, environment only (NOT parsed from failover.env: a
+# command string does not survive the env-file parser's quoting rules).
+FAILOVER_NOTIFY_CMD="${FAILOVER_NOTIFY_CMD:-}"
 
 APPLY=0
 WATCH=0
@@ -66,6 +69,13 @@ Configuration (environment or generated/failover.env):
   PING_TIMEOUT (5)     PROBE_HTTP_TIMEOUT (5)
   RESTORE_PRIMARY (1)  1=switch back when primary recovers, 0=stay on fallback
   ENSURE_PRIMARY (0)   1=select primary when no exit node is selected yet
+
+Notification (environment only; NOT read from generated/failover.env):
+  FAILOVER_NOTIFY_CMD  opt-in command run after a real switch attempt. Receives
+                       FAILOVER_EVENT (switched|failed), FAILOVER_ROLE,
+                       FAILOVER_LABEL, and FAILOVER_REASON in the environment.
+                       Its exit status is ignored and cannot change the outcome;
+                       keep it fast so it does not stall the controller.
 EOF
 }
 
@@ -410,6 +420,16 @@ apply_switch() {
   return 1
 }
 
+notify_hook() {
+  # Opt-in: run FAILOVER_NOTIFY_CMD after a real switch attempt, passing context
+  # via the environment. It runs synchronously but its exit status is discarded
+  # (`|| true`), so a broken hook can never change the switch outcome. Keep the
+  # command fast: a hook that hangs will stall the controller loop.
+  [ -n "$FAILOVER_NOTIFY_CMD" ] || return 0
+  FAILOVER_EVENT="$1" FAILOVER_ROLE="$2" FAILOVER_LABEL="$3" FAILOVER_REASON="$4" \
+    sh -c "$FAILOVER_NOTIFY_CMD" || true
+}
+
 run_cycle() {
   acquire_lock
   local decision action reason target_role target_label event active_role k v rc
@@ -457,6 +477,15 @@ run_cycle() {
   apply_switch "$target_role" "$target_label"
   rc=$?
   release_lock
+  # Fire the opt-in notification after releasing the lock (so a slow hook cannot
+  # block another controller) and only for real switch attempts, not dry runs.
+  if [ "$DRY_RUN" != "1" ]; then
+    if [ "$rc" -eq 0 ]; then
+      notify_hook "switched" "$target_role" "$target_label" "$reason"
+    else
+      notify_hook "failed" "$target_role" "$target_label" "$reason"
+    fi
+  fi
   return "$rc"
 }
 
