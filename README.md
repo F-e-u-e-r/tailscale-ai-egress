@@ -417,6 +417,7 @@ See [SECURITY.md](SECURITY.md) for the full security model. Highlights:
 ## Documentation
 
 - [docs/Stability.md](docs/Stability.md) — what is frozen in 1.x and the support policy.
+- [docs/Roadmap.md](docs/Roadmap.md) — non-binding planned direction for 1.2+ and 2.0.
 - [docs/Configuration.md](docs/Configuration.md) — environment variables and recommended auth-key settings.
 - [docs/Tailscale-API-mode.md](docs/Tailscale-API-mode.md) — Advanced policy automation in depth.
 - [docs/Failover.md](docs/Failover.md) — same-region connector failover.
