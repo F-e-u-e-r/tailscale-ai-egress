@@ -32,9 +32,33 @@ class ShellScriptTests(unittest.TestCase):
             "rollback.sh",
             "scripts/maintainer/apply-github-ruleset.sh",
             "scripts/validation-e2e.sh",
+            "scripts/lib/common.sh",
         ]:
             with self.subTest(script=script):
                 subprocess.run(["bash", "-n", str(ROOT / script)], check=True)
+
+    def test_common_lib_rejects_direct_execution(self):
+        # scripts/lib/common.sh is a source-only library; running it directly must
+        # fail with a clear message rather than silently doing nothing.
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/lib/common.sh")],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source-only", result.stderr)
+
+    def test_common_lib_sources_without_side_effects(self):
+        # Sourcing the skeleton must be a no-op: no output, clean exit. This keeps
+        # it safe to source before any helper bodies are added.
+        result = subprocess.run(
+            ["bash", "-c", f'source "{ROOT / "scripts/lib/common.sh"}"'],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
 
     def test_bootstrap_common_domain_pack_overrides_env_and_policy_default_stays_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
