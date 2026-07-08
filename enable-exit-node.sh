@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
 VERSION="${VERSION:-1.1.1}"
 
+# Shared internal library (source-only; see docs/design/shared-shell-library.md).
+COMMON_LIB="$SCRIPT_DIR/scripts/lib/common.sh"
+if [ ! -r "$COMMON_LIB" ]; then
+  printf 'error: missing shared library %s\n' "$COMMON_LIB" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/common.sh
+. "$COMMON_LIB"
+
 REGION="${REGION:-}"
 REGION_LOWER=""
 GENERATED_DIR="${GENERATED_DIR:-$SCRIPT_DIR/generated}"
@@ -206,24 +215,6 @@ resolve_connector_identity() {
   fi
 }
 
-run_root() {
-  if [ "$DRY_RUN" = "1" ]; then
-    printf '+'
-    if [ "$(id -u)" -ne 0 ] && [ "$USE_SUDO" != "0" ]; then
-      printf ' sudo'
-    fi
-    printf ' %q' "$@"
-    printf '\n'
-    return 0
-  fi
-
-  if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
 read_line() {
   local prompt="$1"
   local answer=""
@@ -370,10 +361,10 @@ enable_forwarding() {
     ipv6_available=1
   fi
 
-  run_root install -m 0644 "$tmp" /etc/sysctl.d/99-tailscale-ai-egress.conf
-  run_root sysctl -w net.ipv4.ip_forward=1
+  ai_egress_run_root install -m 0644 "$tmp" /etc/sysctl.d/99-tailscale-ai-egress.conf
+  ai_egress_run_root sysctl -w net.ipv4.ip_forward=1
   if [ "$ipv6_available" = "1" ]; then
-    run_root sysctl -w net.ipv6.conf.all.forwarding=1
+    ai_egress_run_root sysctl -w net.ipv6.conf.all.forwarding=1
   else
     warn "IPv6 forwarding sysctl is unavailable on this host."
   fi
@@ -410,7 +401,7 @@ main() {
   preflight
   confirm_transfer_risk
   enable_forwarding
-  run_root tailscale set --advertise-exit-node
+  ai_egress_run_root tailscale set --advertise-exit-node
   note "[OK] Exit-node fallback is advertised. Approve/use it from Tailscale clients or Admin Console if required."
   if [ "$DRY_RUN" != "1" ]; then
     verify_exit_node_after_enable

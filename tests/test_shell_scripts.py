@@ -60,6 +60,56 @@ class ShellScriptTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
+    def test_ai_egress_run_root_matches_original_dry_run(self):
+        # Parity: the extracted ai_egress_run_root must produce byte-identical
+        # dry-run output to the original inline run_root across
+        # (root/non-root) x (USE_SUDO 0/1), including %q quoting of arguments.
+        original = (
+            'run_root() {\n'
+            '  if [ "$DRY_RUN" = "1" ]; then\n'
+            "    printf '+'\n"
+            '    if [ "$(id -u)" -ne 0 ] && [ "$USE_SUDO" != "0" ]; then\n'
+            "      printf ' sudo'\n"
+            '    fi\n'
+            "    printf ' %q' \"$@\"\n"
+            "    printf '\\n'\n"
+            '    return 0\n'
+            '  fi\n'
+            '  if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then\n'
+            '    "$@"\n'
+            '  else\n'
+            '    sudo "$@"\n'
+            '  fi\n'
+            '}'
+        )
+        common = ROOT / "scripts/lib/common.sh"
+        args = 'tailscale set --exit-node="a b"'
+        for uid in ("0", "1000"):
+            for use_sudo in ("0", "1"):
+                with self.subTest(uid=uid, use_sudo=use_sudo):
+                    preamble = f'id() {{ echo "{uid}"; }}\nDRY_RUN=1\nUSE_SUDO={use_sudo}\n'
+                    orig = subprocess.run(
+                        ["bash", "-c", f"{preamble}{original}\nrun_root {args}"],
+                        text=True, capture_output=True,
+                    )
+                    new = subprocess.run(
+                        ["bash", "-c", f'{preamble}source "{common}"\nai_egress_run_root {args}'],
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(orig.returncode, 0)
+                    self.assertEqual(new.returncode, 0)
+                    self.assertEqual(new.stdout, orig.stdout)
+
+    def test_enable_exit_node_fails_clearly_without_common_lib(self):
+        # A checkout missing scripts/lib/common.sh must fail with a clear message,
+        # not a cryptic `source: No such file` error.
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "enable-exit-node.sh"
+            script.write_text((ROOT / "enable-exit-node.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing shared library", result.stderr)
+
     def test_bootstrap_common_domain_pack_overrides_env_and_policy_default_stays_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = self._bootstrap_dry_run_env(tmp)

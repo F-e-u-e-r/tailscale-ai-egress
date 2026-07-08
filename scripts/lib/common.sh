@@ -1,11 +1,11 @@
 # shellcheck shell=bash
 # scripts/lib/common.sh -- shared internal shell library (NOT a CLI entrypoint).
 #
-# Status: SKELETON. This file intentionally contains no helper bodies yet. It
-# reserves the location, the source-only contract, and the naming convention so
-# the shared-helper migration can land incrementally, one helper and one
-# consumer at a time, in a dedicated parity-tested change. See
+# Status: MIGRATION IN PROGRESS. Helpers move here one at a time, each proven by
+# a parity test before a consumer switches to it. See
 # docs/design/shared-shell-library.md for the migration plan.
+# Implemented so far: ai_egress_run_root (consumer: enable-exit-node.sh). The
+# remaining families listed below are still inline in their scripts.
 #
 # This library is deliberately NOT part of the frozen 1.x CLI surface described
 # in docs/Stability.md: it has no --version, no flags, and no JSON schema. It is
@@ -32,6 +32,30 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   exit 64 # EX_USAGE
 fi
 
+# ai_egress_run_root <cmd...> -- run a command with privilege, honoring the
+# caller's DRY_RUN and USE_SUDO. With DRY_RUN=1 it prints the command (prefixed
+# with `+`, and `sudo` when it would escalate) using %q quoting and does not
+# execute. Otherwise it runs directly when root or USE_SUDO=0, else via sudo.
+# Behavior is byte-identical to the inline run_root it replaces (parity-tested).
+# DRY_RUN and USE_SUDO are provided by the sourcing script's scope.
+ai_egress_run_root() {
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '+'
+    if [ "$(id -u)" -ne 0 ] && [ "$USE_SUDO" != "0" ]; then
+      printf ' sudo'
+    fi
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+
+  if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
 # --- Intended helper families (bodies land later, with parity tests) ----------
 # Nothing below is implemented yet; these are the reserved names and contracts.
 # Each will move here from its current inline copies only once a parity test
@@ -44,9 +68,6 @@ fi
 #                                          tty (bootstrap / enable / restore).
 #   ai_egress_read_secret <prompt>      -- silent variant of read_line for auth
 #                                          keys (no echo; newline to the tty).
-#   ai_egress_run_root <cmd...>         -- privilege wrapper: sudo vs direct vs
-#                                          dry-run echo, honoring AI_EGRESS_USE_SUDO
-#                                          and DRY_RUN.
 #   ai_egress_resolve_identity          -- connector tag/hostname resolution from
 #                                          environment, the persisted identity
 #                                          file, and `tailscale status` (note:
