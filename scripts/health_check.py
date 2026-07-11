@@ -982,7 +982,8 @@ def _safe_peer_metrics(status: dict[str, Any], available: bool, label: str) -> d
     degrades to the null-filled object instead of propagating."""
     try:
         return peer_metrics(status, available, label)
-    except Exception:
+    except Exception as exc:
+        eprint(f"warning: peer metrics unavailable for '{label}': {exc}")
         return _null_metrics()
 
 
@@ -1135,7 +1136,7 @@ def cmd_peer_metrics(args: argparse.Namespace) -> int:
     transport/resolution failure); non-zero only for usage/arg errors. This is the
     single source of truth for the metrics object shape used by the monitor."""
     status, available = get_status(args.status_json_file)
-    print(json.dumps(peer_metrics(status, available, args.node), sort_keys=True))
+    print(json.dumps(_safe_peer_metrics(status, available, args.node), sort_keys=True))
     return 0
 
 

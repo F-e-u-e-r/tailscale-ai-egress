@@ -874,18 +874,33 @@ class PeerMetricsTests(unittest.TestCase):
 
         self.assertEqual(age("2026-07-11T11:59:00Z")["last_handshake_age_seconds"], 60)   # trailing Z
         self.assertEqual(age("2026-07-11T11:59:00")["last_handshake_age_seconds"], 60)    # naive input -> UTC
-        # >6 fractional digits still parses (trimmed to microseconds).
-        self.assertIsInstance(age("2026-07-11T11:59:00.123456789Z")["last_handshake_age_seconds"], int)
+        # >6 fractional digits parse (trimmed to microseconds): 11:59:00.123456 -> age 59.
+        self.assertEqual(age("2026-07-11T11:59:00.123456789Z")["last_handshake_age_seconds"], 59)
         # unparseable -> both handshake fields null.
         bad = age("not-a-timestamp")
         self.assertIsNone(bad["last_handshake"])
         self.assertIsNone(bad["last_handshake_age_seconds"])
 
     def test_byte_counters_ignore_bool_and_float(self):
-        m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x",
-                           "TxBytes": True, "RxBytes": 1.5}, label="p")
-        self.assertIsNone(m["tx_bytes_total"])   # bool is not counted as int
+        for tx in (True, False):  # bool is an int subclass; both must be rejected
+            with self.subTest(tx=tx):
+                m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x", "TxBytes": tx}, label="p")
+                self.assertIsNone(m["tx_bytes_total"])
+        m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x", "RxBytes": 1.5}, label="p")
         self.assertIsNone(m["rx_bytes_total"])   # float rejected
+
+    def test_cli_survives_peer_metrics_exception(self):
+        # The subcommand's "always exits 0" contract holds even if extraction raises.
+        args = argparse.Namespace(node="prim", status_json_file=None, json=False)
+        with mock.patch.object(hc, "get_status", return_value=({}, True)), \
+             mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.cmd_peer_metrics(args)
+        self.assertEqual(rc, 0)
+        obj = json.loads(buf.getvalue())
+        self.assertEqual(set(obj), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in obj.values()))
 
     def test_online_non_bool_is_null_and_unknown_path(self):
         for online in (1, "true"):
@@ -974,6 +989,12 @@ class ConnectorsCliTests(unittest.TestCase):
         for row in report["connectors"]:
             self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
             self.assertTrue(all(v is None for v in row["metrics"].values()))
+        # Text mode shares the attach path: existing lines survive, metrics -> `-`.
+        with mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            rc_text, out_text = run_cli(self._args("--devices-json-file", str(self.devices_file)))
+        self.assertEqual(rc_text, 0)
+        self.assertIn("connector=primary label=primary-vps", out_text)
+        self.assertIn("[metrics] connector=primary tx=-", out_text)
 
     def test_json_schema_version_unchanged_by_metrics(self):
         rc, out = run_cli(self._args("--json"))
