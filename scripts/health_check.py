@@ -910,7 +910,9 @@ def _parse_handshake(value: Any) -> Optional[dt.datetime]:
     text = value.strip()
     if not text or text.startswith("0001-01-01"):
         return None
-    text = text.replace("Z", "+00:00")
+    # Only a trailing 'Z' is the UTC designator; don't touch any other 'Z'.
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     # Python 3.9 fromisoformat accepts at most microsecond precision; trim extra.
     text = re.sub(r"(\.\d{6})\d+", r"\1", text)
     try:
@@ -924,9 +926,10 @@ def _parse_handshake(value: Any) -> Optional[dt.datetime]:
 
 def _connection_path(cur_addr: Optional[str], online: Optional[bool]) -> str:
     """direct if a current direct address is present; else derp when the peer is
-    online; else unknown. Verified on Tailscale 1.98.2: Relay is the home DERP
-    region (set for all peers), so CurAddr is the direct-path discriminator, not
-    Relay. Consumers needing certainty can use the raw cur_addr / relay fields."""
+    online; else unknown. Observed on this host with Tailscale 1.98.2: Relay was
+    set for every observed peer (the home/preferred DERP region), so CurAddr is
+    the direct-path discriminator, not Relay. Best-effort: consumers needing
+    certainty can use the raw cur_addr / relay fields."""
     if cur_addr:
         return "direct"
     if online is True:
@@ -959,15 +962,28 @@ def peer_metrics(
     obj["rx_bytes_total"] = _int_or_none(node.get("RxBytes"))
     obj["online"] = _bool_or_none(node.get("Online"))
     obj["active"] = _bool_or_none(node.get("Active"))
-    handshake = _parse_handshake(node.get("LastHandshake"))
+    raw_handshake = node.get("LastHandshake")
+    handshake = _parse_handshake(raw_handshake)
     if handshake is not None:
-        obj["last_handshake"] = _str_or_none(node.get("LastHandshake"))
-        current = now or dt.datetime.now(dt.timezone.utc)
+        obj["last_handshake"] = raw_handshake.strip() if isinstance(raw_handshake, str) else None
+        current = now if now is not None else dt.datetime.now(dt.timezone.utc)
+        if current.tzinfo is None:  # normalize a caller-supplied naive now to UTC
+            current = current.replace(tzinfo=dt.timezone.utc)
         obj["last_handshake_age_seconds"] = max(0, int((current - handshake).total_seconds()))
     obj["relay"] = _str_or_none(node.get("Relay"))
     obj["cur_addr"] = _str_or_none(node.get("CurAddr"))
     obj["connection_path"] = _connection_path(obj["cur_addr"], obj["online"])
     return obj
+
+
+def _safe_peer_metrics(status: dict[str, Any], available: bool, label: str) -> dict[str, Any]:
+    """Non-gating wrapper: metrics extraction must NEVER abort the monitor report
+    (the hard rule in docs/design/metrics-collection.md), so any unexpected error
+    degrades to the null-filled object instead of propagating."""
+    try:
+        return peer_metrics(status, available, label)
+    except Exception:
+        return _null_metrics()
 
 
 def fetch_devices_via_api() -> Optional[list[Any]]:  # pragma: no cover - network path
@@ -1072,8 +1088,9 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             "rtt_ms": result.rtt_ms,
             "routes": route_count,
             # Additive per-peer counters + liveness (read-only). Never gates the
-            # monitor's health verdict below; null-filled if unavailable.
-            "metrics": peer_metrics(status, available, label),
+            # monitor's health verdict below; null-filled (and exception-isolated)
+            # if unavailable.
+            "metrics": _safe_peer_metrics(status, available, label),
         })
     # In oldest-first HA exactly one connector serves routes at a time, so the
     # pair is route-healthy when at least one advertises app-connector/subnet

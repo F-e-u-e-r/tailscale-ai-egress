@@ -858,6 +858,42 @@ class PeerMetricsTests(unittest.TestCase):
                     obj = json.loads(result.stdout)
                     self.assertEqual(set(obj), set(hc.PEER_METRIC_KEYS))
 
+    def test_naive_now_is_normalized(self):
+        # A caller-supplied naive `now` must not raise against the aware handshake.
+        peer = {"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5",
+                "LastHandshake": "2026-07-11T11:59:00+00:00"}
+        m = self._metrics(peer, label="p", now=hc.dt.datetime(2026, 7, 11, 12, 0, 0))  # naive
+        self.assertEqual(m["last_handshake_age_seconds"], 60)
+
+    def test_handshake_parse_variants(self):
+        now = hc.dt.datetime(2026, 7, 11, 12, 0, 0, tzinfo=hc.dt.timezone.utc)
+
+        def age(hs):
+            peer = {"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5", "LastHandshake": hs}
+            return self._metrics(peer, label="p", now=now)
+
+        self.assertEqual(age("2026-07-11T11:59:00Z")["last_handshake_age_seconds"], 60)   # trailing Z
+        self.assertEqual(age("2026-07-11T11:59:00")["last_handshake_age_seconds"], 60)    # naive input -> UTC
+        # >6 fractional digits still parses (trimmed to microseconds).
+        self.assertIsInstance(age("2026-07-11T11:59:00.123456789Z")["last_handshake_age_seconds"], int)
+        # unparseable -> both handshake fields null.
+        bad = age("not-a-timestamp")
+        self.assertIsNone(bad["last_handshake"])
+        self.assertIsNone(bad["last_handshake_age_seconds"])
+
+    def test_byte_counters_ignore_bool_and_float(self):
+        m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x",
+                           "TxBytes": True, "RxBytes": 1.5}, label="p")
+        self.assertIsNone(m["tx_bytes_total"])   # bool is not counted as int
+        self.assertIsNone(m["rx_bytes_total"])   # float rejected
+
+    def test_online_non_bool_is_null_and_unknown_path(self):
+        for online in (1, "true"):
+            with self.subTest(online=online):
+                m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": online, "CurAddr": ""}, label="p")
+                self.assertIsNone(m["online"])                       # non-bool Online -> null
+                self.assertEqual(m["connection_path"], "unknown")    # not exactly True -> not derp
+
 
 class ConnectorsCliTests(unittest.TestCase):
     def setUp(self):
@@ -926,6 +962,22 @@ class ConnectorsCliTests(unittest.TestCase):
         self.assertIn("[metrics] connector=primary tx=", out)
         self.assertIn("[metrics] connector=fallback tx=", out)
         self.assertIn("path=", out)
+
+    def test_metrics_failure_is_non_gating(self):
+        # A raising peer_metrics must NOT change the verdict/exit or existing
+        # output; metrics degrade to the null-filled object (hard non-gating rule).
+        with mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            rc, out = run_cli(self._args("--json", "--devices-json-file", str(self.devices_file)))
+        report = json.loads(out)
+        self.assertEqual(rc, 0)                        # verdict/exit unchanged
+        self.assertEqual(report["overall"], "healthy")
+        for row in report["connectors"]:
+            self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
+            self.assertTrue(all(v is None for v in row["metrics"].values()))
+
+    def test_json_schema_version_unchanged_by_metrics(self):
+        rc, out = run_cli(self._args("--json"))
+        self.assertEqual(json.loads(out)["schema_version"], hc.STATE_SCHEMA_VERSION)
 
     def test_degraded_when_offline(self):
         status = json.loads(json.dumps(CONN_STATUS))
