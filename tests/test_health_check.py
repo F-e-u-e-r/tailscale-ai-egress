@@ -763,6 +763,153 @@ class ConnectorOrderingUnitTests(unittest.TestCase):
         self.assertNotIn("ex/ample", captured["url"])
 
 
+class PeerMetricsTests(unittest.TestCase):
+    NOW = hc.dt.datetime(2026, 7, 11, 12, 0, 0, tzinfo=hc.dt.timezone.utc)
+
+    def _status(self, peer):
+        p = dict(peer)
+        p.setdefault("ID", "n1")
+        return {
+            "BackendState": "Running",
+            "Self": {"ID": "self", "HostName": "self", "TailscaleIPs": ["100.64.0.9"]},
+            "Peer": {"k": p},
+        }
+
+    def _metrics(self, peer, *, label="prim", now=None):
+        return hc.peer_metrics(self._status(peer), True, label, now=now)
+
+    def test_direct_peer_full_object(self):
+        peer = {
+            "HostName": "prim", "TailscaleIPs": ["100.64.0.1"], "Online": True, "Active": True,
+            "TxBytes": 1234, "RxBytes": 5678, "LastHandshake": "2026-07-11T11:59:00+00:00",
+            "Relay": "sin", "CurAddr": "1.2.3.4:41641",
+        }
+        m = self._metrics(peer, now=self.NOW)
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))  # fixed key set, no omissions
+        self.assertEqual(m["connection_path"], "direct")
+        self.assertEqual(m["tx_bytes_total"], 1234)
+        self.assertEqual(m["rx_bytes_total"], 5678)
+        self.assertIs(m["online"], True)
+        self.assertIs(m["active"], True)
+        self.assertEqual(m["relay"], "sin")
+        self.assertEqual(m["cur_addr"], "1.2.3.4:41641")
+        self.assertEqual(m["last_handshake"], "2026-07-11T11:59:00+00:00")
+        self.assertEqual(m["last_handshake_age_seconds"], 60)
+
+    def test_derp_when_curaddr_empty_and_online(self):
+        m = self._metrics({"HostName": "d", "TailscaleIPs": ["100.64.0.2"], "Online": True, "CurAddr": "", "Relay": "sin"}, label="d")
+        self.assertEqual(m["connection_path"], "derp")
+        self.assertIsNone(m["cur_addr"])
+
+    def test_unknown_when_offline_or_online_null(self):
+        for peer in (
+            {"HostName": "x", "TailscaleIPs": ["100.64.0.3"], "Online": False, "CurAddr": ""},
+            {"HostName": "x", "TailscaleIPs": ["100.64.0.3"], "CurAddr": ""},            # Online absent
+            {"HostName": "x", "TailscaleIPs": ["100.64.0.3"], "Online": None, "CurAddr": ""},  # Online null
+        ):
+            with self.subTest(online=peer.get("Online", "absent")):
+                m = self._metrics(peer, label="x")
+                # Empty CurAddr with online not exactly True (false/null/absent)
+                # must yield unknown, never derp.
+                self.assertEqual(m["connection_path"], "unknown")
+
+    def test_relay_unset_preserved_raw(self):
+        m = self._metrics({"HostName": "r", "TailscaleIPs": ["100.64.0.4"], "Online": True, "CurAddr": "1.2.3.4:5", "Relay": ""}, label="r")
+        self.assertIsNone(m["relay"])            # empty Relay -> null, not ""
+        self.assertEqual(m["cur_addr"], "1.2.3.4:5")
+        self.assertEqual(m["connection_path"], "direct")
+
+    def test_zero_value_handshake_is_null(self):
+        m = self._metrics({"HostName": "z", "TailscaleIPs": ["100.64.0.5"], "Online": True, "CurAddr": "", "LastHandshake": "0001-01-01T00:00:00Z"}, label="z")
+        self.assertIsNone(m["last_handshake"])
+        self.assertIsNone(m["last_handshake_age_seconds"])
+
+    def test_missing_fields_null_without_omitting_keys(self):
+        m = self._metrics({"HostName": "m", "TailscaleIPs": ["100.64.0.6"], "Online": True, "CurAddr": ""}, label="m")
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertIsNone(m["tx_bytes_total"])
+        self.assertIsNone(m["rx_bytes_total"])
+
+    def test_transport_failure_is_null_filled(self):
+        m = hc.peer_metrics({}, False, "anything")
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in m.values()))
+
+    def test_peer_not_found_is_null_filled(self):
+        m = self._metrics({"HostName": "prim", "TailscaleIPs": ["100.64.0.1"]}, label="does-not-exist")
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in m.values()))
+
+    def test_cli_always_exits_zero_and_prints_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "status.json"
+            fixture.write_text(
+                json.dumps(self._status({"HostName": "prim", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5", "TxBytes": 5})),
+                encoding="utf-8",
+            )
+            for node in ("prim", "missing-peer"):
+                with self.subTest(node=node):
+                    result = subprocess.run(
+                        [sys.executable, str(ROOT / "scripts/health_check.py"),
+                         "peer-metrics", "--node", node, "--status-json-file", str(fixture)],
+                        text=True, capture_output=True, cwd=ROOT,
+                    )
+                    self.assertEqual(result.returncode, 0)
+                    obj = json.loads(result.stdout)
+                    self.assertEqual(set(obj), set(hc.PEER_METRIC_KEYS))
+
+    def test_naive_now_is_normalized(self):
+        # A caller-supplied naive `now` must not raise against the aware handshake.
+        peer = {"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5",
+                "LastHandshake": "2026-07-11T11:59:00+00:00"}
+        m = self._metrics(peer, label="p", now=hc.dt.datetime(2026, 7, 11, 12, 0, 0))  # naive
+        self.assertEqual(m["last_handshake_age_seconds"], 60)
+
+    def test_handshake_parse_variants(self):
+        now = hc.dt.datetime(2026, 7, 11, 12, 0, 0, tzinfo=hc.dt.timezone.utc)
+
+        def age(hs):
+            peer = {"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5", "LastHandshake": hs}
+            return self._metrics(peer, label="p", now=now)
+
+        self.assertEqual(age("2026-07-11T11:59:00Z")["last_handshake_age_seconds"], 60)   # trailing Z
+        self.assertEqual(age("2026-07-11T11:59:00")["last_handshake_age_seconds"], 60)    # naive input -> UTC
+        # >6 fractional digits parse (trimmed to microseconds): 11:59:00.123456 -> age 59.
+        self.assertEqual(age("2026-07-11T11:59:00.123456789Z")["last_handshake_age_seconds"], 59)
+        # unparseable -> both handshake fields null.
+        bad = age("not-a-timestamp")
+        self.assertIsNone(bad["last_handshake"])
+        self.assertIsNone(bad["last_handshake_age_seconds"])
+
+    def test_byte_counters_ignore_bool_and_float(self):
+        for tx in (True, False):  # bool is an int subclass; both must be rejected
+            with self.subTest(tx=tx):
+                m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x", "TxBytes": tx}, label="p")
+                self.assertIsNone(m["tx_bytes_total"])
+        m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x", "RxBytes": 1.5}, label="p")
+        self.assertIsNone(m["rx_bytes_total"])   # float rejected
+
+    def test_cli_survives_peer_metrics_exception(self):
+        # The subcommand's "always exits 0" contract holds even if extraction raises.
+        args = argparse.Namespace(node="prim", status_json_file=None, json=False)
+        with mock.patch.object(hc, "get_status", return_value=({}, True)), \
+             mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.cmd_peer_metrics(args)
+        self.assertEqual(rc, 0)
+        obj = json.loads(buf.getvalue())
+        self.assertEqual(set(obj), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in obj.values()))
+
+    def test_online_non_bool_is_null_and_unknown_path(self):
+        for online in (1, "true"):
+            with self.subTest(online=online):
+                m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": online, "CurAddr": ""}, label="p")
+                self.assertIsNone(m["online"])                       # non-bool Online -> null
+                self.assertEqual(m["connection_path"], "unknown")    # not exactly True -> not derp
+
+
 class ConnectorsCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -809,6 +956,49 @@ class ConnectorsCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("overall=healthy", out)
         self.assertIn("ordering=primary_is_oldest", out)
+
+    def test_json_connectors_include_metrics_object(self):
+        # Additive: every connector row gains a `metrics` object with the full key
+        # set; existing keys and the overall verdict are unchanged.
+        rc, out = run_cli(self._args("--json"))
+        report = json.loads(out)
+        self.assertIn("overall", report)
+        self.assertEqual(len(report["connectors"]), 2)
+        for row in report["connectors"]:
+            self.assertIn("online", row)          # existing key unchanged
+            self.assertIn("metrics", row)         # new additive key
+            self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
+
+    def test_text_connectors_append_metrics_line(self):
+        # Text mode is append-only: a new [metrics] line per connector; the
+        # existing connector= line is not reworded/reordered.
+        rc, out = run_cli(self._args())
+        self.assertIn("connector=primary label=primary-vps", out)   # existing line intact
+        self.assertIn("[metrics] connector=primary tx=", out)
+        self.assertIn("[metrics] connector=fallback tx=", out)
+        self.assertIn("path=", out)
+
+    def test_metrics_failure_is_non_gating(self):
+        # A raising peer_metrics must NOT change the verdict/exit or existing
+        # output; metrics degrade to the null-filled object (hard non-gating rule).
+        with mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            rc, out = run_cli(self._args("--json", "--devices-json-file", str(self.devices_file)))
+        report = json.loads(out)
+        self.assertEqual(rc, 0)                        # verdict/exit unchanged
+        self.assertEqual(report["overall"], "healthy")
+        for row in report["connectors"]:
+            self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
+            self.assertTrue(all(v is None for v in row["metrics"].values()))
+        # Text mode shares the attach path: existing lines survive, metrics -> `-`.
+        with mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
+            rc_text, out_text = run_cli(self._args("--devices-json-file", str(self.devices_file)))
+        self.assertEqual(rc_text, 0)
+        self.assertIn("connector=primary label=primary-vps", out_text)
+        self.assertIn("[metrics] connector=primary tx=-", out_text)
+
+    def test_json_schema_version_unchanged_by_metrics(self):
+        rc, out = run_cli(self._args("--json"))
+        self.assertEqual(json.loads(out)["schema_version"], hc.STATE_SCHEMA_VERSION)
 
     def test_degraded_when_offline(self):
         status = json.loads(json.dumps(CONN_STATUS))

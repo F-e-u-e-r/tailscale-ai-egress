@@ -26,6 +26,14 @@ both Python CLIs report it with `--version`.
   `FAILOVER_LABEL`, and `FAILOVER_REASON` in the environment. Environment only
   (not parsed from `failover.env`); its exit status is ignored and cannot change
   the switch outcome.
+- Per-connector metrics (counters + liveness), read-only. `scripts/health_check.py`
+  gains a `peer-metrics --node <label>` subcommand printing a fixed-shape JSON
+  object (tx/rx byte counters, online/active, last-handshake age, relay/cur_addr,
+  and a derived `connection_path`), and the `connectors` report (used by
+  `monitor-connectors.sh`) now includes a `metrics` object per connector in
+  `--json` plus an append-only `[metrics]` text line. Additive only; metrics never
+  gate the monitor's health verdict. Byte counters are cumulative since tailscaled
+  started, not billing usage. See `docs/design/metrics-collection.md`.
 
 ### Changed
 
