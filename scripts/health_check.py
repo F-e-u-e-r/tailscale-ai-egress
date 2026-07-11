@@ -863,6 +863,113 @@ def node_routes(status: dict[str, Any], node_id: Optional[str], ips: list[str]) 
     return extra
 
 
+# --------------------------------------------------------------------------- #
+# Per-peer metrics: read-only counters + liveness. See
+# docs/design/metrics-collection.md. Single normative shape: a FIXED key set,
+# keys never omitted; every value null on transport/resolution failure.
+# --------------------------------------------------------------------------- #
+PEER_METRIC_KEYS = (
+    "tx_bytes_total",
+    "rx_bytes_total",
+    "online",
+    "active",
+    "last_handshake",
+    "last_handshake_age_seconds",
+    "relay",
+    "cur_addr",
+    "connection_path",
+)
+
+
+def _null_metrics() -> dict[str, Any]:
+    return {key: None for key in PEER_METRIC_KEYS}
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def _bool_or_none(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
+def _fmt_metric(value: Any) -> str:
+    """Render a metric value for text output; null renders as ``-``."""
+    return "-" if value is None else str(value)
+
+
+def _parse_handshake(value: Any) -> Optional[dt.datetime]:
+    """Parse a Tailscale RFC3339 LastHandshake into an aware UTC datetime, or None
+    for the Go zero-value (0001-01-01...), absent, or unparseable timestamp."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.startswith("0001-01-01"):
+        return None
+    text = text.replace("Z", "+00:00")
+    # Python 3.9 fromisoformat accepts at most microsecond precision; trim extra.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _connection_path(cur_addr: Optional[str], online: Optional[bool]) -> str:
+    """direct if a current direct address is present; else derp when the peer is
+    online; else unknown. Verified on Tailscale 1.98.2: Relay is the home DERP
+    region (set for all peers), so CurAddr is the direct-path discriminator, not
+    Relay. Consumers needing certainty can use the raw cur_addr / relay fields."""
+    if cur_addr:
+        return "direct"
+    if online is True:
+        return "derp"
+    return "unknown"
+
+
+def peer_metrics(
+    status: dict[str, Any],
+    available: bool,
+    label: str,
+    *,
+    now: Optional[dt.datetime] = None,
+) -> dict[str, Any]:
+    """Read-only per-peer counters + liveness for a connector label. Returns the
+    fixed-key metrics object; ALL values null on transport failure (status
+    unavailable) or resolution failure (peer not found). On a resolved peer,
+    individual missing / zero-value fields are null but keys are never omitted.
+
+    tx/rx are cumulative byte counters since tailscaled started (reset on restart),
+    NOT session or billing usage."""
+    if not available:
+        return _null_metrics()
+    node_id, ips = resolve_identity(status, label)
+    node = _find_node(status, node_id, ips)
+    if node is None:
+        return _null_metrics()
+    obj = _null_metrics()
+    obj["tx_bytes_total"] = _int_or_none(node.get("TxBytes"))
+    obj["rx_bytes_total"] = _int_or_none(node.get("RxBytes"))
+    obj["online"] = _bool_or_none(node.get("Online"))
+    obj["active"] = _bool_or_none(node.get("Active"))
+    handshake = _parse_handshake(node.get("LastHandshake"))
+    if handshake is not None:
+        obj["last_handshake"] = _str_or_none(node.get("LastHandshake"))
+        current = now or dt.datetime.now(dt.timezone.utc)
+        obj["last_handshake_age_seconds"] = max(0, int((current - handshake).total_seconds()))
+    obj["relay"] = _str_or_none(node.get("Relay"))
+    obj["cur_addr"] = _str_or_none(node.get("CurAddr"))
+    obj["connection_path"] = _connection_path(obj["cur_addr"], obj["online"])
+    return obj
+
+
 def fetch_devices_via_api() -> Optional[list[Any]]:  # pragma: no cover - network path
     token = os.environ.get("TAILSCALE_API_KEY")
     if not token:
@@ -964,6 +1071,9 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             "reachable": result.reachable,
             "rtt_ms": result.rtt_ms,
             "routes": route_count,
+            # Additive per-peer counters + liveness (read-only). Never gates the
+            # monitor's health verdict below; null-filled if unavailable.
+            "metrics": peer_metrics(status, available, label),
         })
     # In oldest-first HA exactly one connector serves routes at a time, so the
     # pair is route-healthy when at least one advertises app-connector/subnet
@@ -989,10 +1099,27 @@ def cmd_connectors(args: argparse.Namespace) -> int:
                 f"online={_fmt_online(row['online'])} reachable={int(row['reachable'])} "
                 f"rtt_ms={row['rtt_ms']} routes={route_text}"
             )
+            m = row["metrics"]
+            print(
+                f"[metrics] connector={row['connector']} "
+                f"tx={_fmt_metric(m['tx_bytes_total'])} rx={_fmt_metric(m['rx_bytes_total'])} "
+                f"path={_fmt_metric(m['connection_path'])} "
+                f"handshake_age={_fmt_metric(m['last_handshake_age_seconds'])}"
+            )
         print(f"ordering={order} reason={order_reason}")
         print(f"routes_serving={serving}")
         print(f"overall={overall}")
     return 0 if overall_healthy else 1
+
+
+def cmd_peer_metrics(args: argparse.Namespace) -> int:
+    """Print the read-only metrics object for one connector label as JSON. Always
+    exits 0 when it can print the object (including the null-filled object on
+    transport/resolution failure); non-zero only for usage/arg errors. This is the
+    single source of truth for the metrics object shape used by the monitor."""
+    status, available = get_status(args.status_json_file)
+    print(json.dumps(peer_metrics(status, available, args.node), sort_keys=True))
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1113,6 +1240,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connectors.add_argument("--json", action="store_true")
     connectors.set_defaults(func=cmd_connectors)
+
+    peer = sub.add_parser(
+        "peer-metrics",
+        help="Read-only per-peer counters + liveness for one connector label (JSON; always exits 0).",
+    )
+    peer.add_argument("--node", required=True)
+    peer.add_argument("--status-json-file")
+    peer.add_argument("--json", action="store_true", help="Accepted for consistency; output is always JSON.")
+    peer.set_defaults(func=cmd_peer_metrics)
 
     return parser
 

@@ -32,6 +32,12 @@ reachability, and -- only if a Tailscale API token is configured -- the
 device.created ordering (to confirm the intended primary is the oldest). With
 no token it prints "ordering=unavailable" and still runs the health checks.
 
+Each connector also carries read-only metrics (tx/rx byte counters cumulative
+since tailscaled started, last-handshake age, and a derived direct/derp path):
+a "metrics" object per connector in --json, and an append-only "[metrics]" line
+in text mode. Metrics never affect the exit status. See
+docs/design/metrics-collection.md.
+
 Exit status: 0 if both connectors are online and reachable, 1 if degraded.
 
 Options:

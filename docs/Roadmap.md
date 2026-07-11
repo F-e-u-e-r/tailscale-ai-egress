@@ -88,9 +88,16 @@ Highest user value first.
   state is written and pre-existing v1 state still reads; tests cover ordered
   fallback and the v1 read-compat path.
 - **Monitoring integration.** `1.x additive-safe`.
-  `monitor-connectors.sh --prometheus-textfile <path>` emits node_exporter
-  textfile format; add healthchecks.io / Uptime Kuma examples. No server, no
-  telemetry.
+  Step 1 (**done**): per-connector counters + liveness in the monitor's `--json`
+  (`metrics` object) and an append-only `[metrics]` text line, plus a
+  `health_check.py peer-metrics` subcommand — see
+  [design/metrics-collection.md](design/metrics-collection.md). Establishes that
+  no Tailscale "app wrapper" is needed (raw inputs come from `status --json` /
+  `tailscale ping` / `tailscale metrics print`).
+  Next: `latency_ms` from `tailscale ping`; then
+  `monitor-connectors.sh --prometheus-textfile <path>` emitting node_exporter
+  textfile format (wrapping `tailscale metrics print` + status gauges), plus
+  healthchecks.io / Uptime Kuma examples. No server, no telemetry.
   *Acceptance:* `--prometheus-textfile` writes valid node_exporter textfile
   output; existing text/`--json` modes are unchanged; a test parses the emitted
   file.
