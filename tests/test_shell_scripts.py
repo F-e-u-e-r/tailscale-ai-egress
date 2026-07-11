@@ -167,6 +167,33 @@ class ShellScriptTests(unittest.TestCase):
         self.assertIn("run_root_output tailscale", restore)
         self.assertNotIn("ai_egress_run_root_output", restore)
 
+    def test_run_root_output_dispatch_unchanged(self):
+        # run_root_output (restore-only; deferred from the shared-lib migration)
+        # must keep its behavior: direct/sudo dispatch by (root/USE_SUDO) and
+        # crucially NO dry-run branch. Extract the REAL function from the script
+        # and exercise it; a body change that altered dispatch or added a dry-run
+        # branch fails this.
+        src = (ROOT / "restore-connector.sh").read_text(encoding="utf-8")
+        match = re.search(r"^run_root_output\(\) \{.*?^\}", src, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "run_root_output definition not found")
+        func = match.group(0)
+        for uid in ("0", "1000"):
+            for use_sudo in ("0", "1"):
+                with self.subTest(uid=uid, use_sudo=use_sudo):
+                    # DRY_RUN=1 must be IGNORED (run_root_output has no dry-run branch).
+                    preamble = (
+                        f'id() {{ echo "{uid}"; }}\n'
+                        'sudo() { printf "SUDO "; "$@"; }\n'
+                        f'USE_SUDO={use_sudo}\nDRY_RUN=1\n'
+                    )
+                    out = subprocess.run(
+                        ["bash", "-c", f"{preamble}{func}\nrun_root_output printf 'CMD\\n'"],
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(out.returncode, 0)
+                    expected = "SUDO CMD\n" if (uid != "0" and use_sudo != "0") else "CMD\n"
+                    self.assertEqual(out.stdout, expected)
+
     def test_disable_exit_node_fails_clearly_without_common_lib(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "disable-exit-node.sh"
