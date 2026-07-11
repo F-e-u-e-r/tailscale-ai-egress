@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
 VERSION="${VERSION:-1.1.1}"
 
+# Shared internal library (source-only; see docs/design/shared-shell-library.md).
+COMMON_LIB="$SCRIPT_DIR/scripts/lib/common.sh"
+if [ ! -r "$COMMON_LIB" ]; then
+  printf 'error: missing shared library %s\n' "$COMMON_LIB" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/common.sh
+. "$COMMON_LIB"
+
 REGION="${REGION:-}"
 REGION_LOWER=""
 GENERATED_DIR="${GENERATED_DIR:-$SCRIPT_DIR/generated}"
@@ -197,24 +206,6 @@ resolve_connector_identity() {
   fi
 }
 
-run_root() {
-  if [ "$DRY_RUN" = "1" ]; then
-    printf '+'
-    if [ "$(id -u)" -ne 0 ] && [ "$USE_SUDO" != "0" ]; then
-      printf ' sudo'
-    fi
-    printf ' %q' "$@"
-    printf '\n'
-    return 0
-  fi
-
-  if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -296,7 +287,7 @@ check_connector_after_disable() {
 main() {
   parse_args "$@"
   preflight
-  run_root tailscale set --advertise-exit-node=false
+  ai_egress_run_root tailscale set --advertise-exit-node=false
   note "[OK] Exit-node advertising disabled."
   if [ "$DRY_RUN" != "1" ]; then
     check_connector_after_disable

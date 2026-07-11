@@ -143,6 +143,33 @@ class ShellScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing shared library", result.stderr)
 
+    def test_migrated_consumers_use_shared_run_root(self):
+        # Structural guard for the shared-lib migration: each migrated consumer
+        # must source common.sh, no longer define an inline run_root(), and call
+        # ai_egress_run_root. A revert to the inline copy fails this.
+        for name in ("enable-exit-node.sh", "disable-exit-node.sh", "restore-connector.sh"):
+            with self.subTest(script=name):
+                text = (ROOT / name).read_text(encoding="utf-8")
+                self.assertIn('. "$COMMON_LIB"', text)
+                self.assertNotIn("run_root() {", text)
+                self.assertIn("ai_egress_run_root", text)
+
+    def test_disable_exit_node_fails_clearly_without_common_lib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "disable-exit-node.sh"
+            script.write_text((ROOT / "disable-exit-node.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing shared library", result.stderr)
+
+    def test_restore_connector_fails_clearly_without_common_lib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "restore-connector.sh"
+            script.write_text((ROOT / "restore-connector.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing shared library", result.stderr)
+
     def test_bootstrap_common_domain_pack_overrides_env_and_policy_default_stays_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = self._bootstrap_dry_run_env(tmp)

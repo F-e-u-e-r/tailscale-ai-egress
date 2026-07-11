@@ -29,11 +29,12 @@ both Python CLIs report it with `--version`.
 
 ### Changed
 
-- Internal refactor (no behavior change): `enable-exit-node.sh` now sources the
-  shared `scripts/lib/common.sh` for `run_root` (as `ai_egress_run_root`), the
-  first step of the shared-shell-library migration. `scripts/lib/common.sh` is
-  therefore now a runtime dependency of `enable-exit-node.sh` and is verified in
-  the release package. CI lints with `shellcheck -x`.
+- Internal refactor (no behavior change): `enable-exit-node.sh`,
+  `disable-exit-node.sh`, and `restore-connector.sh` now source the shared
+  `scripts/lib/common.sh` for `run_root` (as `ai_egress_run_root`), completing the
+  first helper of the shared-shell-library migration across all three consumers.
+  `scripts/lib/common.sh` is therefore a runtime dependency of those scripts and
+  is verified in the release package. CI lints with `shellcheck -x`.
 
 ## [1.1.1] - 2026-07-08
 
