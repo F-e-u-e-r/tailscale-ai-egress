@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+import re
 import select
 import signal
 import subprocess
@@ -140,26 +141,38 @@ class ShellScriptTests(unittest.TestCase):
             script = Path(tmp) / "enable-exit-node.sh"
             script.write_text((ROOT / "enable-exit-node.sh").read_text(encoding="utf-8"), encoding="utf-8")
             result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("missing shared library", result.stderr)
 
     def test_migrated_consumers_use_shared_run_root(self):
         # Structural guard for the shared-lib migration: each migrated consumer
-        # must source common.sh, no longer define an inline run_root(), and call
-        # ai_egress_run_root. A revert to the inline copy fails this.
-        for name in ("enable-exit-node.sh", "disable-exit-node.sh", "restore-connector.sh"):
+        # must source common.sh, no longer define an inline run_root(), call
+        # ai_egress_run_root at least as many times as it used to, and leave NO
+        # bare `run_root` call token behind (a partial rename). A revert to the
+        # inline copy, or a missed call site, fails this.
+        min_calls = {"enable-exit-node.sh": 4, "disable-exit-node.sh": 1, "restore-connector.sh": 3}
+        for name, expected in min_calls.items():
             with self.subTest(script=name):
                 text = (ROOT / name).read_text(encoding="utf-8")
                 self.assertIn('. "$COMMON_LIB"', text)
                 self.assertNotIn("run_root() {", text)
-                self.assertIn("ai_egress_run_root", text)
+                self.assertGreaterEqual(text.count("ai_egress_run_root"), expected)
+                # No bare `run_root` token: allows ai_egress_run_root / run_root_output.
+                leftover = re.search(r"(?<![A-Za-z_])run_root(?![A-Za-z_(])", text)
+                self.assertIsNone(leftover, f"leftover bare run_root token in {name}")
+
+        # restore-connector.sh must PRESERVE its separate run_root_output helper.
+        restore = (ROOT / "restore-connector.sh").read_text(encoding="utf-8")
+        self.assertIn("run_root_output() {", restore)
+        self.assertIn("run_root_output tailscale", restore)
+        self.assertNotIn("ai_egress_run_root_output", restore)
 
     def test_disable_exit_node_fails_clearly_without_common_lib(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "disable-exit-node.sh"
             script.write_text((ROOT / "disable-exit-node.sh").read_text(encoding="utf-8"), encoding="utf-8")
             result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("missing shared library", result.stderr)
 
     def test_restore_connector_fails_clearly_without_common_lib(self):
@@ -167,7 +180,7 @@ class ShellScriptTests(unittest.TestCase):
             script = Path(tmp) / "restore-connector.sh"
             script.write_text((ROOT / "restore-connector.sh").read_text(encoding="utf-8"), encoding="utf-8")
             result = subprocess.run(["bash", str(script), "--dry-run"], text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("missing shared library", result.stderr)
 
     def test_bootstrap_common_domain_pack_overrides_env_and_policy_default_stays_safe(self):
