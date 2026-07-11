@@ -60,10 +60,12 @@ reserves names and contracts only.
    and the `ai_egress_*` convention. Lint + a source-only test in CI.
 2. **First helper — `ai_egress_run_root` (done):** the smallest, most
    self-contained helper. Extracted into `scripts/lib/common.sh` and adopted by
-   `enable-exit-node.sh` only, with a parity test (below) and a missing-library
-   guard. `disable-exit-node.sh` and `restore-connector.sh` still carry their
-   (byte-identical) inline copies; they migrate in follow-up steps. CI runs
-   `shellcheck -x` so the sourced library is followed.
+   `enable-exit-node.sh`, `disable-exit-node.sh`, and `restore-connector.sh` (all
+   three had a byte-identical inline `run_root`), each with the missing-library
+   guard and structural tests; the helper is covered by a parity test. CI runs
+   `shellcheck -x` so the sourced library is followed. Deferred: restore's
+   `run_root_output` (no dry-run branch) and bootstrap's `run_root` variant (no
+   `USE_SUDO`).
 3. **`ai_egress_have` / logging helpers:** trivial, low-risk; migrate all three
    consumers.
 4. **`ai_egress_read_line` / `ai_egress_read_secret`:** migrate one consumer at a

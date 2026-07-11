@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
 VERSION="${VERSION:-1.1.1}"
 
+# Shared internal library (source-only; see docs/design/shared-shell-library.md).
+COMMON_LIB="$SCRIPT_DIR/scripts/lib/common.sh"
+if [ ! -r "$COMMON_LIB" ]; then
+  printf 'error: missing shared library %s\n' "$COMMON_LIB" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/common.sh
+. "$COMMON_LIB"
+
 REGION="${REGION:-}"
 REGION_LOWER=""
 GENERATED_DIR="${GENERATED_DIR:-$SCRIPT_DIR/generated}"
@@ -265,24 +274,6 @@ resolve_connector_identity() {
   CONNECTOR_HOSTNAME=""
 }
 
-run_root() {
-  if [ "$DRY_RUN" = "1" ]; then
-    printf '+'
-    if [ "$(id -u)" -ne 0 ] && [ "$USE_SUDO" != "0" ]; then
-      printf ' sudo'
-    fi
-    printf ' %q' "$@"
-    printf '\n'
-    return 0
-  fi
-
-  if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
-
 run_root_output() {
   # Only call this from non-dry-run branches that need to inspect command output.
   if [ "$(id -u)" -eq 0 ] || [ "$USE_SUDO" = "0" ]; then
@@ -366,10 +357,10 @@ connector_set_unsupported() {
 }
 
 default_restore() {
-  run_root tailscale set --advertise-exit-node=false
+  ai_egress_run_root tailscale set --advertise-exit-node=false
 
   if [ "$DRY_RUN" = "1" ]; then
-    run_root tailscale set --advertise-connector
+    ai_egress_run_root tailscale set --advertise-connector
   else
     local output
     if ! output="$(run_root_output tailscale set --advertise-connector 2>&1)"; then
@@ -409,7 +400,7 @@ force_reset_restore() {
   [ -n "$CONNECTOR_HOSTNAME" ] || die "Could not identify a connector hostname. Set CONNECTOR_HOSTNAME or REGION, rerun ./bootstrap.sh to create generated/connector-identity.env, or make sure Tailscale status reports this host's name."
   note "Using connector identity from $IDENTITY_SOURCE: $CONNECTOR_TAG / $CONNECTOR_HOSTNAME"
   confirm_force_reset
-  run_root tailscale up \
+  ai_egress_run_root tailscale up \
     --reset \
     --hostname="$CONNECTOR_HOSTNAME" \
     --advertise-connector \
