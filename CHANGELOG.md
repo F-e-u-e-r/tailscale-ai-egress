@@ -48,6 +48,11 @@ both Python CLIs report it with `--version`.
   omitted (never a fake `0`); the write exit code reflects write success, not
   health. With `--watch` the file is rewritten each interval and a failed write
   leaves the previous file intact.
+- Docs: "Post-Switch Diagnostics With `peer-metrics`" (`docs/Failover.md`) shows how
+  to log the new exit node's metrics after a failover switch by composing the
+  existing `FAILOVER_NOTIFY_CMD` hook with `peer-metrics --ping` — no controller
+  change. The switch is recorded before the hook runs; the hook is synchronous, so
+  the usual "keep it fast" caveat applies (a `SIGTERM` during it still yields `143`).
 
 ### Changed
 
