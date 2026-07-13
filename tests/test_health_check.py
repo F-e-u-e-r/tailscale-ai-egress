@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import stat
 import subprocess
@@ -891,7 +892,7 @@ class PeerMetricsTests(unittest.TestCase):
 
     def test_cli_survives_peer_metrics_exception(self):
         # The subcommand's "always exits 0" contract holds even if extraction raises.
-        args = argparse.Namespace(node="prim", status_json_file=None, json=False)
+        args = argparse.Namespace(node="prim", status_json_file=None, json=False, ping=False, ping_timeout=5.0)
         with mock.patch.object(hc, "get_status", return_value=({}, True)), \
              mock.patch.object(hc, "peer_metrics", side_effect=RuntimeError("boom")):
             buf = io.StringIO()
@@ -908,6 +909,169 @@ class PeerMetricsTests(unittest.TestCase):
                 m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": online, "CurAddr": ""}, label="p")
                 self.assertIsNone(m["online"])                       # non-bool Online -> null
                 self.assertEqual(m["connection_path"], "unknown")    # not exactly True -> not derp
+
+    # --- latency_ms (PR A) -------------------------------------------------
+    def _resolved(self, **extra):
+        peer = {"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "1.2.3.4:5"}
+        peer.update(extra)
+        return self._status(peer)
+
+    def test_latency_key_present_null_without_source(self):
+        m = self._metrics({"HostName": "p", "TailscaleIPs": ["100.64.0.1"], "Online": True, "CurAddr": "x"}, label="p")
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertIsNone(m["latency_ms"])                            # no caller value / ping_fn
+
+    def test_latency_from_caller_value_on_resolved(self):
+        m = hc.peer_metrics(self._resolved(), True, "p", latency_ms=12.5)
+        self.assertEqual(m["latency_ms"], 12.5)
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+
+    def test_latency_from_ping_fn_only_when_resolved(self):
+        calls = []
+
+        def ping_fn():
+            calls.append(1)
+            return 7.0
+
+        m = hc.peer_metrics(self._resolved(), True, "p", ping_fn=ping_fn)
+        self.assertEqual(m["latency_ms"], 7.0)
+        self.assertEqual(calls, [1])                                  # invoked exactly once
+
+    def test_ping_fn_not_invoked_when_unresolved(self):
+        calls = []
+
+        def ping_fn():
+            calls.append(1)
+            return 7.0
+
+        m = hc.peer_metrics(self._resolved(), True, "does-not-exist", ping_fn=ping_fn)
+        self.assertTrue(all(v is None for v in m.values()))          # null-filled sentinel
+        self.assertEqual(calls, [])                                  # never ping a phantom label
+
+    def test_latency_dropped_on_null_fill_even_if_supplied(self):
+        # Q6: null-filled objects stay all-null even when a latency is supplied,
+        # because latency is a per-peer metric (no peer -> no peer latency).
+        self.assertTrue(all(v is None for v in hc.peer_metrics({}, False, "x", latency_ms=12.3).values()))
+        m = hc.peer_metrics(self._resolved(), True, "does-not-exist", latency_ms=12.3)
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in m.values()))
+
+    def test_latency_validator(self):
+        for bad in (True, False, float("nan"), float("inf"), -1.0, -5, "12", None, 10 ** 400):
+            with self.subTest(bad=repr(bad)):
+                self.assertIsNone(hc._latency_or_none(bad))
+        self.assertEqual(hc._latency_or_none(0), 0.0)
+        neg_zero = hc._latency_or_none(-0.0)                          # -0.0 normalized to +0.0
+        self.assertEqual(neg_zero, 0.0)
+        self.assertEqual(math.copysign(1.0, neg_zero), 1.0)          # actually checks the sign (== can't)
+        self.assertEqual(hc._latency_or_none(12), 12.0)
+        self.assertEqual(hc._latency_or_none(12.5), 12.5)
+
+    def test_latency_validator_adversarial_float_subclass(self):
+        # C7: normalization to a builtin float defeats a __lt__ lie, and a
+        # __float__ that raises degrades to null instead of propagating.
+        class LyingFloat(float):
+            def __lt__(self, other):  # pragma: no cover - never consulted after normalize
+                return False
+
+        class RaisingFloat(float):
+            def __float__(self):
+                raise RuntimeError("adversarial conversion")
+
+        self.assertIsNone(hc._latency_or_none(LyingFloat(-5.0)))     # normalized -5.0 < 0 -> None
+        self.assertIsNone(hc._latency_or_none(RaisingFloat(7.0)))    # raise -> None, never propagates
+
+    def test_raising_ping_fn_degrades_to_null_object(self):
+        def ping_fn():
+            raise RuntimeError("ping boom")
+
+        m = hc._safe_peer_metrics(self._resolved(), True, "p", ping_fn=ping_fn)
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in m.values()))         # non-gating: raise -> null
+
+    def test_malformed_status_resolution_is_safe_under_ping(self):
+        # F-02: resolve_identity raises (TailscaleIPs is not iterable-of-str) but
+        # _safe_peer_metrics must degrade to the null object, never traceback, and
+        # must not invoke the ping.
+        calls = []
+
+        def ping_fn():
+            calls.append(1)
+            return 5.0
+
+        bad_status = {"BackendState": "Running", "Self": {"ID": "self"},
+                      "Peer": {"k": {"ID": "n1", "HostName": "p", "TailscaleIPs": 7}}}
+        m = hc._safe_peer_metrics(bad_status, True, "p", ping_fn=ping_fn)
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
+        self.assertTrue(all(v is None for v in m.values()))
+        self.assertEqual(calls, [])                                 # never reached the ping
+
+    def test_peer_metrics_cli_ping_flag(self):
+        # peer-metrics --ping resolves first, then pings only the resolved peer.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "status.json"
+            fixture.write_text(json.dumps(self._resolved()), encoding="utf-8")
+            # resolved + --ping -> latency from mocked ping
+            with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("p", True, rtt_ms=9.0)) as spy:
+                args = argparse.Namespace(node="p", status_json_file=str(fixture), json=False, ping=True, ping_timeout=5.0)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = hc.cmd_peer_metrics(args)
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue())["latency_ms"], 9.0)
+            self.assertEqual(spy.call_count, 1)
+            # default (no --ping) -> no ping, latency null
+            with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("p", True, rtt_ms=9.0)) as spy2:
+                args = argparse.Namespace(node="p", status_json_file=str(fixture), json=False, ping=False, ping_timeout=5.0)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    hc.cmd_peer_metrics(args)
+            self.assertIsNone(json.loads(buf.getvalue())["latency_ms"])
+            self.assertEqual(spy2.call_count, 0)                    # default is side-effect-free
+            # unresolved + --ping -> null object, ping NOT called (resolve-first)
+            with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("x", True, rtt_ms=9.0)) as spy3:
+                args = argparse.Namespace(node="missing", status_json_file=str(fixture), json=False, ping=True, ping_timeout=5.0)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    hc.cmd_peer_metrics(args)
+            self.assertIsNone(json.loads(buf.getvalue())["latency_ms"])
+            self.assertEqual(spy3.call_count, 0)
+
+    def test_bad_ping_timeout_env_does_not_break_default_path(self):
+        # An invalid PING_TIMEOUT in the environment must not break the default
+        # (no --ping) path -- peer-metrics ignored PING_TIMEOUT entirely before the
+        # --ping flag existed, so it must stay a clean exit-0 JSON print.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "status.json"
+            fixture.write_text(json.dumps(self._resolved()), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"PING_TIMEOUT": "oops"}, clear=False):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = hc.main(["peer-metrics", "--node", "p", "--status-json-file", str(fixture)])
+                self.assertEqual(rc, 0)                              # not argparse-exit 2
+                self.assertEqual(set(json.loads(buf.getvalue())), set(hc.PEER_METRIC_KEYS))
+                # with --ping, a bad env value falls back to the default timeout.
+                with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("p", True, rtt_ms=4.0)) as spy:
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = hc.main(["peer-metrics", "--node", "p", "--status-json-file", str(fixture), "--ping"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(buf.getvalue())["latency_ms"], 4.0)
+                self.assertEqual(spy.call_args.args[1], hc.DEFAULT_PING_TIMEOUT)
+
+    def test_invalid_utf8_status_file_is_unavailable_not_crash(self):
+        # A status file that is not valid UTF-8 must degrade to the null object
+        # (get_status fails closed), preserving peer-metrics' always-exits-0 contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "status.json"
+            fixture.write_bytes(b"\xff\xfe not utf-8 \x80\x81")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.main(["peer-metrics", "--node", "p", "--status-json-file", str(fixture)])
+            self.assertEqual(rc, 0)
+            obj = json.loads(buf.getvalue())
+            self.assertEqual(set(obj), set(hc.PEER_METRIC_KEYS))
+            self.assertTrue(all(v is None for v in obj.values()))
 
 
 class ConnectorsCliTests(unittest.TestCase):
@@ -977,6 +1141,39 @@ class ConnectorsCliTests(unittest.TestCase):
         self.assertIn("[metrics] connector=primary tx=", out)
         self.assertIn("[metrics] connector=fallback tx=", out)
         self.assertIn("path=", out)
+
+    def test_metrics_line_appends_latency_byte_exact(self):
+        # PR A: latency_ms is appended at the END of the existing [metrics] line
+        # (no reword/reorder). assertEqual on the WHOLE line so a token appended
+        # AFTER latency_ms (or any reorder) is caught (fake tailscale pings "in 12ms").
+        rc, out = run_cli(self._args())
+        lines = {
+            line.split(" ", 2)[1].split("=", 1)[1]: line
+            for line in out.splitlines() if line.startswith("[metrics] connector=")
+        }
+        self.assertEqual(
+            lines["primary"], "[metrics] connector=primary tx=- rx=- path=derp handshake_age=- latency_ms=12.0"
+        )
+        self.assertEqual(
+            lines["fallback"], "[metrics] connector=fallback tx=- rx=- path=derp handshake_age=- latency_ms=12.0"
+        )
+
+    def test_json_metrics_latency_from_reachability_ping(self):
+        # latency_ms reuses the reachability ping (12ms) and is stamped on the
+        # resolved connectors; the top-level rtt_ms is unchanged too.
+        rc, out = run_cli(self._args("--json"))
+        report = json.loads(out)
+        for row in report["connectors"]:
+            self.assertEqual(row["metrics"]["latency_ms"], 12.0)
+            self.assertEqual(row["rtt_ms"], 12.0)                    # existing field intact
+
+    def test_connectors_ping_exactly_once_per_connector(self):
+        # No double-ping AND exactly one ping per connector (primary once, fallback
+        # once) -- a total count of 2 alone would pass if primary were pinged twice.
+        with mock.patch.object(hc, "tailscale_ping", wraps=hc.tailscale_ping) as spy:
+            run_cli(self._args("--json"))
+        pinged = sorted(call.args[0] for call in spy.call_args_list)
+        self.assertEqual(pinged, ["fallback-vps", "primary-vps"])
 
     def test_metrics_failure_is_non_gating(self):
         # A raising peer_metrics must NOT change the verdict/exit or existing

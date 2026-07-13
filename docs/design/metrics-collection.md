@@ -1,7 +1,7 @@
 # Design: metrics collection (counters + liveness)
 
-**Status:** implemented (step 1: counters + liveness). Latency, controller reuse,
-and a Prometheus textfile are named follow-ups.
+**Status:** implemented (counters + liveness + latency_ms). Controller reuse and a
+Prometheus textfile are named follow-ups.
 **Tracking:** [Roadmap](../Roadmap.md) · governed by [Stability](../Stability.md)
 
 ## Do we need to wrap an app for Tailscale? No.
@@ -52,6 +52,7 @@ keys are never omitted. Two null regimes:
 | `last_handshake_age_seconds` | derived, UTC | int\|null (≥ 0) |
 | `relay`, `cur_addr` | status Relay/CurAddr | string\|null (raw, for transparency) |
 | `connection_path` | derived | `direct` \| `derp` \| `unknown` \| null |
+| `latency_ms` | `tailscale ping` RTT | float\|null. Stamped ONLY on a resolved peer; null when unmeasured or the ping had no RTT. |
 
 `active` is surfaced as raw liveness only; it does NOT participate in
 `connection_path`.
@@ -83,8 +84,9 @@ derived enum can be refined additively later without breaking the fixed key set.
 - **`connectors` subcommand** (which `monitor-connectors.sh` delegates to): each
   connector record in `--json` gains a `metrics` object (additive; the report's
   `schema_version` is unchanged). Text mode appends one `[metrics] connector=…
-  tx=… rx=… path=… handshake_age=…` line per connector (nulls render as `-`);
-  existing lines and message ids are unchanged.
+  tx=… rx=… path=… handshake_age=… latency_ms=…` line per connector (nulls render
+  as `-`); existing tokens are append-only (never reworded/reordered) and message
+  ids are unchanged.
 
 > Note vs. the reviewed plan §4: because `monitor-connectors.sh` delegates its
 > whole report to `health_check.py connectors`, there is no bash-side merge point.
@@ -115,12 +117,14 @@ reachability/online/route checks and does not reference `metrics`.
 - Offline peers may carry stale Tx/Rx and an old `LastHandshake`;
   `last_handshake_age_seconds` makes staleness visible.
 - `status --json` does not require root; the extractor is read-only.
+- `latency_ms` is a *per-peer* metric measured by `tailscale ping`, stamped ONLY
+  once the peer resolves. The `connectors` report reuses its single reachability
+  ping (no extra ping); `peer-metrics --ping` (opt-in, default off) resolves first
+  and pings only a resolved peer, so an unresolvable label is never pinged and the
+  object stays null-filled. A caller-supplied RTT is validated (finite, ≥ 0).
 
 ## Follow-ups (not in this step)
 
-- **Latency:** additively add `latency_ms` (from `tailscale ping`); when it lands,
-  update both `peer_metrics` and the monitor's tests in the same change so the
-  fixed key set stays in sync.
 - **Controller reuse:** the failover controller may consume `peer-metrics` for
   post-switch diagnosis/logging — best-effort / non-gating; metrics must never
   change a failover decision or the controller's exit path in 1.x.
