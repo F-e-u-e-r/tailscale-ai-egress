@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 # Kept in lock-step with the VERSION file (checked by tests/test_release_metadata.py).
 __version__ = "1.1.1"
@@ -435,7 +435,10 @@ def get_status(status_file: Optional[str]) -> tuple[dict[str, Any], bool]:
     if status_file:
         try:
             data = json.loads(Path(status_file).read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            # UnicodeDecodeError: a status file that is not valid UTF-8 must degrade
+            # to "unavailable" (like a JSON error), never surface as a traceback --
+            # callers such as peer-metrics rely on get_status failing closed.
             eprint(f"warning: could not read status file: {exc}")
             return {}, False
         return (data, True) if isinstance(data, dict) else ({}, False)
@@ -878,6 +881,7 @@ PEER_METRIC_KEYS = (
     "relay",
     "cur_addr",
     "connection_path",
+    "latency_ms",
 )
 
 
@@ -895,6 +899,28 @@ def _str_or_none(value: Any) -> Optional[str]:
 
 def _bool_or_none(value: Any) -> Optional[bool]:
     return value if isinstance(value, bool) else None
+
+
+def _latency_or_none(value: Any) -> Optional[float]:
+    """Validate a caller-supplied latency in ms for the metrics object: a finite,
+    non-negative number (int or float; a string is rejected, matching the strict
+    isinstance style of the other coercers). Rejects bool, NaN/Inf, and negatives;
+    catches OverflowError so a huge int (whose float() overflows) degrades to null
+    rather than aborting the whole extraction. Normalizes -0.0 to 0.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)  # normalize (incl. int/float subclasses) to a builtin float
+    except Exception:
+        # A validator must never raise: besides TypeError/ValueError/OverflowError,
+        # a float subclass overriding __float__ can raise anything. Any failure to
+        # produce a builtin float degrades to null (only latency is rejected, never
+        # the whole metrics object). BaseException (KeyboardInterrupt/SystemExit)
+        # is deliberately NOT caught.
+        return None
+    if not math.isfinite(parsed) or parsed < 0:  # validate the normalized (builtin) value
+        return None
+    return parsed + 0.0
 
 
 def _fmt_metric(value: Any) -> str:
@@ -943,6 +969,8 @@ def peer_metrics(
     label: str,
     *,
     now: Optional[dt.datetime] = None,
+    latency_ms: Optional[float] = None,
+    ping_fn: Optional[Callable[[], Any]] = None,
 ) -> dict[str, Any]:
     """Read-only per-peer counters + liveness for a connector label. Returns the
     fixed-key metrics object; ALL values null on transport failure (status
@@ -950,7 +978,15 @@ def peer_metrics(
     individual missing / zero-value fields are null but keys are never omitted.
 
     tx/rx are cumulative byte counters since tailscaled started (reset on restart),
-    NOT session or billing usage."""
+    NOT session or billing usage.
+
+    ``latency_ms`` is a per-peer metric: it is stamped ONLY once the peer resolves,
+    so a null-filled object stays all-null (the reachability RTT is never attributed
+    to a label that does not resolve to a known peer). Callers with an RTT already
+    in hand pass ``latency_ms``; ``ping_fn`` is an optional zero-arg callable invoked
+    ONLY after a successful resolve (so a standalone caller never pings an
+    unresolvable label). Both run inside the resolved path, so a raising ``ping_fn``
+    is caught by ``_safe_peer_metrics`` along with any resolution error."""
     if not available:
         return _null_metrics()
     node_id, ips = resolve_identity(status, label)
@@ -973,15 +1009,27 @@ def peer_metrics(
     obj["relay"] = _str_or_none(node.get("Relay"))
     obj["cur_addr"] = _str_or_none(node.get("CurAddr"))
     obj["connection_path"] = _connection_path(obj["cur_addr"], obj["online"])
+    lat = latency_ms
+    if lat is None and ping_fn is not None:
+        lat = ping_fn()  # reached only for a resolved peer
+    obj["latency_ms"] = _latency_or_none(lat)
     return obj
 
 
-def _safe_peer_metrics(status: dict[str, Any], available: bool, label: str) -> dict[str, Any]:
+def _safe_peer_metrics(
+    status: dict[str, Any],
+    available: bool,
+    label: str,
+    *,
+    latency_ms: Optional[float] = None,
+    ping_fn: Optional[Callable[[], Any]] = None,
+) -> dict[str, Any]:
     """Non-gating wrapper: metrics extraction must NEVER abort the monitor report
     (the hard rule in docs/design/metrics-collection.md), so any unexpected error
-    degrades to the null-filled object instead of propagating."""
+    -- including a resolution error on a malformed status or a raising ``ping_fn``
+    -- degrades to the null-filled object instead of propagating."""
     try:
-        return peer_metrics(status, available, label)
+        return peer_metrics(status, available, label, latency_ms=latency_ms, ping_fn=ping_fn)
     except Exception as exc:
         eprint(f"warning: peer metrics unavailable for '{label}': {exc}")
         return _null_metrics()
@@ -1090,8 +1138,9 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             "routes": route_count,
             # Additive per-peer counters + liveness (read-only). Never gates the
             # monitor's health verdict below; null-filled (and exception-isolated)
-            # if unavailable.
-            "metrics": _safe_peer_metrics(status, available, label),
+            # if unavailable. latency_ms reuses the reachability ping above (one
+            # ping per connector); it is stamped only when the peer also resolves.
+            "metrics": _safe_peer_metrics(status, available, label, latency_ms=result.rtt_ms),
         })
     # In oldest-first HA exactly one connector serves routes at a time, so the
     # pair is route-healthy when at least one advertises app-connector/subnet
@@ -1122,7 +1171,8 @@ def cmd_connectors(args: argparse.Namespace) -> int:
                 f"[metrics] connector={row['connector']} "
                 f"tx={_fmt_metric(m['tx_bytes_total'])} rx={_fmt_metric(m['rx_bytes_total'])} "
                 f"path={_fmt_metric(m['connection_path'])} "
-                f"handshake_age={_fmt_metric(m['last_handshake_age_seconds'])}"
+                f"handshake_age={_fmt_metric(m['last_handshake_age_seconds'])} "
+                f"latency_ms={_fmt_metric(m['latency_ms'])}"
             )
         print(f"ordering={order} reason={order_reason}")
         print(f"routes_serving={serving}")
@@ -1134,9 +1184,30 @@ def cmd_peer_metrics(args: argparse.Namespace) -> int:
     """Print the read-only metrics object for one connector label as JSON. Always
     exits 0 when it can print the object (including the null-filled object on
     transport/resolution failure); non-zero only for usage/arg errors. This is the
-    single source of truth for the metrics object shape used by the monitor."""
+    single source of truth for the metrics object shape used by the monitor.
+
+    With ``--ping`` (default off) latency_ms is measured with a single tailscale
+    ping, but only for a peer that resolves: the ping runs inside peer_metrics'
+    resolved path, so an unresolvable label is never pinged and stays null-filled.
+    The ping timeout (``--ping-timeout``, then ``PING_TIMEOUT``, then the default)
+    is resolved ONLY when --ping is set, so an invalid ``PING_TIMEOUT`` in the
+    environment can never break the default no-ping path (which ignores it)."""
     status, available = get_status(args.status_json_file)
-    print(json.dumps(_safe_peer_metrics(status, available, args.node), sort_keys=True))
+    ping_fn: Optional[Callable[[], Any]] = None
+    if getattr(args, "ping", False):
+        node = args.node
+        ping_timeout = getattr(args, "ping_timeout", None)
+        if ping_timeout is None:
+            # No explicit --ping-timeout: read PING_TIMEOUT defensively (env_float
+            # never raises) and clamp, rather than validating it at parse time.
+            ping_timeout = env_float("PING_TIMEOUT", DEFAULT_PING_TIMEOUT)
+            if not (0 < ping_timeout <= MAX_TIMEOUT_SECONDS):
+                ping_timeout = DEFAULT_PING_TIMEOUT
+
+        def ping_fn() -> Optional[float]:  # invoked only after a successful resolve
+            return tailscale_ping(node, ping_timeout).rtt_ms
+
+    print(json.dumps(_safe_peer_metrics(status, available, args.node, ping_fn=ping_fn), sort_keys=True))
     return 0
 
 
@@ -1266,6 +1337,17 @@ def build_parser() -> argparse.ArgumentParser:
     peer.add_argument("--node", required=True)
     peer.add_argument("--status-json-file")
     peer.add_argument("--json", action="store_true", help="Accepted for consistency; output is always JSON.")
+    peer.add_argument(
+        "--ping",
+        action="store_true",
+        help="Also measure latency_ms with a single tailscale ping to a resolved peer (default off; adds one ping).",
+    )
+    peer.add_argument(
+        "--ping-timeout",
+        type=_pos_float,
+        default=None,
+        help="Seconds for the --ping probe; read only when --ping is set (else PING_TIMEOUT/5).",
+    )
     peer.set_defaults(func=cmd_peer_metrics)
 
     return parser

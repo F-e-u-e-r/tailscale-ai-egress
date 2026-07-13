@@ -34,6 +34,11 @@ both Python CLIs report it with `--version`.
   `--json` plus an append-only `[metrics]` text line. Additive only; metrics never
   gate the monitor's health verdict. Byte counters are cumulative since tailscaled
   started, not billing usage. See `docs/design/metrics-collection.md`.
+- Per-connector metrics gain a `latency_ms` field (the `tailscale ping` RTT),
+  stamped only on a resolved peer. The `connectors` report reuses its existing
+  reachability ping (no extra ping) and appends `latency_ms=` to the end of the
+  `[metrics]` text line; `scripts/health_check.py peer-metrics` gains an opt-in
+  `--ping` flag to measure it standalone. Additive and still non-gating.
 
 ### Changed
 
@@ -43,6 +48,13 @@ both Python CLIs report it with `--version`.
   first helper of the shared-shell-library migration across all three consumers.
   `scripts/lib/common.sh` is therefore a runtime dependency of those scripts and
   is verified in the release package. CI lints with `shellcheck -x`.
+
+### Fixed
+
+- `scripts/health_check.py`: reading a `--status-json-file` that is not valid UTF-8
+  now fails closed (treated as unavailable status) instead of raising
+  `UnicodeDecodeError`, so `peer-metrics` keeps its always-exit-0 contract and the
+  failover/monitor commands degrade cleanly.
 
 ## [1.1.1] - 2026-07-08
 

@@ -94,7 +94,8 @@ Highest user value first.
   [design/metrics-collection.md](design/metrics-collection.md). Establishes that
   no Tailscale "app wrapper" is needed (raw inputs come from `status --json` /
   `tailscale ping` / `tailscale metrics print`).
-  Next: `latency_ms` from `tailscale ping`; then
+  Step 2 (**done**): `latency_ms` from `tailscale ping` (reuses the connector
+  reachability ping; opt-in `peer-metrics --ping` for standalone use). Next:
   `monitor-connectors.sh --prometheus-textfile <path>` emitting node_exporter
   textfile format (wrapping `tailscale metrics print` + status gauges), plus
   healthchecks.io / Uptime Kuma examples. No server, no telemetry.
