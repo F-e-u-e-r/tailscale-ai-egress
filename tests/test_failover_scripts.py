@@ -703,6 +703,68 @@ class FailoverControllerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("overall=degraded", result.stdout)
 
+    # --- --prometheus-textfile (PR C) --------------------------------------
+    def test_monitor_prometheus_textfile_writes_valid_file(self):
+        dest = self.gen_dir / "conn.prom"
+        result = self.run_monitor("--prometheus-textfile", str(dest))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[prometheus] wrote", result.stdout)
+        self.assertNotIn("overall=healthy", result.stdout)  # textfile-only: no normal report
+        self.assertTrue(dest.exists())
+        self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o644")
+        content = dest.read_text(encoding="utf-8")
+        self.assertTrue(content.endswith("\n"))
+        last = [line for line in content.split("\n") if line][-1]
+        self.assertTrue(last.startswith("ai_egress_overall_healthy "))
+
+    def test_monitor_prometheus_textfile_degraded_still_writes_exit0(self):
+        dest = self.gen_dir / "deg.prom"
+        result = self.run_monitor("--prometheus-textfile", str(dest), FAKE_UNREACHABLE="fallback-vps")
+        self.assertEqual(result.returncode, 0)  # write succeeded; health is in the gauge
+        self.assertIn("ai_egress_overall_healthy 0", dest.read_text(encoding="utf-8"))
+
+    def test_monitor_prometheus_textfile_rejects_json_combo(self):
+        result = self.run_monitor("--json", "--prometheus-textfile", str(self.gen_dir / "x.prom"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be combined", result.stderr)
+
+    def test_monitor_prometheus_textfile_requires_path(self):
+        result = self.run_monitor("--prometheus-textfile")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a <path>", result.stderr)
+
+    def test_monitor_prometheus_textfile_rejects_non_prom(self):
+        dest = self.gen_dir / "bad.txt"
+        result = self.run_monitor("--prometheus-textfile", str(dest))
+        self.assertNotEqual(result.returncode, 0)   # python write failure propagates
+        self.assertIn("must end in .prom", result.stderr)
+        self.assertFalse(dest.exists())
+
+    def test_monitor_prometheus_textfile_rejects_empty_path(self):
+        # An empty path (e.g. an unset automation variable) must be a usage error,
+        # not silently fall through to the normal report / exit 0 without writing.
+        result = self.run_monitor("--prometheus-textfile", "")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("non-empty path", result.stderr)
+
+    def test_monitor_prometheus_watch_continues_on_write_failure(self):
+        # A failed write must NOT abort --watch: the loop reaches the interval sleep
+        # (forced to fail here to break the loop deterministically), proving the
+        # write failure was tolerated (write_prometheus_textfile || true).
+        fake_sleep = self.fake_bin / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_sleep.chmod(0o755)
+        try:
+            result = subprocess.run(
+                ["bash", str(ROOT / "monitor-connectors.sh"), "--watch",
+                 "--prometheus-textfile", str(self.gen_dir / "bad.txt")],  # write always fails
+                env=self._monitor_env(), capture_output=True, text=True, cwd=ROOT, timeout=30,
+            )
+        finally:
+            fake_sleep.unlink()
+        self.assertIn("write failed", result.stderr)          # the write was attempted and failed
+        self.assertIn("refusing to busy-loop", result.stderr)  # yet the loop reached the sleep
+
     def test_monitor_rejects_bad_ping_timeout(self):
         result = self.run_monitor("--once", PING_TIMEOUT="oops")
         self.assertNotEqual(result.returncode, 0)

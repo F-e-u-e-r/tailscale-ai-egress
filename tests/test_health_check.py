@@ -1133,6 +1133,20 @@ class ConnectorsCliTests(unittest.TestCase):
             self.assertIn("metrics", row)         # new additive key
             self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
 
+    def test_json_key_sets_exact_no_internal_leak(self):
+        # Guards additive-safety: the prometheus-only `resolved` identity must NOT
+        # leak into the JSON rows, so assert the EXACT key sets (not just presence).
+        rc, out = run_cli(self._args("--json"))
+        report = json.loads(out)
+        self.assertEqual(
+            set(report),
+            {"schema_version", "connectors", "ordering", "ordering_reason", "routes_serving", "overall"},
+        )
+        for row in report["connectors"]:
+            self.assertEqual(
+                set(row), {"connector", "label", "online", "reachable", "rtt_ms", "routes", "metrics"}
+            )
+
     def test_text_connectors_append_metrics_line(self):
         # Text mode is append-only: a new [metrics] line per connector; the
         # existing connector= line is not reworded/reordered.
@@ -1474,6 +1488,294 @@ class StatusTimeoutTests(unittest.TestCase):
                 with mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
                     hc.get_status(None)
                 self.assertEqual(captured["timeout"], expected)
+
+
+def _parse_prom(text):
+    """Strict-enough Prometheus text parser used to validate the emitter. Enforces:
+    trailing newline; HELP/TYPE at most once per family; samples only after their
+    family's TYPE and contiguously (no family reappearance, no orphan metadata);
+    every sample value numeric. Returns {name: [(labels_str, value_str), ...]}."""
+    assert text.endswith("\n"), "document must end with a trailing newline"
+    families: dict = {}
+    help_seen: set = set()
+    type_seen: dict = {}
+    order: list = []
+    current = None
+    for line in text.split("\n"):
+        if not line:
+            continue
+        if line.startswith("# HELP "):
+            name = line[len("# HELP "):].split(" ", 1)[0]
+            assert name not in help_seen, f"duplicate HELP for {name}"
+            help_seen.add(name)
+            continue
+        if line.startswith("# TYPE "):
+            _, _, name, kind = line.split(" ", 3)
+            assert name not in type_seen, f"duplicate TYPE for {name}"
+            assert name not in order, f"family {name} reappears"
+            assert kind in ("gauge", "counter"), f"unexpected TYPE {kind!r} for {name}"
+            type_seen[name] = kind
+            order.append(name)
+            families[name] = []
+            current = name
+            continue
+        assert not line.startswith("#"), f"unexpected comment line: {line!r}"
+        if "{" in line:
+            name = line[: line.index("{")]
+            labels = line[line.index("{"): line.rindex("}") + 1]
+            value = line[line.rindex("}") + 1:].strip()
+        else:
+            name, value = line.split(" ", 1)
+            labels, value = "", value.strip()
+        assert name in type_seen, f"sample for {name} before its TYPE"
+        assert name == current, f"sample {name} not contiguous with its family (current {current})"
+        num = float(value)  # numeric-only (raises otherwise)
+        assert math.isfinite(num), f"non-finite sample value {value!r} for {name}"
+        families[name].append((labels, value))
+    assert help_seen == set(type_seen), f"every family needs one HELP and one TYPE; mismatch: {help_seen ^ set(type_seen)}"
+    return families, type_seen
+
+
+class PrometheusTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.rmdir() if child.is_dir() else child.unlink()
+        self.tmp.rmdir()
+
+    def _status(self, primary_extra=None, fallback_extra=None):
+        p = {"ID": "nodeP", "HostName": "primary-vps", "TailscaleIPs": ["100.64.0.1"], "Online": True,
+             "CurAddr": "1.2.3.4:41641", "TxBytes": 100, "RxBytes": 200, "PrimaryRoutes": ["10.0.0.0/24"]}
+        f = {"ID": "nodeF", "HostName": "fallback-vps", "TailscaleIPs": ["100.64.0.2"], "Online": True}
+        if primary_extra:
+            p.update(primary_extra)
+        if fallback_extra:
+            f.update(fallback_extra)
+        return {"BackendState": "Running", "Self": {"ID": "self", "HostName": "c", "TailscaleIPs": ["100.64.0.9"]},
+                "Peer": {"nodeP": p, "nodeF": f}}
+
+    def _emit(self, status, *, primary="primary-vps", fallback="fallback-vps", rtt=12.0, require_routes="1"):
+        fixture = self.tmp / "status.json"
+        fixture.write_text(json.dumps(status), encoding="utf-8")
+        with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("x", True, rtt_ms=rtt)):
+            return run_cli([
+                "connectors", "--primary", primary, "--fallback", fallback,
+                "--status-json-file", str(fixture), "--require-routes", require_routes, "--prometheus",
+            ])
+
+    def test_valid_document_and_sentinel_last(self):
+        rc, out = self._emit(self._status())
+        fams, types = _parse_prom(out)  # raises on any structural violation
+        self.assertEqual(len(fams["ai_egress_overall_healthy"]), 1)   # exactly one sentinel
+        last = [line for line in out.split("\n") if line][-1]
+        self.assertRegex(last, r"^ai_egress_overall_healthy [01]$")   # sentinel is EXACTLY the last line
+        self.assertEqual(types["ai_egress_connector_tx_bytes_total"], "counter")
+        self.assertEqual(types["ai_egress_connector_rx_bytes_total"], "counter")
+        self.assertEqual(types["ai_egress_connector_online"], "gauge")
+        self.assertEqual(rc, 0)                                       # healthy -> 0
+
+    def test_non_finite_rtt_omitted(self):
+        for bad in (float("nan"), float("inf"), -1.0):
+            with self.subTest(rtt=bad):
+                _, out = self._emit(self._status(), rtt=bad)
+                fams, _ = _parse_prom(out)   # would raise if a non-finite value slipped in
+                self.assertEqual(fams.get("ai_egress_connector_latency_ms", []), [])
+
+    def test_empty_rows_document_is_just_sentinel(self):
+        # All samples omitted / no connectors -> the document is still valid and
+        # ends with exactly the sentinel (the write-completeness guarantee).
+        doc = hc._prometheus_document([], [], {}, True)
+        self.assertEqual(
+            doc,
+            "# HELP ai_egress_overall_healthy Connector-pair health: 1 healthy, 0 degraded.\n"
+            "# TYPE ai_egress_overall_healthy gauge\n"
+            "ai_egress_overall_healthy 1\n",
+        )
+        _parse_prom(doc)  # still structurally valid
+
+    def test_route_noncanonical_default_gauge_vs_lenient_health(self):
+        # "0.0.0.1/0" canonicalizes to the default route -> the STRICT gauge excludes
+        # it (count 0, a true zero, not omitted). The released, lenient node_routes
+        # that drives overall_healthy still counts the raw string as a route, so for
+        # this ADVERSARIAL input (real tailscale only emits canonical CIDRs) the
+        # strict gauge and the health verdict deliberately diverge. Aligning health
+        # to the strict view is a released-semantics change tracked as a separate
+        # hardening PR; PR C keeps the gauge strict (rule 4) without changing health.
+        _, out = self._emit(self._status(primary_extra={"PrimaryRoutes": ["0.0.0.1/0"]}))
+        fams, _ = _parse_prom(out)
+        prim = [val for lbl, val in fams["ai_egress_connector_routes"] if "primary" in lbl]
+        self.assertEqual(prim, ["0"])                                   # strict gauge -> 0
+        self.assertEqual(fams["ai_egress_overall_healthy"][0][1], "1")  # lenient health -> still serving
+
+    def test_route_malformed_self_like_entry_omits_gauge(self):
+        # An AllowedIPs entry that resembles a self address but is malformed must
+        # omit the gauge (not be silently skipped as "self"). Remove PrimaryRoutes
+        # entirely so the AllowedIPs fallback branch is actually taken.
+        status = self._status()
+        del status["Peer"]["nodeP"]["PrimaryRoutes"]
+        status["Peer"]["nodeP"]["AllowedIPs"] = ["100.64.0.1/not-a-prefix"]
+        _, out = self._emit(status)
+        fams, _ = _parse_prom(out)
+        prim = [lbl for lbl, _ in fams.get("ai_egress_connector_routes", []) if "primary" in lbl]
+        self.assertEqual(prim, [])
+
+    def test_write_rejects_incomplete_document(self):
+        dest = self.tmp / "keep.prom"
+        dest.write_text("OLD\n", encoding="utf-8")
+        for bad in ("no trailing newline", "partial\n", "ai_egress_overall_healthy 1\ntrailing 2\n",
+                    "ai_egress_overall_healthy 1\nai_egress_overall_healthy 0\n"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    hc._write_textfile_atomic(str(dest), bad)
+        self.assertEqual(dest.read_text(encoding="utf-8"), "OLD\n")   # never clobbered
+
+    def test_output_without_prometheus_rejected(self):
+        fixture = self.tmp / "s.json"
+        fixture.write_text(json.dumps(self._status()), encoding="utf-8")
+        dest = self.tmp / "o.prom"
+        with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("x", True, rtt_ms=1.0)):
+            rc = hc.main(["connectors", "--primary", "primary-vps", "--fallback", "fallback-vps",
+                          "--status-json-file", str(fixture), "--output", str(dest)])
+        self.assertEqual(rc, 2)
+        self.assertFalse(dest.exists())
+
+    def test_empty_output_errors_not_silent_stdout(self):
+        fixture = self.tmp / "s.json"
+        fixture.write_text(json.dumps(self._status()), encoding="utf-8")
+        with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("x", True, rtt_ms=1.0)):
+            rc = hc.main(["connectors", "--primary", "primary-vps", "--fallback", "fallback-vps",
+                          "--status-json-file", str(fixture), "--prometheus", "--output", ""])
+        self.assertEqual(rc, 1)   # empty path -> write error, never a silent stdout fall-back
+
+    def test_write_rejects_disguised_or_duplicate_sentinel(self):
+        # A timestamped or labeled sentinel line (both valid Prometheus grammar) must
+        # not slip past the completeness boundary as an invisible extra sample, and
+        # rejection must happen BEFORE any temp file is created.
+        dest = self.tmp / "keep.prom"
+        dest.write_text("OLD\n", encoding="utf-8")
+        for bad in (
+            "ai_egress_overall_healthy 0 123\nai_egress_overall_healthy 1\n",   # timestamped + bare
+            'ai_egress_overall_healthy{connector="x"} 1\n',                     # labeled, not bare
+            "ai_egress_overall_healthy 0 1700000000000\n",                     # single timestamped
+            "  ai_egress_overall_healthy 0\nai_egress_overall_healthy 1\n",     # leading whitespace + bare
+            "ai_egress_overall_healthy\t0\nai_egress_overall_healthy 1\n",      # tab separator + bare
+        ):
+            with self.subTest(bad=repr(bad)):
+                with mock.patch.object(hc.tempfile, "mkstemp") as mkstemp:
+                    with self.assertRaises(ValueError):
+                        hc._write_textfile_atomic(str(dest), bad)
+                    mkstemp.assert_not_called()
+        self.assertEqual(dest.read_text(encoding="utf-8"), "OLD\n")
+
+    def test_parser_rejects_non_gauge_counter_type(self):
+        # A family declared with a type other than gauge/counter must be rejected even
+        # with no sample line. Use a clean sample-less fixture and assert the SPECIFIC
+        # message, so the test fails if the TYPE-branch guard is removed (a trailing
+        # sample would otherwise trip "sample before its TYPE" regardless of the guard).
+        with self.assertRaisesRegex(AssertionError, "unexpected TYPE"):
+            _parse_prom("# HELP x d\n# TYPE x histogram\n")
+
+    def test_huge_counter_omitted_not_infinite(self):
+        # A float64-unrepresentable TxBytes (adversarial status) must be omitted, not
+        # emitted as a sample that scrapes to +Inf.
+        _, out = self._emit(self._status(primary_extra={"TxBytes": 10 ** 400}))
+        fams, _ = _parse_prom(out)  # would raise on a non-finite sample if one slipped in
+        prim = [lbl for lbl, _ in fams.get("ai_egress_connector_tx_bytes_total", []) if "primary" in lbl]
+        self.assertEqual(prim, [])
+
+    def test_null_and_negative_counter_omitted(self):
+        # primary negative TxBytes + fallback missing TxBytes -> both tx samples omitted
+        # (never a negative or fabricated counter).
+        _, out = self._emit(self._status(primary_extra={"TxBytes": -5}))
+        fams, _ = _parse_prom(out)
+        self.assertEqual(fams.get("ai_egress_connector_tx_bytes_total", []), [])
+
+    def test_malformed_routes_omitted(self):
+        for bad in ([""], ["not-a-cidr"], "10.0.0.0/24", [123], {"x": 1}):
+            with self.subTest(bad=bad):
+                _, out = self._emit(self._status(primary_extra={"PrimaryRoutes": bad}))
+                fams, _ = _parse_prom(out)
+                prim = [lbl for lbl, _ in fams.get("ai_egress_connector_routes", []) if "primary" in lbl]
+                self.assertEqual(prim, [], f"malformed routes {bad!r} must omit the gauge")
+
+    def test_valid_routes_counted(self):
+        _, out = self._emit(self._status(primary_extra={"PrimaryRoutes": ["10.0.0.0/24", "192.168.0.0/16", "0.0.0.0/0"]}))
+        fams, _ = _parse_prom(out)
+        prim = [val for lbl, val in fams["ai_egress_connector_routes"] if "primary" in lbl]
+        self.assertEqual(prim, ["2"])  # two non-default routes; default 0.0.0.0/0 excluded
+
+    def test_latency_from_rtt_even_when_unresolved(self):
+        # An unresolvable connector label still gets its probe RTT as latency (from
+        # row.rtt_ms), but peer-derived gauges (online) are omitted -- F-01.
+        _, out = self._emit(self._status(), primary="ghost-primary")
+        fams, _ = _parse_prom(out)
+        lat = [lbl for lbl, _ in fams.get("ai_egress_connector_latency_ms", []) if "ghost-primary" in lbl]
+        self.assertEqual(len(lat), 1)
+        online = [lbl for lbl, _ in fams.get("ai_egress_connector_online", []) if "ghost-primary" in lbl]
+        self.assertEqual(online, [])
+
+    def test_label_escaping(self):
+        _, out = self._emit(self._status(), primary='has"q\\b')
+        self.assertIn(r'label="has\"q\\b"', out)
+
+    def test_degraded_stdout_exit_1(self):
+        # Neither connector serves routes -> degraded -> stdout mode exits 1.
+        _, out = self._emit(self._status(primary_extra={"PrimaryRoutes": []}))
+        # (still a valid document; only the exit code and the sentinel value change)
+        fams, _ = _parse_prom(out)
+        self.assertEqual(fams["ai_egress_overall_healthy"][0][1], "0")
+        rc, _ = self._emit(self._status(primary_extra={"PrimaryRoutes": []}))
+        self.assertEqual(rc, 1)
+
+    # --- atomic writer -----------------------------------------------------
+    def test_write_sets_mode_0644_and_trailing_newline(self):
+        dest = self.tmp / "m.prom"
+        hc._write_textfile_atomic(str(dest), "ai_egress_overall_healthy 1\n")
+        self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o644")
+        self.assertTrue(dest.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_write_rejects_non_prom_missing_parent_and_dir(self):
+        good = "ai_egress_overall_healthy 1\n"   # passes the completeness check
+        with self.assertRaises(ValueError):
+            hc._write_textfile_atomic(str(self.tmp / "x.txt"), good)        # not .prom
+        with self.assertRaises(ValueError):
+            hc._write_textfile_atomic(str(self.tmp / "no" / "x.prom"), good)   # missing parent
+        adir = self.tmp / "d.prom"
+        adir.mkdir()
+        with self.assertRaises((IsADirectoryError, OSError)):
+            hc._write_textfile_atomic(str(adir), good)                     # dest is a directory
+
+    def test_write_atomic_keeps_old_file_on_failure(self):
+        dest = self.tmp / "keep.prom"
+        dest.write_text("OLD\n", encoding="utf-8")
+        os.chmod(dest, 0o600)
+        with mock.patch.object(hc.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                hc._write_textfile_atomic(str(dest), "ai_egress_overall_healthy 1\n")
+        self.assertEqual(dest.read_text(encoding="utf-8"), "OLD\n")         # bytes unchanged
+        self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o600")        # mode unchanged
+        self.assertEqual(list(self.tmp.glob(".ai-egress-prom.*")), [])     # temp cleaned up
+
+    def test_cmd_output_exit_0_on_write_even_if_degraded(self):
+        status = self._status(primary_extra={"PrimaryRoutes": []})          # degraded
+        fixture = self.tmp / "s.json"
+        fixture.write_text(json.dumps(status), encoding="utf-8")
+        dest = self.tmp / "o.prom"
+        with mock.patch.object(hc, "tailscale_ping", return_value=hc.ProbeResult("x", True, rtt_ms=5.0)):
+            rc = hc.main([
+                "connectors", "--primary", "primary-vps", "--fallback", "fallback-vps",
+                "--status-json-file", str(fixture), "--prometheus", "--output", str(dest),
+            ])
+        self.assertEqual(rc, 0)                                             # write ok -> 0 even degraded
+        self.assertEqual([line for line in dest.read_text().split("\n") if line][-1], "ai_egress_overall_healthy 0")
+
+    def test_json_and_prometheus_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):  # argparse error, either order
+            hc.build_parser().parse_args(["connectors", "--json", "--prometheus"])
+        with self.assertRaises(SystemExit):
+            hc.build_parser().parse_args(["connectors", "--prometheus", "--json"])
 
 
 class VersionTests(unittest.TestCase):

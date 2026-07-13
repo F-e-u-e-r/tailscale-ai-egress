@@ -18,6 +18,7 @@ REQUIRE_ROUTES="${REQUIRE_ROUTES:-}"
 
 WATCH=0
 JSON=0
+PROM_TEXTFILE=""
 
 usage() {
   cat <<'EOF'
@@ -44,6 +45,14 @@ Options:
   --once       Run a single check (default). Useful from cron for alerting.
   --watch      Loop forever, checking every CHECK_INTERVAL seconds.
   --json       Emit a JSON report instead of text.
+  --prometheus-textfile <path>
+               Write a node_exporter textfile (per-connector gauges) to <path>
+               (must end in .prom) instead of printing the normal report, then
+               exit; with --watch, rewrite it every CHECK_INTERVAL. The file is
+               written atomically. Exit status reflects write success, not health
+               (health is the ai_egress_overall_healthy gauge). Not combinable
+               with --json. Node-level tailscaled_* metrics are separately
+               available via `tailscale metrics print`.
   --version    Print the tailscale-ai-egress version and exit.
   -h, --help   Show this help.
 
@@ -70,6 +79,7 @@ show_version() {
 }
 
 note() { printf '%s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -138,11 +148,20 @@ parse_args() {
       --once) shift ;;
       --watch) WATCH=1; shift ;;
       --json) JSON=1; shift ;;
+      --prometheus-textfile)
+        shift
+        [ "$#" -ge 1 ] || usage_error "--prometheus-textfile requires a <path> argument"
+        [ -n "$1" ] || usage_error "--prometheus-textfile requires a non-empty path"
+        case "$1" in -*) usage_error "--prometheus-textfile requires a path, got option '$1'" ;; esac
+        PROM_TEXTFILE="$1"; shift ;;
       --version) show_version; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       *) usage_error "unknown argument: $1" ;;
     esac
   done
+  if [ -n "$PROM_TEXTFILE" ] && [ "$JSON" = "1" ]; then
+    usage_error "--json cannot be combined with --prometheus-textfile"
+  fi
 }
 
 preflight() {
@@ -168,12 +187,50 @@ run_check() {
   python3 "$HEALTH" "${args[@]}"
 }
 
+write_prometheus_textfile() {
+  # Delegate the whole validated document AND the atomic write to the Python
+  # engine (which owns the .prom validation, fchmod 0644, fsync, and os.replace).
+  # Returns the engine's status: 0 on a successful write (even when the pair is
+  # degraded -- health is carried by the ai_egress_overall_healthy gauge, not the
+  # exit code), nonzero on a write/validation failure. On failure the existing
+  # file is left untouched and Python's stderr is surfaced via warn.
+  local err rc
+  # `2>&1 >/dev/null` (in THIS order) captures Python's stderr into `err` and
+  # discards its stdout; do NOT "simplify" it to `>/dev/null 2>&1`, which would
+  # capture nothing. `rc` is Python's exit status.
+  err="$(python3 "$HEALTH" connectors \
+    --primary "$PRIMARY_CONNECTOR" --fallback "$FALLBACK_CONNECTOR" \
+    --ping-timeout "$PING_TIMEOUT" --require-routes "$REQUIRE_ROUTES" \
+    --prometheus --output "$PROM_TEXTFILE" 2>&1 >/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "prometheus textfile write failed (rc=$rc): ${err:-unknown error}; kept any existing $PROM_TEXTFILE"
+  else
+    note "[prometheus] wrote $PROM_TEXTFILE"
+  fi
+  return "$rc"
+}
+
 main() {
   parse_args "$@"
   read_failover_env
   apply_defaults
   validate_config
   preflight
+  if [ -n "$PROM_TEXTFILE" ]; then
+    # Textfile-only mode: write the node_exporter .prom (Python owns generation +
+    # atomic write); the normal text/JSON report is NOT also printed (one pass).
+    if [ "$WATCH" = "1" ]; then
+      note "[watch] prometheus textfile writer started (interval=${CHECK_INTERVAL}s -> $PROM_TEXTFILE)"
+      while true; do
+        write_prometheus_textfile || true  # keep looping; existing file retained on failure
+        sleep "$CHECK_INTERVAL" || die "sleep for CHECK_INTERVAL='$CHECK_INTERVAL' failed; refusing to busy-loop"
+      done
+    else
+      write_prometheus_textfile
+      return $?
+    fi
+  fi
   if [ "$WATCH" = "1" ]; then
     note "[watch] connector monitor started (interval=${CHECK_INTERVAL}s)"
     while true; do

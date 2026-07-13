@@ -95,13 +95,15 @@ Highest user value first.
   no Tailscale "app wrapper" is needed (raw inputs come from `status --json` /
   `tailscale ping` / `tailscale metrics print`).
   Step 2 (**done**): `latency_ms` from `tailscale ping` (reuses the connector
-  reachability ping; opt-in `peer-metrics --ping` for standalone use). Next:
-  `monitor-connectors.sh --prometheus-textfile <path>` emitting node_exporter
-  textfile format (wrapping `tailscale metrics print` + status gauges), plus
-  healthchecks.io / Uptime Kuma examples. No server, no telemetry.
+  reachability ping; opt-in `peer-metrics --ping` for standalone use).
+  Step 3 (**done**): `monitor-connectors.sh --prometheus-textfile <path>` emits an
+  atomically-written node_exporter textfile of validated per-connector gauges
+  (Python owns generation + the atomic write). Node-level `tailscaled_*` counters
+  stay separately scrapeable via `tailscale metrics print` (a validated opt-in
+  wrapper is a possible future addition). No server, no telemetry.
   *Acceptance:* `--prometheus-textfile` writes valid node_exporter textfile
   output; existing text/`--json` modes are unchanged; a test parses the emitted
-  file.
+  file. **(met.)**
 - **Shared internal shell library.** `1.x additive-safe` (source-only). Extract
   the duplicated `read_line` / `run_root` / identity helpers into
   `scripts/lib/common.sh` incrementally, one consumer at a time, with parity

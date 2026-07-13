@@ -25,12 +25,14 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import ipaddress
 import json
 import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1111,12 +1113,232 @@ def _fmt_online(value: Optional[bool]) -> str:
     return "unknown"
 
 
+# --------------------------------------------------------------------------- #
+# Prometheus textfile emitter (read-only; a user-run scraper consumes it).
+# Python owns the whole validated document AND the atomic write; the monitor is a
+# thin wrapper. NEVER emits a silently-wrong value: a null / non-finite / negative
+# / malformed metric is OMITTED (never a fake 0). See docs/design/metrics-collection.md.
+# --------------------------------------------------------------------------- #
+def _prom_escape(value: str) -> str:
+    """Escape a Prometheus label value: backslash, double-quote, newline."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _prom_labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    inner = ",".join(f'{key}="{_prom_escape(str(val))}"' for key, val in labels.items())
+    return "{" + inner + "}"
+
+
+def _prom_num(value: Any) -> str:
+    """Render a numeric sample value: floats via repr (finite), ints via str."""
+    return repr(value) if isinstance(value, float) else str(int(value))
+
+
+def _nonneg_int_or_none(value: Any) -> Optional[int]:
+    """A counter sample must be a non-negative, non-bool int that is also finite as
+    a float64 (Prometheus sample values are float64): an absurdly large int would
+    parse as +Inf in a scraper, so omit it rather than emit a non-finite sample."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    try:
+        if not math.isfinite(float(value)):
+            return None
+    except OverflowError:  # int too large to fit in a float64 -> would scrape as +Inf
+        return None
+    return value
+
+
+_PROM_DEFAULT_NETS = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+
+
+def _prom_route_count(status: dict[str, Any], node_id: Optional[str], ips: list[str]) -> Optional[int]:
+    """Strict, Prometheus-only count of non-default advertised routes. Unlike the
+    lenient JSON `node_routes`, this returns None (⇒ omit the gauge) whenever the
+    authoritative route field is not a list or ANY element is not a valid, non-empty
+    CIDR/IP string -- so a malformed status can never manufacture a fake route count
+    (rule 4). EVERY element is parsed FIRST; the default-route and own-host
+    exclusions are then applied to the parsed network, so a non-canonical default
+    like ``0.0.0.1/0`` is still excluded and a malformed entry that merely resembles
+    a self address still omits the gauge. Never touches `node_routes`, `serving`, or
+    the health verdict."""
+    node = _find_node(status, node_id, ips)
+    if node is None:
+        return None
+    self_hosts: set[Any] = set()
+    if "PrimaryRoutes" in node:
+        raw = node.get("PrimaryRoutes")
+    else:
+        raw = node.get("AllowedIPs")
+        for ip in node.get("TailscaleIPs") or []:
+            if isinstance(ip, str):
+                try:
+                    self_hosts.add(ipaddress.ip_address(_norm_ip(ip)))
+                except ValueError:
+                    pass
+    if not isinstance(raw, list):
+        return None
+    count = 0
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            return None  # malformed element -> omit the whole gauge
+        try:
+            net = ipaddress.ip_network(entry.strip(), strict=False)
+        except ValueError:
+            return None  # not a valid CIDR/IP -> omit the whole gauge
+        if net in _PROM_DEFAULT_NETS:
+            continue  # a (canonical) default route is not an app-connector route
+        if net.prefixlen == net.max_prefixlen and net.network_address in self_hosts:
+            continue  # the connector's own host address (AllowedIPs fallback path)
+        count += 1
+    return count
+
+
+def _prometheus_document(
+    rows: list[dict[str, Any]],
+    resolved: list[tuple[Optional[str], list[str]]],
+    status: dict[str, Any],
+    overall_healthy: bool,
+) -> str:
+    """Build the complete Prometheus text-exposition document from the connector
+    rows. HELP/TYPE appear once per family, all its samples together; a family with
+    no samples is skipped. `ai_egress_overall_healthy` is emitted exactly once, LAST
+    (it is derived from a bool, so never null) as the completeness sentinel, and the
+    document always ends with a trailing newline."""
+    online: list[tuple[dict[str, str], Any]] = []
+    reachable: list[tuple[dict[str, str], Any]] = []
+    latency: list[tuple[dict[str, str], Any]] = []
+    tx: list[tuple[dict[str, str], Any]] = []
+    rx: list[tuple[dict[str, str], Any]] = []
+    handshake: list[tuple[dict[str, str], Any]] = []
+    routes: list[tuple[dict[str, str], Any]] = []
+    info: list[tuple[dict[str, str], Any]] = []
+
+    for row, (node_id, ips) in zip(rows, resolved):
+        labels = {"connector": str(row["connector"]), "label": str(row["label"])}
+        metrics = row["metrics"]
+        if isinstance(row["online"], bool):
+            online.append((labels, 1 if row["online"] else 0))
+        if isinstance(row["reachable"], bool):
+            reachable.append((labels, 1 if row["reachable"] else 0))
+        lat = _latency_or_none(row["rtt_ms"])
+        if lat is not None:
+            latency.append((labels, lat))
+        tx_val = _nonneg_int_or_none(metrics["tx_bytes_total"])
+        if tx_val is not None:
+            tx.append((labels, tx_val))
+        rx_val = _nonneg_int_or_none(metrics["rx_bytes_total"])
+        if rx_val is not None:
+            rx.append((labels, rx_val))
+        age = metrics["last_handshake_age_seconds"]
+        if isinstance(age, int) and not isinstance(age, bool) and age >= 0:
+            handshake.append((labels, age))
+        route_count = _prom_route_count(status, node_id, ips)
+        if route_count is not None:
+            routes.append((labels, route_count))
+        path = metrics["connection_path"]
+        if isinstance(path, str) and path:
+            info.append(({**labels, "connection_path": path}, 1))
+
+    families = [
+        ("ai_egress_connector_online", "gauge",
+         "Connector peer online per tailscale status: 1 or 0.", online),
+        ("ai_egress_connector_reachable", "gauge",
+         "Connector reachable via tailscale ping this cycle: 1 or 0.", reachable),
+        ("ai_egress_connector_latency_ms", "gauge",
+         "Probe round-trip time from tailscale ping, in milliseconds.", latency),
+        ("ai_egress_connector_tx_bytes_total", "counter",
+         "Bytes sent to the connector peer, cumulative since tailscaled start (may reset on restart).", tx),
+        ("ai_egress_connector_rx_bytes_total", "counter",
+         "Bytes received from the connector peer, cumulative since tailscaled start (may reset on restart).", rx),
+        ("ai_egress_connector_last_handshake_age_seconds", "gauge",
+         "Seconds since the last handshake with the connector peer.", handshake),
+        ("ai_egress_connector_routes", "gauge",
+         "Non-default app-connector/subnet routes advertised (omitted if the route field is malformed).", routes),
+        ("ai_egress_connector_info", "gauge",
+         "Connector connection-path info; the value is always 1.", info),
+    ]
+
+    lines: list[str] = []
+    for name, kind, help_text, samples in families:
+        if not samples:
+            continue
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        for labels, value in samples:
+            lines.append(f"{name}{_prom_labels(labels)} {_prom_num(value)}")
+    # Sentinel LAST: proves the emitter ran to completion (the writer checks it).
+    lines.append("# HELP ai_egress_overall_healthy Connector-pair health: 1 healthy, 0 degraded.")
+    lines.append("# TYPE ai_egress_overall_healthy gauge")
+    lines.append(f"ai_egress_overall_healthy {1 if overall_healthy else 0}")
+    return "\n".join(lines) + "\n"
+
+
+_SENTINEL_RE = re.compile(r"ai_egress_overall_healthy [01]")
+# Any sample line of the sentinel SERIES: optional leading blanks/tabs, the metric
+# name, then `{labels}` or a space/tab separator (both valid Prometheus grammar), so a
+# timestamped (`... 0 123`), labeled, leading-whitespace, tab-separated, or duplicate
+# form is caught -- not only the exact bare line that _SENTINEL_RE matches. The
+# separator class stops it from matching a different metric such as
+# `ai_egress_overall_healthy_extra`.
+_SENTINEL_FAMILY_RE = re.compile(r"[ \t]*ai_egress_overall_healthy(?:\{|[ \t])")
+
+
+def _write_textfile_atomic(dest: str, content: str) -> None:
+    """Atomically publish a prometheus `.prom` document to `dest`. Uses a
+    same-directory temp + fd-based `fchmod(0644)` + `fsync` + `os.replace`, so a
+    reader never sees a partial file and the mode is set on the fd (no symlink
+    race). Validates the destination AND the document, and raises on any failure,
+    leaving an existing `dest` untouched (the temp is unlinked).
+
+    Completeness boundary: refuses to publish a document that is not sentinel-
+    terminated (exactly one `ai_egress_overall_healthy [01]` as the final non-empty
+    line, plus a trailing newline) -- a truncated / partial document must fail
+    rather than clobber a good file. Security note: the destination directory must
+    be writable only by the writer; a world-writable, non-sticky parent permits a
+    pathname-swap race that `os.replace` cannot defend against (operator's
+    responsibility, like any node_exporter textfile directory)."""
+    if not content.endswith("\n"):
+        raise ValueError("refusing to publish a document without a trailing newline")
+    family = [line for line in content.split("\n") if _SENTINEL_FAMILY_RE.match(line)]
+    last = content.rstrip("\n").rsplit("\n", 1)[-1]
+    if len(family) != 1 or not _SENTINEL_RE.fullmatch(family[0]) or last != family[0]:
+        raise ValueError("refusing to publish an incomplete document (a single bare ai_egress_overall_healthy [01] must be the final line)")
+    if not dest.endswith(".prom"):
+        raise ValueError("output path must end in .prom (node_exporter textfile collector reads *.prom)")
+    dirpath = os.path.dirname(dest) or "."
+    if not os.path.isdir(dirpath):
+        raise ValueError(f"parent directory does not exist or is not a directory: {dirpath}")
+    if os.path.isdir(dest):
+        raise IsADirectoryError(f"output path is a directory: {dest}")
+    fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=".ai-egress-prom.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o644)  # fd-based: no symlink-follow race
+            os.fsync(handle.fileno())
+        os.replace(tmp, dest)  # atomic; raises rather than nesting into a directory
+        tmp = ""  # published; nothing to clean up
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
 def cmd_connectors(args: argparse.Namespace) -> int:
+    if getattr(args, "output", None) is not None and not getattr(args, "prometheus", False):
+        eprint("error: --output requires --prometheus")
+        return 2
     status, available = get_status(args.status_json_file)
     # A well-formed status always carries a string BackendState; treat anything
     # other than "Running" (including a missing / null / non-string value) as down.
     backend_down = status.get("BackendState") != "Running"
     rows: list[dict[str, Any]] = []
+    # Parallel to `rows` (NOT stored in the row dict, so the JSON stays additive):
+    # the canonical identity for the Prometheus-only strict route re-validation.
+    resolved: list[tuple[Optional[str], list[str]]] = []
     reachable_ok = True
     serving = "none"
     for role, label in (("primary", args.primary), ("fallback", args.fallback)):
@@ -1129,6 +1351,7 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             reachable_ok = False
         if route_count and serving == "none":
             serving = role
+        resolved.append((node_id, ips))
         rows.append({
             "connector": role,
             "label": label,
@@ -1149,6 +1372,20 @@ def cmd_connectors(args: argparse.Namespace) -> int:
     overall_healthy = available and not backend_down and reachable_ok and (not args.require_routes or routes_ok)
     order, order_reason = connector_ordering(load_devices(args.devices_json_file), args.primary, args.fallback)
     overall = "healthy" if overall_healthy else "degraded"
+    if getattr(args, "prometheus", False):
+        document = _prometheus_document(rows, resolved, status, overall_healthy)
+        output = getattr(args, "output", None)
+        if output is not None:  # NOT truthiness: an empty --output must error, not fall back to stdout
+            try:
+                _write_textfile_atomic(output, document)
+            except Exception as exc:
+                eprint(f"error: could not write prometheus textfile: {exc}")
+                return 1
+            # Write succeeded: exit 0 even when degraded -- health is carried by the
+            # ai_egress_overall_healthy gauge, not the exit code (R3-04).
+            return 0
+        print(document, end="")
+        return 0 if overall_healthy else 1
     if args.json:
         print(json.dumps({
             "schema_version": STATE_SCHEMA_VERSION,
@@ -1327,7 +1564,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REQUIRE_ROUTES", "1"),
         help="Degrade when neither connector advertises routes (default 1). Set 0 if routes are not client-visible.",
     )
-    connectors.add_argument("--json", action="store_true")
+    connectors_out = connectors.add_mutually_exclusive_group()
+    connectors_out.add_argument("--json", action="store_true")
+    connectors_out.add_argument(
+        "--prometheus",
+        action="store_true",
+        help="Emit Prometheus text-exposition of per-connector gauges (instead of text/JSON).",
+    )
+    connectors.add_argument(
+        "--output",
+        help="With --prometheus, atomically write the document to this .prom file "
+        "(node_exporter textfile) instead of stdout; exit reflects write success, not health.",
+    )
     connectors.set_defaults(func=cmd_connectors)
 
     peer = sub.add_parser(
