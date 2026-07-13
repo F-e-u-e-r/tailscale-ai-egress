@@ -142,6 +142,34 @@ tailscale set --exit-node=<your-primary>
 
 iOS and Android cannot run this watcher (switch the exit node in the app); Windows is not yet supported. See [Configuration](Configuration.md) for the full list of `failover.env` settings, and the `docs/examples/` directory for ready-made systemd, launchd, and cron units.
 
+### Post-Switch Diagnostics With `peer-metrics`
+
+The controller ships **no built-in** post-switch metrics collection: under the 1.x
+rule its *own code* never puts a metrics fetch on the failover decision or exit path,
+so by default a slow or failing metric cannot stall or fail a switch.
+
+You can still log the *new* exit node's read-only metrics after each switch by
+composing the existing `FAILOVER_NOTIFY_CMD` hook with the `peer-metrics` subcommand.
+This needs **no controller code change** and **cannot change the failover decision or
+the already-recorded switch/cooldown** — the switch is recorded before the hook runs,
+and the hook's exit status is ignored. It does, however, **extend the controller's
+process path while it runs**: the hook is *synchronous*, so keep it fast (a slow
+command stalls the watch loop), and a `SIGTERM` reaching the controller *while the
+hook is running* makes it exit `143` rather than `0`. That is your informed opt-in,
+exactly as for any `FAILOVER_NOTIFY_CMD`. The hook receives `FAILOVER_EVENT`
+(`switched`|`failed`), `FAILOVER_ROLE`, `FAILOVER_LABEL`, and `FAILOVER_REASON` in its
+environment; gate on `switched` so it does not run on a failed attempt:
+
+```bash
+# Log the new exit node's tx/rx, connection path, latency, and handshake age after
+# each successful switch (adjust the install path). `peer-metrics --ping` is
+# read-only and always exits 0; see docs/design/metrics-collection.md.
+export FAILOVER_NOTIFY_CMD='[ "$FAILOVER_EVENT" = switched ] && \
+  python3 /opt/tailscale-ai-egress/scripts/health_check.py \
+    peer-metrics --node "$FAILOVER_LABEL" --ping | logger -t ai-egress-failover'
+./failover-exit-node.sh --watch --apply
+```
+
 ## Taking One Machine Out
 
 | Action | Effect |

@@ -1,7 +1,8 @@
 # Design: metrics collection (counters + liveness)
 
 **Status:** implemented (counters + liveness + latency_ms + Prometheus textfile).
-Controller reuse is the remaining named follow-up.
+All named follow-ups are addressed; controller reuse is documented as a
+notify-hook composition (below), not a built-in.
 **Tracking:** [Roadmap](../Roadmap.md) · governed by [Stability](../Stability.md)
 
 ## Do we need to wrap an app for Tailscale? No.
@@ -93,7 +94,8 @@ derived enum can be refined additively later without breaking the fixed key set.
 > The metrics are attached inside `cmd_connectors` using the status it already
 > fetched (one fetch, not a per-connector shell-out), which is cleaner and keeps
 > `health_check.py` as the single owner of the shape. `peer-metrics` exists for
-> standalone / future controller use.
+> standalone use and for the notify-hook composition (see the Controller-reuse note
+> below).
 
 **Non-gating (hard rule):** a metrics fetch/extract failure never changes the
 monitor's exit code, existing health/status lines, or message ids. The
@@ -164,8 +166,15 @@ non-sticky** parent, so such a directory offers no integrity guarantee. The writ
 also refuses to publish a document that is not sentinel-terminated (a truncated or
 partial generation fails rather than clobbering a good file).
 
-## Follow-ups (not in this step)
+## Follow-ups — all addressed
 
-- **Controller reuse:** the failover controller may consume `peer-metrics` for
-  post-switch diagnosis/logging — best-effort / non-gating; metrics must never
-  change a failover decision or the controller's exit path in 1.x.
+- **Latency** (`latency_ms`) and the **Prometheus textfile** landed in later steps
+  (see the sections above and the [Roadmap](../Roadmap.md)).
+- **Controller reuse — documented as a composition, not a built-in.** The shipped
+  controller's own code never puts metrics on the failover decision/exit path (the
+  1.x rule). Rather than build that in, operators can opt in via the existing
+  `FAILOVER_NOTIFY_CMD` hook + `peer-metrics` — see [Failover.md](../Failover.md),
+  "Post-Switch Diagnostics With `peer-metrics`". No controller code changes and the
+  failover decision / recorded switch are untouched; but enabling the hook **does
+  extend the controller's process path** (it is synchronous — a `SIGTERM` while it
+  runs still yields `143`), which the operator accepts as an informed opt-in.
