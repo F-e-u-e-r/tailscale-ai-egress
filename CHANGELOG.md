@@ -39,6 +39,15 @@ both Python CLIs report it with `--version`.
   reachability ping (no extra ping) and appends `latency_ms=` to the end of the
   `[metrics]` text line; `scripts/health_check.py peer-metrics` gains an opt-in
   `--ping` flag to measure it standalone. Additive and still non-gating.
+- `monitor-connectors.sh --prometheus-textfile <path>`: write a node_exporter
+  textfile of per-connector gauges (online/reachable/latency/tx/rx/handshake-age/
+  routes/connection-path + an `ai_egress_overall_healthy` sentinel) instead of the
+  normal report. The document is built and written atomically by
+  `scripts/health_check.py connectors --prometheus [--output <path>]` (a new,
+  `--json`-mutually-exclusive mode). Null/non-finite/negative/malformed values are
+  omitted (never a fake `0`); the write exit code reflects write success, not
+  health. With `--watch` the file is rewritten each interval and a failed write
+  leaves the previous file intact.
 
 ### Changed
 

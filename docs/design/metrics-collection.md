@@ -1,7 +1,7 @@
 # Design: metrics collection (counters + liveness)
 
-**Status:** implemented (counters + liveness + latency_ms). Controller reuse and a
-Prometheus textfile are named follow-ups.
+**Status:** implemented (counters + liveness + latency_ms + Prometheus textfile).
+Controller reuse is the remaining named follow-up.
 **Tracking:** [Roadmap](../Roadmap.md) · governed by [Stability](../Stability.md)
 
 ## Do we need to wrap an app for Tailscale? No.
@@ -123,10 +123,49 @@ reachability/online/route checks and does not reference `metrics`.
   and pings only a resolved peer, so an unresolvable label is never pinged and the
   object stays null-filled. A caller-supplied RTT is validated (finite, ≥ 0).
 
+## Prometheus textfile (`monitor-connectors.sh --prometheus-textfile <path>`)
+
+For a user-run scraper (node_exporter's textfile collector, Prometheus, Grafana),
+the monitor can emit the per-connector state as a `.prom` textfile instead of the
+normal report. **Python owns the whole thing** — `health_check.py connectors
+--prometheus [--output <path>]` builds a validated Prometheus document and, with
+`--output`, writes it **atomically** (same-dir `mkstemp` → `fchmod 0644` → `fsync`
+→ `os.replace`); the shell wrapper only passes the path and, in `--watch`, keeps
+looping (a failed write leaves the previous file untouched). It is mutually
+exclusive with `--json`.
+
+Gauges (labels `connector` = primary|fallback, `label` = hostname):
+`ai_egress_connector_online`, `_reachable`, `_latency_ms` (the probe RTT, sourced
+from the reachability ping so it survives even an unresolved peer),
+`_tx_bytes_total` / `_rx_bytes_total` (counters), `_last_handshake_age_seconds`,
+`_routes`, `_info{connection_path=…}`, and `ai_egress_overall_healthy` (emitted
+**last**, the write-completeness sentinel).
+
+**Never a silently-wrong value (rule 4):** a null, non-finite, negative-counter,
+float64-unrepresentable, or malformed-route value is **omitted** (no sample line),
+never a fake `0`; route counts are re-validated per element with `ipaddress`. This
+strict per-element route validation is intentionally stricter than the released,
+lenient `node_routes` check that drives `overall_healthy`: for any well-formed
+status they agree, and only an adversarial/malformed route field (e.g. `0.0.0.1/0`
+or `not-a-cidr`, which real Tailscale never emits) can make the strict `_routes`
+gauge and the health sentinel diverge. Tightening the health verdict itself is a
+released-semantics change kept OUT of this additive step (tracked as a separate
+hardening PR); metrics never change the health verdict here (rule 1). **Exit code = write
+integrity, not health:** with `--output` a successful write exits `0` even when the
+pair is degraded (health is the `ai_egress_overall_healthy` gauge); a
+generation/write failure exits non-zero. Node-level `tailscaled_*` counters are
+already Prometheus-formatted and separately scrapeable via `tailscale metrics
+print`, so they are not wrapped here (a future opt-in could add them, validated).
+
+**Operator note (security):** point `--prometheus-textfile` at a directory writable
+only by the writer (as node_exporter's textfile collector expects). The atomic
+`os.replace` cannot defend against a pathname-swap in a **world-writable,
+non-sticky** parent, so such a directory offers no integrity guarantee. The writer
+also refuses to publish a document that is not sentinel-terminated (a truncated or
+partial generation fails rather than clobbering a good file).
+
 ## Follow-ups (not in this step)
 
 - **Controller reuse:** the failover controller may consume `peer-metrics` for
   post-switch diagnosis/logging — best-effort / non-gating; metrics must never
   change a failover decision or the controller's exit path in 1.x.
-- **`--prometheus-textfile`:** a node_exporter textfile wrapping `tailscale
-  metrics print` + status-derived per-peer gauges, for a user-run scraper.
