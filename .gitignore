@@ -16,3 +16,9 @@ htmlcov/
 .venv/
 venv/
 .DS_Store
+
+# Local, untracked working files. These must be ignored so scripts/package.sh --
+# which stages `git ls-files --cached --others --exclude-standard` -- does not sweep
+# them into the release archive.
+/skills-staging/
+/fable review.txt
