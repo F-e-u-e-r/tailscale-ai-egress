@@ -73,3 +73,65 @@ jobs:
         run: |
           python3 -m coverage run -m unittest discover -s tests
           python3 -m coverage report --fail-under=55
+
+  # Second job (parallel, advisory): covers what the Linux job cannot -- stock Bash 3.2
+  # and the BSD userland (`stat -f`, `route -n get`, `shasum`). Deliberately does NOT
+  # re-run shellcheck/ruff/mypy/docs-links/coverage: those are platform-independent and
+  # already covered above.
+  macos-test:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      # actions/setup-python v6.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+
+      - name: Runner identity
+        run: |
+          uname -a
+          /bin/bash --version | head -1
+          python3 --version
+
+      - name: Check shell syntax (stock Bash 3.2)
+        run: |
+          # /bin/bash is macOS's stock Bash 3.2; the runner also has a newer Homebrew
+          # bash on PATH, so invoke the interpreter explicitly to actually test 3.2.
+          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh; do
+            /bin/bash -n "$file"
+          done
+
+      - name: Real BSD route lookup (route_get + parse_route_interface)
+        run: |
+          # Exercise the genuine BSD `route -n get` and the interface parser on loopback
+          # (no network, root, or tailscale). AI_EGRESS_SOURCE_ONLY suppresses main().
+          set -euo pipefail
+          AI_EGRESS_SOURCE_ONLY=1 . ./check-client-routes.sh
+          iface="$(route_get 127.0.0.1 | parse_route_interface)"
+          [ -n "$iface" ] || { echo "empty interface from real BSD route" >&2; exit 1; }
+          echo "loopback interface: $iface"
+
+      - name: Run Python unit tests (BSD userland + Bash 3.2)
+        run: python3 -B -m unittest discover -s tests
+
+      - name: Command-surface + dry-run smoke test
+        run: ./scripts/smoke-test.sh
+
+      - name: Packaging check (force the BSD shasum fallback)
+        # Restrict PATH so any Homebrew `sha256sum` cannot shadow the BSD `shasum -a 256`
+        # fallback in package.sh; git/tar/zip/shasum live in /usr/bin and it needs no python3.
+        env:
+          PATH: /usr/bin:/bin
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "unexpected sha256sum on the restricted PATH (would bypass the shasum fallback)" >&2
+            exit 1
+          fi
+          command -v shasum >/dev/null 2>&1 || { echo "shasum missing on the restricted PATH" >&2; exit 1; }
+          ./scripts/package.sh --check

@@ -15,6 +15,16 @@ both Python CLIs report it with `--version`.
 
 ### Added
 
+- **macOS CI job.** A parallel `macos-latest` workflow job covers what the Linux
+  matrix cannot: stock Bash 3.2 syntax (`/bin/bash -n`), the BSD userland (a real
+  `route -n get` probe, the `stat -f` lock-age arm exercised by the failover
+  stale-lock tests, and the `shasum -a 256` packaging fallback forced via a
+  restricted `PATH`), plus the full test suite on Darwin. It deliberately does not
+  re-run shellcheck / ruff / mypy / docs-links / coverage (platform-independent,
+  already covered by the Linux job). Also adds a `diagnose.sh` Darwin `route -n get`
+  test mirroring the client-route checker, and makes both route-checker fake `route`
+  commands argument-strict. Advisory only (not a required status check); no script,
+  behavior, CLI, or schema change.
 - `diagnose.sh`: `--connector-tag <tag>` plus custom connector-tag detection.
   The expected connector tag is resolved by precedence — `--connector-tag`, then
   the `CONNECTOR_TAG` environment variable, then

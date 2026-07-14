@@ -1621,6 +1621,8 @@ esac
                 fake_bin,
                 "route",
                 f"""#!/bin/sh
+# argument-strict: the script must call the BSD form `route -n get <ip>`.
+[ "$1" = "-n" ] && [ "$2" = "get" ] || {{ echo "route: expected '-n get <ip>', got: $*" >&2; exit 64; }}
 eval "target=\\${{$#}}"
 case "$target" in
   100.64.0.2|104.18.1.1) iface=utun8 ;;
@@ -1833,7 +1835,7 @@ exit 1
         self.assertTrue(any(check["details"].get("wildcards_skipped") == 1 for check in checks))
         self.assertTrue(any(check["status"] == "fail" and "No non-wildcard" in check["message"] for check in checks))
 
-    def _diagnose_env(self, tmp, *, status_json=None, status_text=None, status_available=True, linux_userspace=False):
+    def _diagnose_env(self, tmp, *, status_json=None, status_text=None, status_available=True, linux_userspace=False, os_name="Linux"):
         fake_bin = Path(tmp) / "bin"
         fake_bin.mkdir()
         if status_json is None:
@@ -1924,11 +1926,49 @@ fi
 exit 0
 """,
         )
-        self._write_fake_command(fake_bin, "uname", "#!/bin/sh\necho Linux\n")
+        self._write_fake_command(fake_bin, "uname", f"#!/bin/sh\necho {os_name}\n")
+        if os_name == "Darwin":
+            # BSD route: exercises diagnose.sh's Darwin `route -n get` arm (argument-strict).
+            self._write_fake_command(
+                fake_bin,
+                "route",
+                """#!/bin/sh
+[ "$1" = "-n" ] && [ "$2" = "get" ] || { echo "route: expected '-n get <ip>', got: $*" >&2; exit 64; }
+eval "target=\\${$#}"
+case "$target" in
+  104.18.1.1) iface=utun8 ;;
+  *) iface=en0 ;;
+esac
+echo "interface: $iface"
+""",
+            )
 
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         return env
+
+    def test_diagnose_route_checker_darwin_success(self):
+        # Closes the coverage gap: diagnose.sh's Darwin `route -n get` arm (diagnose.sh:298)
+        # mirrors check-client-routes.sh but was only tested with uname=Linux. Drive it with
+        # a fake uname=Darwin + an argument-strict BSD `route`, and assert the sample route
+        # check reports the Darwin interface (proving the Darwin arm ran + parsed correctly).
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            env = self._diagnose_env(tmp, os_name="Darwin")
+            result = subprocess.run(
+                ["bash", str(ROOT / "diagnose.sh"), "--domains-file", str(domains), "--json"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+        payload = json.loads(result.stdout)
+        route_checks = [c for c in payload["checks"] if c["id"] == "sample-domain-routes"]
+        self.assertTrue(
+            any(c["status"] == "ok" and "chatgpt.com -> 104.18.1.1 -> utun8" in c["message"] for c in route_checks),
+            msg=f"Darwin route arm not exercised; checks={route_checks}",
+        )
 
     def test_diagnose_json_reports_connector_exit_node_and_forwarding(self):
         with tempfile.TemporaryDirectory() as tmp:
