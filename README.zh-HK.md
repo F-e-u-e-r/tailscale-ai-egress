@@ -2,6 +2,12 @@
 
 語言：[English](README.md) | 繁體中文（香港）
 
+[![CI](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml/badge.svg)](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-1.1.1-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20VPS%20%C2%B7%20POSIX%20shell-lightgrey)
+![Telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)
+
 > `README.md` 是最新內容的主要來源。本中文文件使用香港繁體中文；台灣讀者可能會見到少量用語差異，例如「網絡」和「網路」。
 
 > **Stable v1.x.** 1.0 的 command surface 已凍結，詳見 [docs/Stability.md](docs/Stability.md)；v1.1 新增 opt-in failover 與 health-monitoring helpers（`failover-exit-node.sh`、`monitor-connectors.sh`），不會改變原有 command surface。所有 entrypoint 都支援 `--version` 和 `--help`。
@@ -20,8 +26,19 @@ cd tailscale-ai-egress
 
 選預設 `common` domains，Advanced Mode 回答 `N`，貼上產生的 policy snippet，然後完成 Tailscale node login。
 
+## 功能
+
+- **🎯 Domain-selective AI egress** — 只把你選的 AI domains 經 VPS 出口 IP，其他流量繼續走本地網絡或你慣用的 exit node。
+- **🔁 同區 connector failover** — 多台 App Connector 共用同一 tag，其中一台離線時，新的 AI-domain 連線會轉去仍在線的 connector。
+- **🛟 Exit-node failover controller** — `failover-exit-node.sh --watch --apply` 在主 exit node 健康檢查失敗時切換到備援，具備 hysteresis、cooldown 和可選的 post-switch notify hook。
+- **📊 Connector HA 監察 + metrics** — `monitor-connectors.sh` 報告每台 connector 的 online／可達性／route 狀態，以及 per-connector metrics（Tx/Rx counters、liveness、`tailscale ping` latency、connection path）。用 `--prometheus-textfile` 輸出 node_exporter／Prometheus textfile，或用 `health_check.py peer-metrics` 讀單一 connector。
+- **🧭 引導式設定，automation 需 opt in** — 預設只產生手動 policy snippet；只有你選擇時才 opt in 可審核的 API policy（`plan` → `apply-plan`），永不自動執行。
+- **🩺 診斷，支援 JSON** — `diagnose.sh`（VPS）和 `check-client-routes.sh`（client）端到端驗證 routing，兩者都支援 `--json` 供 scripting 使用。
+- **🔒 安全優先** — 不收集 telemetry；secrets 只從 env／hidden input 讀取；驗證 release artifact checksum；可審核 policy plan 配 `If-Match` concurrency check；health engine 對 malformed status fail closed。
+
 ## 目錄
 
+- [功能](#功能)
 - [開始前需要](#開始前需要)
 - [選擇模式](#選擇模式)
 - [Quick Start](#quick-start)
