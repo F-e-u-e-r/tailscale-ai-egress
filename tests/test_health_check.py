@@ -187,6 +187,17 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(d.action, "switch-to-primary")
         self.assertEqual(d.reason, "ensure_primary")
 
+    def test_ensure_primary_does_not_switch_on_unknown(self):
+        # A malformed/untrusted ExitNodeStatus resolves to "unknown" (see
+        # test_live_active_role_malformed_status_is_unknown_not_none), and "unknown"
+        # must NOT authorize a switch even under --ensure-primary -- only a genuine
+        # "none" does. Together they close the malformed-status fail-open (Blocker 1a).
+        th = hc.Thresholds(fail_threshold=1, ok_threshold=1, cooldown=0.0, ensure_primary=True)
+        state = self._state(hc.STATE_UP, hc.STATE_UP)
+        d = hc.evaluate(state, "unknown", probe("p", True), probe("f", True), th, now=10_000.0)
+        self.assertEqual(d.action, "none")
+        self.assertEqual(d.reason, "unknown_active")
+
     def test_none_without_ensure_primary_does_nothing(self):
         th = hc.Thresholds(ensure_primary=False)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
@@ -243,6 +254,18 @@ class IdentityTests(unittest.TestCase):
         node_id, _ = hc.resolve_identity(SAMPLE_STATUS, "100.64.0.2")
         self.assertEqual(node_id, "nodeF")
 
+    def test_resolve_ip_label_is_canonicalized(self):
+        # GPT-5.6-sol r6 F1: an IP-valued label is canonicalized like the peer IPs, so an
+        # expanded or uppercased IPv6 label still resolves (pre-fix: (None, []) because
+        # the label kept its spelling while the peer IP was canonicalized).
+        status = {"Peer": {"p": {"ID": "nodeP", "HostName": "p", "TailscaleIPs": ["fd7a:115c:a1e0::9"]}}}
+        for label in ("fd7a:115c:a1e0::9", "fd7a:115c:a1e0:0:0:0:0:9", "FD7A:115C:A1E0::9"):
+            with self.subTest(label=label):
+                self.assertEqual(hc.resolve_identity(status, label), ("nodeP", ["fd7a:115c:a1e0::9"]))
+        # a native IPv4 label and a v6-mapped peer IP are DIFFERENT addresses -> no match
+        v4 = {"Peer": {"p": {"ID": "nodeP", "HostName": "p", "TailscaleIPs": ["100.64.0.1"]}}}
+        self.assertEqual(hc.resolve_identity(v4, "::ffff:100.64.0.1"), (None, []))
+
     def test_resolve_not_found(self):
         self.assertEqual(hc.resolve_identity(SAMPLE_STATUS, "ghost"), (None, []))
 
@@ -286,6 +309,74 @@ class IdentityTests(unittest.TestCase):
         role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "fallback")
 
+    def test_live_active_role_survives_malformed_exit_ips(self):
+        # A malformed ExitNodeStatus.TailscaleIPs must fail closed on this GATING path:
+        # never a TypeError (scalar) and never iterated as dict KEYS into a false role
+        # attribution -- e.g. {"100.64.0.1": true} must NOT be read as owning 100.64.0.1.
+        # Validation is WHOLE-FIELD fail-closed: a list mixing a real IP with any junk
+        # element (e.g. ["100.64.0.1", 5]) is voided entirely, not partially kept, so it
+        # cannot contribute even the valid address to a match.
+        for bad in (7, "100.64.0.1", {"100.64.0.1": True}, ["100.64.0.1", 5]):
+            with self.subTest(bad=bad):
+                status = dict(SAMPLE_STATUS, ExitNodeStatus={"ID": "nodeX", "TailscaleIPs": bad})
+                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                self.assertEqual(role, "unknown")
+
+    def test_live_active_role_invalid_prefix_ip_no_false_match(self):
+        # An IP string whose stripped head looks valid (`100.64.0.1/not-a-prefix`)
+        # must be rejected wholesale, not `_norm_ip`-stripped into a false address
+        # match on this gating path (GPT-5.6-sol Blocker 1b; pre-fix returned "primary").
+        status = dict(SAMPLE_STATUS, ExitNodeStatus={"TailscaleIPs": ["100.64.0.1/not-a-prefix"]})
+        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        self.assertEqual(role, "unknown")
+
+    def test_live_active_role_malformed_status_is_unknown_not_none(self):
+        # "none" is ACTIONABLE -- it authorizes switch-to-primary under --ensure-primary
+        # -- so a present-but-malformed ExitNodeStatus (scalar / list / empty dict) must
+        # fail closed to "unknown", never "none" (GPT-5.6-sol Blocker 1a). Absent/null
+        # legitimately stays "none" (see test_live_active_role_none).
+        for bad in (7, "exit", ["100.64.0.1"], {}):
+            with self.subTest(bad=bad):
+                status = dict(SAMPLE_STATUS, ExitNodeStatus=bad)
+                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                self.assertEqual(role, "unknown")
+
+    def test_live_active_role_no_false_match_from_malformed_candidate_ip(self):
+        # GPT-5.6-sol Blocker A: a malformed PRIMARY peer IP must not normalize into
+        # primary_ips and forge a match against a valid, different exit node. The primary
+        # peer resolves by NAME only (no IP identity); the live exit node is nodeX.
+        status = {"Peer": {"p": {"ID": "nodeP", "HostName": "primary-vps",
+                                 "TailscaleIPs": ["100.64.0.1/not-a-prefix"]}},
+                  "ExitNodeStatus": {"ID": "nodeX", "TailscaleIPs": ["100.64.0.1"]}}
+        pid, pips = hc.resolve_identity(status, "primary-vps")
+        self.assertEqual((pid, pips), ("nodeP", []))    # resolves by name; contributes NO ip identity
+        role = hc.live_active_role(status, pid, pips, "nodeF", ["100.64.0.2"])
+        self.assertEqual(role, "unknown")               # pre-fix: "primary" (100.64.0.1 stripped in)
+
+    def test_live_active_role_rejects_dotted_netmask_ip(self):
+        # GPT-5.6-sol Blocker B: ipaddress accepts addr/dotted-mask, which Tailscale
+        # never emits; it must not forge an address match on this gating path.
+        status = dict(SAMPLE_STATUS, ExitNodeStatus={"TailscaleIPs": ["100.64.0.1/255.255.255.255"]})
+        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        self.assertEqual(role, "unknown")               # pre-fix: "primary"
+
+    def test_live_active_role_rejects_noncanonical_host_prefix(self):
+        # GPT-5.6-sol r5 Blocker: a zero-padded (`/032`) or non-host (`/24`) suffix on a
+        # host-identity token is not a real Tailscale form and must not forge a match.
+        for bad_ip in ("100.64.0.1/032", "100.64.0.1/24"):
+            with self.subTest(bad_ip=bad_ip):
+                status = dict(SAMPLE_STATUS, ExitNodeStatus={"ID": "other", "TailscaleIPs": [bad_ip]})
+                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                self.assertEqual(role, "unknown")       # pre-fix: "primary"
+
+    def test_live_active_role_matches_equivalent_ipv6_spelling(self):
+        # GPT-5.6-sol r5: identity keys are CANONICAL, so an expanded IPv6 exit address
+        # still matches a peer configured with the compressed form (spelling-agnostic).
+        status = dict(SAMPLE_STATUS,
+                      ExitNodeStatus={"ID": "nodeQ", "TailscaleIPs": ["fd7a:115c:a1e0:0:0:0:0:9"]})
+        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeQ", ["fd7a:115c:a1e0::9"])
+        self.assertEqual(role, "fallback")             # canonical match despite differing spelling
+
 
 class StateTests(unittest.TestCase):
     def setUp(self):
@@ -324,6 +415,26 @@ class StateTests(unittest.TestCase):
         self.assertEqual(reloaded["nodes"]["primary"]["configured_label"], "new-primary")
         self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 0)
         self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_UNKNOWN)
+
+    def test_respelled_ip_label_preserves_state(self):
+        # GPT-5.6-sol r7: an IP-valued configured label is compared by canonical address in
+        # normalize_state, so re-spelling the SAME IP (expanded/uppercase IPv6 persisted by
+        # an older run vs the compressed form now) must NOT reset health history and suppress
+        # a due failover. A native IPv4 vs its v6-mapped form remain distinct (still resets).
+        path = self.tmp / "failover-state.json"
+        state = hc.default_state("FD7A:115C:A1E0:0:0:0:0:9", "f")
+        state["nodes"]["primary"]["fail_count"] = 2
+        state["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
+        hc.save_state(path, state)
+        reloaded = hc.load_state(path, "fd7a:115c:a1e0::9", "f")
+        self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 2)          # preserved
+        self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_DOWN)
+        # a different address (native IPv4 vs v6-mapped) is still treated as a new node
+        state2 = hc.default_state("100.64.0.1", "f")
+        state2["nodes"]["primary"]["fail_count"] = 2
+        hc.save_state(path, state2)
+        reloaded2 = hc.load_state(path, "::ffff:100.64.0.1", "f")
+        self.assertEqual(reloaded2["nodes"]["primary"]["fail_count"], 0)         # reset
 
     def test_corrupt_field_types_are_discarded(self):
         path = self.tmp / "failover-state.json"
@@ -587,6 +698,43 @@ class VerdictCliTests(unittest.TestCase):
         self.assertEqual(state["nodes"]["primary"]["tailscale_ips"], ["100.64.0.1"])
         self.assertEqual(state["nodes"]["primary"]["fail_count"], 1)  # reset to 0 then one fresh fail
 
+    def test_verdict_preserves_history_across_ipv6_spelling_upgrade(self):
+        # GPT-5.6-sol r6 F2: an older build persisted tailscale_ips as raw text (expanded
+        # IPv6); this build canonicalizes resolved IPs. The SAME node in expanded vs
+        # compressed spelling must NOT look like a node change -- otherwise health history
+        # resets and a due failover is suppressed across the upgrade. Here the persisted
+        # primary is DOWN-trending (fail_count 2, threshold 3); preserving history lets one
+        # more failure trip the switch, whereas a spurious reset would restart the count.
+        noid = self.tmp / "noid6.json"
+        noid.write_text(json.dumps({
+            "BackendState": "Running",
+            "Self": {"ID": "self", "HostName": "client", "TailscaleIPs": ["100.64.0.5"]},
+            "Peer": {
+                "k1": {"HostName": "primary-vps", "TailscaleIPs": ["fd7a:115c:a1e0::9"]},  # no ID, compressed
+                "k2": {"HostName": "fallback-vps", "TailscaleIPs": ["100.64.0.2"]},
+            },
+            "ExitNodeStatus": None,
+        }), encoding="utf-8")
+        stale = hc.default_state("primary-vps", "fallback-vps")
+        stale["nodes"]["primary"]["node_id"] = None
+        stale["nodes"]["primary"]["tailscale_ips"] = ["fd7a:115c:a1e0:0:0:0:0:9"]  # SAME node, expanded (old build)
+        stale["nodes"]["primary"]["fail_count"] = 2
+        stale["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
+        self.state_file.write_text(json.dumps(stale), encoding="utf-8")
+        os.environ["FAKE_UNREACHABLE"] = "primary-vps"
+        self.addCleanup(lambda: os.environ.pop("FAKE_UNREACHABLE", None))
+        run_cli([
+            "verdict", "--state-file", str(self.state_file),
+            "--primary", "primary-vps", "--fallback", "fallback-vps",
+            "--status-json-file", str(noid),
+            "--fail-threshold", "3", "--ok-threshold", "1", "--cooldown", "0",
+        ])
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        # history PRESERVED (not reset to 0): 2 -> 3 reaches the threshold. Pre-fix the
+        # expanded-vs-compressed mismatch reset it, leaving fail_count == 1.
+        self.assertEqual(state["nodes"]["primary"]["fail_count"], 3)
+        self.assertEqual(state["nodes"]["primary"]["last_state"], hc.STATE_DOWN)
+
     def _verdict_with_backend(self, backend_value, *, present=True):
         """Run a verdict whose status has BackendState set to ``backend_value``
         (or removed when ``present`` is False) and return the decision dict."""
@@ -734,6 +882,97 @@ class ConnectorOrderingUnitTests(unittest.TestCase):
                                      "PrimaryRoutes": [], "AllowedIPs": ["10.0.0.0/24"]}}}
         node_id, ips = hc.resolve_identity(status, "primary-vps")
         self.assertEqual(hc.node_routes(status, node_id, ips), [])
+
+    # --- hardening: malformed-status crash-safety + strict routes (task #7) --------
+    def test_resolve_identity_survives_malformed_tailscaleips(self):
+        # A non-list TailscaleIPs must not crash resolve_identity / _find_node.
+        status = {"Peer": {"k": {"ID": "n1", "HostName": "prim", "TailscaleIPs": 7}}}
+        self.assertEqual(hc.resolve_identity(status, "prim"), ("n1", []))   # by name, no crash
+        self.assertIsNotNone(hc._find_node(status, "n1", []))
+        self.assertEqual(hc.resolve_identity(status, "100.64.0.9"), (None, []))  # IP match, no crash
+
+    def test_node_routes_strict(self):
+        def routes(node_extra):
+            status = {"Peer": {"nodeP": {"ID": "nodeP", "HostName": "primary-vps",
+                                         "TailscaleIPs": ["100.64.0.1"], **node_extra}}}
+            nid, ips = hc.resolve_identity(status, "primary-vps")
+            return hc.node_routes(status, nid, ips)
+        # malformed -> None (fail closed)
+        self.assertIsNone(routes({"PrimaryRoutes": "10.0.0.0/24"}))          # non-list
+        self.assertIsNone(routes({"PrimaryRoutes": ["not-a-cidr"]}))         # invalid element
+        self.assertIsNone(routes({"PrimaryRoutes": ["10.0.0.0/24", ""]}))    # empty element
+        self.assertIsNone(routes({"AllowedIPs": 7}))                         # non-list fallback
+        # present-null / absent authoritative field -> [] (a Go nil slice marshals to
+        # null); matches the pre-hardening behavior, NOT fail-closed None.
+        self.assertEqual(routes({"PrimaryRoutes": None}), [])
+        self.assertEqual(routes({}), [])                                     # no PrimaryRoutes, no AllowedIPs
+        # AllowedIPs fallback with an UNTRUSTWORTHY TailscaleIPs -> fail closed: the
+        # own-host exclusion is unreliable, so the node's own /32 must NOT be counted as
+        # a route. "Untrustworthy" means non-list, a non-str/empty element, an element
+        # that is not a valid IP/CIDR, OR an empty self set (nothing to exclude with).
+        self.assertIsNone(routes({"TailscaleIPs": 7, "AllowedIPs": ["100.64.0.1/32"]}))
+        self.assertIsNone(routes({"TailscaleIPs": ["bad", 5], "AllowedIPs": ["100.64.0.1/32"]}))
+        self.assertIsNone(routes({"TailscaleIPs": ["not-an-ip"], "AllowedIPs": ["100.64.0.1/32"]}))
+        self.assertIsNone(routes({"TailscaleIPs": ["100.64.0.1/nope"], "AllowedIPs": ["10.0.0.0/24"]}))
+        self.assertIsNone(routes({"TailscaleIPs": [], "AllowedIPs": ["100.64.0.1/32"]}))
+        # dotted netmask / host-mask forms are accepted by ipaddress but Tailscale never
+        # emits them -> fail closed on both the route field and the self-IP set (Blocker B)
+        self.assertIsNone(routes({"PrimaryRoutes": ["10.0.0.0/255.255.255.0"]}))
+        self.assertIsNone(routes({"TailscaleIPs": ["100.64.0.1/255.0.0.0"], "AllowedIPs": ["10.0.0.0/24"]}))
+        # a valid TailscaleIPs with a /prefix still excludes the own address
+        self.assertEqual(routes({"TailscaleIPs": ["100.64.0.1/32"], "AllowedIPs": ["100.64.0.1/32", "10.0.0.0/24"]}),
+                         ["10.0.0.0/24"])
+        # valid -> strict list; non-canonical default and own host excluded
+        self.assertEqual(routes({"PrimaryRoutes": ["0.0.0.1/0", "10.0.0.0/24"]}), ["10.0.0.0/24"])
+        self.assertEqual(routes({"AllowedIPs": ["100.64.0.1/32", "10.0.0.0/24"]}), ["10.0.0.0/24"])
+        # own address is excluded at ANY prefix, not only /32 -- preserves the prior
+        # canonical behavior (a prefix-agnostic address-part match), so a valid status
+        # with an aligned non-host prefix on the node's own address still yields [].
+        self.assertEqual(routes({"AllowedIPs": ["100.64.0.1/32", "100.64.0.1/31"]}), [])
+        # scoped IPv6 and over-long prefixes are rejected on the route field too: a
+        # scoped `::%x/0` must not slip past the default-route exclusion, and a
+        # thousands-of-digits prefix must fail closed, never raise (GPT-5.6-sol r4b).
+        self.assertIsNone(routes({"PrimaryRoutes": ["::%forged/0"]}))
+        self.assertIsNone(routes({"PrimaryRoutes": ["10.0.0.0/" + "9" * 5000]}))
+        # own-host exclusion is by CANONICAL address, so an EXPANDED IPv6 spelling of the
+        # node's own address is still excluded and not counted as a route (GPT-5.6-sol r5:
+        # a text-only compare left it in -> false healthy).
+        self.assertEqual(routes({"TailscaleIPs": ["fd7a:115c:a1e0::1"],
+                                 "AllowedIPs": ["fd7a:115c:a1e0:0:0:0:0:1/128", "10.0.0.0/24"]}),
+                         ["10.0.0.0/24"])
+
+    def test_strict_ip_parser_table(self):
+        # Direct table for the shared strict parser (GPT-5.6-sol r4b/r5). Accept only
+        # real Tailscale forms and return the CANONICAL address; reject everything
+        # ipaddress would over-accept. Canonicalization: an expanded IPv6 spelling and a
+        # host-suffixed form collapse to the compressed address.
+        for good, expected in (("100.64.0.1", "100.64.0.1"), ("100.64.0.1/32", "100.64.0.1"),
+                               ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::1"),
+                               ("fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::1"),
+                               ("fd7a:115c:a1e0:0:0:0:0:1", "fd7a:115c:a1e0::1")):
+            self.assertEqual(hc._strict_norm_ip(good), expected, msg=good)
+        for bad in ("not-an-ip", "100.64.0.1/33", "100.64.0.1/nope", "100.64.0.1/255.255.255.255",
+                    "100.64.0.1/24", "100.64.0.1/032", "fd7a:115c:a1e0::1/129", "fd7a:115c:a1e0::1%eth0",
+                    "100.64.0.1/" + "9" * 5000, "", "100.64.0.1/-1"):
+            self.assertIsNone(hc._strict_norm_ip(bad), msg=bad)
+        # whole-field fail-closed: one bad element voids the set (never a partial keep)
+        self.assertIsNone(hc._valid_ip_set(["100.64.0.1", "bad"]))
+        self.assertEqual(hc._valid_ip_set(["100.64.0.1", "fd7a::1/128"]), {"100.64.0.1", "fd7a::1"})
+        # compressed and expanded IPv6 spellings of the same address collapse to one key
+        self.assertEqual(hc._valid_ip_set(["fd7a:115c:a1e0::1", "fd7a:115c:a1e0:0:0:0:0:1"]),
+                         {"fd7a:115c:a1e0::1"})
+
+    def test_find_node_prefers_valid_over_malformed_candidate(self):
+        # A malformed candidate peer IP must not forge an IP match; _find_node must
+        # select the peer whose VALIDATED IPs actually contain the wanted address, even
+        # if a different peer's junk string normalizes to the same head (r4b Blocker A).
+        status = {"Peer": {
+            "bad": {"ID": "nodeBad", "HostName": "bad", "TailscaleIPs": ["100.64.0.1/not-a-prefix"]},
+            "good": {"ID": "nodeGood", "HostName": "good", "TailscaleIPs": ["100.64.0.1"]},
+        }}
+        node = hc._find_node(status, None, ["100.64.0.1"])
+        self.assertIsNotNone(node)
+        self.assertEqual(node["ID"], "nodeGood")   # not nodeBad (its "100.64.0.1/not-a-prefix" is void)
 
     def test_fetch_devices_encodes_tailnet_in_url(self):
         # A tailnet name with reserved characters must be percent-encoded into a
@@ -989,10 +1228,10 @@ class PeerMetricsTests(unittest.TestCase):
         self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
         self.assertTrue(all(v is None for v in m.values()))         # non-gating: raise -> null
 
-    def test_malformed_status_resolution_is_safe_under_ping(self):
-        # F-02: resolve_identity raises (TailscaleIPs is not iterable-of-str) but
-        # _safe_peer_metrics must degrade to the null object, never traceback, and
-        # must not invoke the ping.
+    def test_malformed_tailscaleips_does_not_crash_resolution(self):
+        # Hardening (C2): a non-list TailscaleIPs is treated as empty rather than
+        # crashing resolution. The peer still resolves by HostName, so the object is
+        # well-formed and the ping (reached only for a resolved peer) runs.
         calls = []
 
         def ping_fn():
@@ -1002,9 +1241,12 @@ class PeerMetricsTests(unittest.TestCase):
         bad_status = {"BackendState": "Running", "Self": {"ID": "self"},
                       "Peer": {"k": {"ID": "n1", "HostName": "p", "TailscaleIPs": 7}}}
         m = hc._safe_peer_metrics(bad_status, True, "p", ping_fn=ping_fn)
-        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))
-        self.assertTrue(all(v is None for v in m.values()))
-        self.assertEqual(calls, [])                                 # never reached the ping
+        self.assertEqual(set(m), set(hc.PEER_METRIC_KEYS))          # no crash, well-formed
+        self.assertEqual(m["latency_ms"], 5.0)                     # resolved by name -> ping ran
+        self.assertEqual(calls, [1])
+        # A malformed status whose label matches nothing still null-fills safely.
+        m2 = hc._safe_peer_metrics(bad_status, True, "does-not-exist")
+        self.assertTrue(all(v is None for v in m2.values()))
 
     def test_peer_metrics_cli_ping_flag(self):
         # peer-metrics --ping resolves first, then pings only the resolved peer.
@@ -1134,8 +1376,8 @@ class ConnectorsCliTests(unittest.TestCase):
             self.assertEqual(set(row["metrics"]), set(hc.PEER_METRIC_KEYS))
 
     def test_json_key_sets_exact_no_internal_leak(self):
-        # Guards additive-safety: the prometheus-only `resolved` identity must NOT
-        # leak into the JSON rows, so assert the EXACT key sets (not just presence).
+        # Guards additive-safety: internal resolution/identity data must NOT leak into
+        # the JSON rows, so assert the EXACT key sets (not just presence).
         rc, out = run_cli(self._args("--json"))
         report = json.loads(out)
         self.assertEqual(
@@ -1188,6 +1430,73 @@ class ConnectorsCliTests(unittest.TestCase):
             run_cli(self._args("--json"))
         pinged = sorted(call.args[0] for call in spy.call_args_list)
         self.assertEqual(pinged, ["fallback-vps", "primary-vps"])
+
+    def test_connectors_survives_malformed_status(self):
+        # C2 + hardening: a malformed status must degrade cleanly (no traceback) AND must
+        # never manufacture a false-healthy verdict. The dangerous shape is an AllowedIPs
+        # carrying the node's OWN /32 with a TailscaleIPs we cannot validate (non-list,
+        # an invalid-IP string, or empty): the own-host exclusion is then untrustworthy,
+        # so node_routes must fail closed (routes null) rather than count the own address
+        # as an advertised route (GPT-5.6-sol Blocker 2 / Codex #1).
+        peer_variants = [
+            {"TailscaleIPs": 7},                                                 # non-list, no routes
+            {"TailscaleIPs": 7, "AllowedIPs": ["100.64.0.1/32"]},                # non-list self
+            {"TailscaleIPs": ["not-an-ip"], "AllowedIPs": ["100.64.0.1/32"]},    # invalid-IP self string
+            {"TailscaleIPs": [], "AllowedIPs": ["100.64.0.1/32"]},               # empty self set
+        ]
+        for extra in peer_variants:
+            with self.subTest(extra=extra):
+                status = {"BackendState": "Running", "Self": {"ID": "self"},
+                          "Peer": {"k": {"ID": "n1", "HostName": "primary-vps", **extra}}}
+                self.status_file.write_text(json.dumps(status), encoding="utf-8")
+                rc, out = run_cli(self._args("--json"))
+                report = json.loads(out)
+                self.assertEqual(len(report["connectors"]), 2)       # clean report, not a crash
+                # the own /32 is never miscounted as an advertised route (mutation-sensitive:
+                # pre-fix the malformed self-IP left the own /32 counted, i.e. routes == 1).
+                self.assertNotIn(1, [c["routes"] for c in report["connectors"]])
+                # (overall is degraded here too, but only weakly -- the fallback peer is
+                # absent, so reachability already fails; the false-healthy CONTRACT with
+                # both connectors reachable is locked by the next test, not this one.)
+
+    def test_connectors_malformed_self_ip_is_not_false_healthy(self):
+        # Non-tautological false-healthy lock (GPT-5.6-sol Minor): BOTH connectors are
+        # online AND reachable, so reachability cannot drive the verdict -- only routes
+        # do. The primary has an invalid TailscaleIPs alongside an own-/32 AllowedIPs;
+        # pre-fix its own /32 was counted as a served route -> overall "healthy", exit 0.
+        # Post-fix node_routes fails closed (routes null) -> nothing serving -> "degraded".
+        status = {
+            "BackendState": "Running",
+            "Self": {"ID": "selfID", "HostName": "client", "TailscaleIPs": ["100.64.0.5"]},
+            "Peer": {
+                "nodeP": {"ID": "nodeP", "HostName": "primary-vps", "TailscaleIPs": ["not-an-ip"],
+                          "Online": True, "AllowedIPs": ["100.64.0.1/32"]},
+                "nodeF": {"ID": "nodeF", "HostName": "fallback-vps", "TailscaleIPs": ["100.64.0.2"],
+                          "Online": True},
+            },
+        }
+        self.status_file.write_text(json.dumps(status), encoding="utf-8")
+        rc, out = run_cli(self._args("--json"))
+        report = json.loads(out)
+        primary = next(c for c in report["connectors"] if c["connector"] == "primary")
+        self.assertIsNone(primary["routes"])                 # own /32 never counted (pre-fix: 1)
+        self.assertEqual(report["routes_serving"], "none")
+        self.assertEqual(report["overall"], "degraded")      # driven by routes, not reachability
+        self.assertEqual(rc, 1)                              # exit reflects degraded
+
+    def test_connectors_ambiguous_label_warns_once(self):
+        # C4: an ambiguous label produces exactly ONE ambiguity warning (cmd_connectors
+        # resolves once and threads the node into metrics extraction; before the fix
+        # peer_metrics re-resolved and warned a second time).
+        status = {"BackendState": "Running", "Self": {"ID": "self", "HostName": "self"},
+                  "Peer": {"a": {"ID": "n1", "HostName": "dup", "TailscaleIPs": ["100.64.0.1"]},
+                           "b": {"ID": "n2", "HostName": "dup", "TailscaleIPs": ["100.64.0.2"]}}}
+        self.status_file.write_text(json.dumps(status), encoding="utf-8")
+        buf_err = io.StringIO()
+        with contextlib.redirect_stderr(buf_err):
+            run_cli(["connectors", "--primary", "dup", "--fallback", "fallback-vps",
+                     "--status-json-file", str(self.status_file)])
+        self.assertEqual(buf_err.getvalue().count("is ambiguous"), 1)   # exactly one, not two
 
     def test_metrics_failure_is_non_gating(self):
         # A raising peer_metrics must NOT change the verdict/exit or existing
@@ -1586,7 +1895,7 @@ class PrometheusTests(unittest.TestCase):
     def test_empty_rows_document_is_just_sentinel(self):
         # All samples omitted / no connectors -> the document is still valid and
         # ends with exactly the sentinel (the write-completeness guarantee).
-        doc = hc._prometheus_document([], [], {}, True)
+        doc = hc._prometheus_document([], True)
         self.assertEqual(
             doc,
             "# HELP ai_egress_overall_healthy Connector-pair health: 1 healthy, 0 degraded.\n"
@@ -1595,19 +1904,16 @@ class PrometheusTests(unittest.TestCase):
         )
         _parse_prom(doc)  # still structurally valid
 
-    def test_route_noncanonical_default_gauge_vs_lenient_health(self):
-        # "0.0.0.1/0" canonicalizes to the default route -> the STRICT gauge excludes
-        # it (count 0, a true zero, not omitted). The released, lenient node_routes
-        # that drives overall_healthy still counts the raw string as a route, so for
-        # this ADVERSARIAL input (real tailscale only emits canonical CIDRs) the
-        # strict gauge and the health verdict deliberately diverge. Aligning health
-        # to the strict view is a released-semantics change tracked as a separate
-        # hardening PR; PR C keeps the gauge strict (rule 4) without changing health.
+    def test_route_noncanonical_default_gauge_and_health_agree(self):
+        # After the hardening, node_routes is strict for BOTH the gauge and the health
+        # verdict: "0.0.0.1/0" canonicalizes to the default route -> 0 non-default
+        # routes -> gauge 0 AND (neither connector serves) overall_healthy 0. The
+        # earlier PR-C strict-gauge-vs-lenient-health divergence is gone.
         _, out = self._emit(self._status(primary_extra={"PrimaryRoutes": ["0.0.0.1/0"]}))
         fams, _ = _parse_prom(out)
         prim = [val for lbl, val in fams["ai_egress_connector_routes"] if "primary" in lbl]
         self.assertEqual(prim, ["0"])                                   # strict gauge -> 0
-        self.assertEqual(fams["ai_egress_overall_healthy"][0][1], "1")  # lenient health -> still serving
+        self.assertEqual(fams["ai_egress_overall_healthy"][0][1], "0")  # health now strict too -> degraded
 
     def test_route_malformed_self_like_entry_omits_gauge(self):
         # An AllowedIPs entry that resembles a self address but is malformed must

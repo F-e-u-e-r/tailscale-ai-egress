@@ -69,6 +69,39 @@ both Python CLIs report it with `--version`.
   now fails closed (treated as unavailable status) instead of raising
   `UnicodeDecodeError`, so `peer-metrics` keeps its always-exit-0 contract and the
   failover/monitor commands degrade cleanly.
+- `scripts/health_check.py`: malformed-status hardening. A non-list `TailscaleIPs`
+  (or `AllowedIPs`) no longer crashes `resolve_identity` / `_find_node` /
+  `node_routes` / `live_active_role` — such fields are read via shared coercion, so a
+  scalar yields no identity and a dict is no longer iterated as keys (which had let a
+  malformed `ExitNodeStatus.TailscaleIPs` mis-attribute the live exit-node role on the
+  failover path). Every status-derived identity/gating IP list -- in `resolve_identity`,
+  `_find_node`, `live_active_role`, and `node_routes` -- is validated per element
+  through one shared strict parser, **whole-field fail-closed** (any invalid element
+  voids the entire list rather than keeping the valid ones), so a value like
+  `100.64.0.1/not-a-prefix`, a dotted-netmask form (`100.64.0.1/255.255.255.255`), an
+  IPv6 zone id (`fd7a::1%zone`), or an over-long prefix — all of which `ipaddress`
+  accepts (or crashes on) but Tailscale never emits — can no longer be truncated,
+  coerced into a false address / route match, or raised as an unhandled error. `live_active_role` now distinguishes an absent/null
+  `ExitNodeStatus` (legitimately `none`) from a present-but-malformed one (fails
+  closed to `unknown`), so a garbled status can never authorize a switch under
+  `--ensure-primary`. `node_routes` validates each advertised route with `ipaddress`
+  and fails closed (returns "unknown") on a wrong-type field or any invalid/empty
+  element; a present-but-null or absent field stays authoritatively empty (a Go nil
+  slice marshals to `null`), and in the `AllowedIPs` fallback an untrustworthy
+  `TailscaleIPs` (non-list, invalid-IP element, or empty) fails closed rather than
+  counting the connector's own address as a route. This one strict result backs the
+  JSON `routes` field, the `serving` / `overall_healthy` verdict, and the Prometheus
+  `_routes` gauge, so they agree (a malformed route field degrades the pair rather
+  than being counted). Because addresses are compared by their canonical form, an
+  IP-valued connector label and the persisted failover state also survive an
+  equivalent re-spelling (expanded vs compressed IPv6, case): the same node is not
+  mistaken for a new one, so health history and a due failover are preserved across an
+  upgrade or a label re-spelling (a native IPv4 and its IPv6-mapped form stay
+  distinct). The `connectors` report also resolves each label once and
+  reuses it for metrics extraction, so an ambiguous label warns once instead of
+  twice. Real `tailscale status --json` is unaffected — own-address exclusion stays
+  prefix-agnostic, matching prior behavior; these only change behavior on
+  adversarial / malformed status.
 
 ## [1.1.1] - 2026-07-08
 

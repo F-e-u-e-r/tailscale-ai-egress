@@ -53,7 +53,6 @@ DEFAULT_OK_THRESHOLD = 3
 DEFAULT_COOLDOWN = 60.0
 DEFAULT_PROBE_TARGET = "https://ipinfo.io"
 DEFAULT_STATUS_TIMEOUT = 15.0
-DEFAULT_ROUTES = frozenset({"0.0.0.0/0", "::/0"})
 
 # Upper bound for operator-supplied seconds values (probe timeouts / cooldown).
 # Rejects absurd inputs (e.g. a 120-digit number) that would hang a probe or, in
@@ -291,8 +290,11 @@ def normalize_state(raw: Any, primary_label: str, fallback_label: str) -> dict[s
             stored = raw_nodes.get(role)
             if not isinstance(stored, dict):
                 continue
-            # Reset health history when the configured label changed (new node).
-            if stored.get("configured_label") != label:
+            # Reset health history when the configured label changed (new node). IP-valued
+            # labels are compared by canonical address, so re-spelling the same IP (expanded
+            # vs compressed IPv6, case) across runs is not mistaken for a node change (which
+            # would drop history and suppress a due failover across an upgrade).
+            if not _labels_equivalent(stored.get("configured_label"), label):
                 continue
             target = base["nodes"][role]
             last_state = stored.get("last_state")
@@ -349,8 +351,91 @@ def state_lock(path: Path) -> Iterator[None]:
 # --------------------------------------------------------------------------- #
 # Live-state reconciliation (canonical identity)
 # --------------------------------------------------------------------------- #
-def _norm_ip(value: str) -> str:
-    return value.split("/")[0].strip().lower()
+def _safe_ip_token(text: str) -> bool:
+    """Reject an IP / CIDR token that ``ipaddress`` accepts but Tailscale never emits
+    and that could forge a match or crash:
+
+    - an IPv6 zone id (``fd7a::1%eth0``): ``ipaddress`` accepts ``%scope`` and a scoped
+      form is never equal to the same address unscoped, so it could forge an identity
+      match or (as ``::%x/0``) slip past the default-route exclusion;
+    - a slash suffix that is not a SHORT decimal prefix: a dotted netmask / host-mask
+      (``/255.255.255.0``), or an over-long digit run (``/999...`` thousands of digits)
+      that would make ``int()`` raise on Python >= 3.11 (the 4300-digit limit) -- a
+      crash on the very path this hardening protects.
+
+    A well-formed token still needs family/range validation by the caller."""
+    if "%" in text:
+        return False
+    _, slash, prefix = text.partition("/")
+    if slash and not (prefix.isascii() and prefix.isdigit() and len(prefix) <= 3):
+        return False
+    if slash and len(prefix) > 1 and prefix.startswith("0"):
+        return False  # non-canonical leading-zero prefix (e.g. /032) -> Tailscale never emits
+    return True
+
+
+def _canon_addr(text: str) -> Optional[str]:
+    """Canonical address string of a token's address part (before any ``/``), so two
+    spellings of the same address -- compressed vs expanded IPv6, mixed case -- compare
+    equal. Returns None if the address part is not a valid IP."""
+    try:
+        return str(ipaddress.ip_address(text.partition("/")[0].strip()))
+    except ValueError:
+        return None
+
+
+def _labels_equivalent(a: Any, b: Any) -> bool:
+    """True if two configured labels denote the same target: exact text, or -- when both
+    are IP-valued -- the same canonical address, so re-spelling an IP label (expanded vs
+    compressed IPv6, case) is not mistaken for a different node. Hostnames and node IDs
+    keep the exact-text comparison (a native IPv4 and its v6-mapped form stay distinct)."""
+    if a == b:
+        return True
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    ca = _canon_addr(a.strip().lower())
+    return ca is not None and ca == _canon_addr(b.strip().lower())
+
+
+def _strict_norm_ip(value: str) -> Optional[str]:
+    """Validate a Tailscale HOST-IP string and return its CANONICAL address (so equal
+    addresses spelled differently match), else None.
+
+    Accepts a bare address, or ``addr/N`` where N is exactly the host prefix for the
+    family (``/32`` or ``/128``) -- a TailscaleIP is a single host address, so any other
+    or non-canonical suffix (``/24``, ``/032``, a dotted netmask), an IPv6 zone id, or an
+    over-long prefix is rejected (see ``_safe_ip_token``) rather than truncated or
+    coerced into a false identity match. Returns the ``ipaddress``-canonical form, not a
+    raw text strip, so ``fd7a::1`` and ``fd7a:0:0:0:0:0:0:1`` collapse to one key."""
+    text = value.strip()
+    if not _safe_ip_token(text):
+        return None
+    addr, slash, prefix = text.partition("/")
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    if slash and prefix != str(ip.max_prefixlen):
+        return None  # a host-identity token's only valid suffix is its own /32 or /128
+    return str(ip)
+
+
+def _valid_ip_set(raw: Any) -> Optional[set[str]]:
+    """Parse a status IP list into a set of CANONICAL address strings (see
+    ``_strict_norm_ip``) for identity/gating comparisons, or None if the field is not a
+    list or ANY element is not a str or not a strictly-valid IP -- so a malformed
+    element fails the WHOLE field closed rather than slipping through."""
+    if not isinstance(raw, list):
+        return None
+    out: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            return None
+        norm = _strict_norm_ip(item)
+        if norm is None:
+            return None
+        out.add(norm)
+    return out
 
 
 def resolve_identity(status: dict[str, Any], label: str) -> tuple[Optional[str], list[str]]:
@@ -366,6 +451,10 @@ def resolve_identity(status: dict[str, Any], label: str) -> tuple[Optional[str],
         nodes.extend(peer for peer in peers.values() if isinstance(peer, dict))
 
     wanted = label.strip().lower().rstrip(".")
+    # Canonicalize an IP-valued label the same way the peer IPs are, so an expanded or
+    # otherwise non-canonical IPv6 label still matches the peer's canonical address
+    # (else this side would be asymmetric and a valid IP label would fail to resolve).
+    wanted_ip = _canon_addr(wanted)
     matches: list[tuple[Optional[str], list[str]]] = []
     seen_ids: set[str] = set()
     for node in nodes:
@@ -376,10 +465,14 @@ def resolve_identity(status: dict[str, Any], label: str) -> tuple[Optional[str],
                 normalized = value.strip().lower().rstrip(".")
                 names.append(normalized)
                 names.append(normalized.split(".")[0])
-        ips = [_norm_ip(ip) for ip in (node.get("TailscaleIPs") or []) if isinstance(ip, str)]
+        # Validated IPs only: a malformed element (e.g. "100.64.0.1/not-a-prefix" or a
+        # dotted netmask) must not normalize into a peer's IP identity, or it could
+        # forge a live-role / connector match. The peer can still resolve by name/ID.
+        ips = sorted(_valid_ip_set(node.get("TailscaleIPs")) or set())
         raw_id = node.get("ID") or node.get("StableID")
         node_id = str(raw_id) if raw_id else None
-        if wanted in names or wanted in ips or (node_id is not None and wanted == node_id.lower()):
+        if (wanted in names or (wanted_ip is not None and wanted_ip in ips)
+                or (node_id is not None and wanted == node_id.lower())):
             if node_id is not None and node_id in seen_ids:
                 continue
             if node_id is not None:
@@ -407,11 +500,20 @@ def live_active_role(
     node is selected (the controller must not override the user's choice).
     """
     exit_status = status.get("ExitNodeStatus")
+    if exit_status is None:
+        return "none"  # field absent/null -> genuinely no exit node selected
     if not isinstance(exit_status, dict) or not exit_status:
-        return "none"
+        # present but malformed (scalar/list) or empty -> untrustworthy. "none" is
+        # actionable (it authorizes switch-to-primary under --ensure-primary), so a
+        # status we cannot trust must fail closed to "unknown", never "none".
+        return "unknown"
     exit_id = exit_status.get("ID")
     exit_id = str(exit_id) if exit_id else None
-    exit_ips = {_norm_ip(ip) for ip in (exit_status.get("TailscaleIPs") or []) if isinstance(ip, str)}
+    # Validated IPs only: a malformed element (e.g. "100.64.0.1/not-a-prefix") must
+    # not normalize into a false address match on this gating path.
+    exit_ips = _valid_ip_set(exit_status.get("TailscaleIPs")) or set()
+    if exit_id is None and not exit_ips:
+        return "unknown"  # a present dict with no trustworthy identity -> fail closed
 
     def matches(node_id: Optional[str], ips: list[str]) -> bool:
         if node_id and exit_id and node_id == exit_id:
@@ -714,13 +816,18 @@ def cmd_verdict(args: argparse.Namespace) -> int:
             ):
                 node = state["nodes"][role]
                 stored_id = node.get("node_id")
-                stored_ips = node.get("tailscale_ips") or []
+                # Canonicalize the persisted set (an older build stored it as raw text)
+                # the same way resolved IPs are canonicalized, so an expanded-vs-compressed
+                # IPv6 spelling across an upgrade is not mistaken for a node change (which
+                # would reset health history and suppress a due failover). A malformed
+                # persisted set canonicalizes to empty -> no spurious reset.
+                stored_ips = _valid_ip_set(node.get("tailscale_ips")) or set()
                 if stored_id and resolved_id:
                     identity_changed = stored_id != resolved_id
                 else:
                     # No reliable ID on at least one side: fall back to IP sets and
                     # treat disjoint non-empty sets as a different node.
-                    identity_changed = bool(stored_ips) and bool(resolved_ips) and not (set(stored_ips) & set(resolved_ips))
+                    identity_changed = bool(stored_ips) and bool(resolved_ips) and not (stored_ips & set(resolved_ips))
                 if identity_changed:
                     # Same label now points at a different node (recreated / new IP):
                     # reset its health history instead of inheriting old state.
@@ -822,11 +929,13 @@ def _find_node(status: dict[str, Any], node_id: Optional[str], ips: list[str]) -
     peers = status.get("Peer")
     if isinstance(peers, dict):
         candidates.extend(peer for peer in peers.values() if isinstance(peer, dict))
-    wanted_ips = {_norm_ip(ip) for ip in ips}
+    # Validated on both sides so a malformed peer IP cannot forge an IP match; a
+    # malformed candidate can still be found by its trustworthy ID.
+    wanted_ips = _valid_ip_set(ips) or set()
     for node in candidates:
         raw_id = node.get("ID") or node.get("StableID")
         nid = str(raw_id) if raw_id else None
-        node_ips = {_norm_ip(ip) for ip in (node.get("TailscaleIPs") or []) if isinstance(ip, str)}
+        node_ips = _valid_ip_set(node.get("TailscaleIPs")) or set()
         if (node_id and nid == node_id) or (wanted_ips and wanted_ips & node_ips):
             return node
     return None
@@ -840,32 +949,67 @@ def node_online(status: dict[str, Any], node_id: Optional[str], ips: list[str]) 
     return bool(value) if isinstance(value, bool) else None
 
 
+_DEFAULT_ROUTE_NETS = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+
+
 def node_routes(status: dict[str, Any], node_id: Optional[str], ips: list[str]) -> Optional[list[str]]:
     """App-connector / subnet routes a connector currently advertises, best-effort
-    from the client's status view. Returns None if the node is absent. Prefers
-    PrimaryRoutes; falls back to AllowedIPs minus the node's own host addresses."""
+    from the client's status view. Prefers PrimaryRoutes; falls back to AllowedIPs
+    minus the node's own host addresses. Default (exit-node) routes are excluded.
+
+    Semantics:
+    - node absent -> None (unknown).
+    - the authoritative field null / absent (a Go nil slice marshals to ``null``) ->
+      ``[]`` (authoritatively no routes), matching the pre-hardening behavior.
+    - the field is a wrong type (string/number/object), or ANY element is not a
+      valid non-empty CIDR/IP -> None (fail closed). In the AllowedIPs branch, if
+      ``TailscaleIPs`` is not a valid, non-empty IP set (non-list, an invalid-IP
+      element, or empty) the own-host exclusion is untrustworthy, so it also fails
+      closed rather than risk counting the node's own address as a route.
+    - otherwise the list of non-default, non-own-host routes.
+
+    Each element is parsed with ``ipaddress`` so a non-canonical default such as
+    ``0.0.0.1/0`` is excluded; own-host exclusion preserves the prior address-part
+    match (any prefix). This single strict result feeds the JSON ``routes`` field,
+    the ``serving`` / health verdict, AND the Prometheus ``_routes`` gauge, so they
+    always agree; it is still a best-effort signal, not proof that AI app routes
+    resolve."""
     node = _find_node(status, node_id, ips)
     if node is None:
         return None
-    # If PrimaryRoutes is present at all it is authoritative: an empty list means
-    # this node currently advertises no app-connector/subnet routes. Only fall
-    # back to AllowedIPs when the field is absent entirely. Default (exit-node)
-    # routes are excluded throughout; this remains a best-effort signal that a
-    # non-default route is advertised, not proof that AI app routes resolve.
-    if "PrimaryRoutes" in node:
-        primary_routes = node.get("PrimaryRoutes")
-        if not isinstance(primary_routes, list):
-            return []
-        return [route for route in primary_routes if isinstance(route, str) and route.strip() not in DEFAULT_ROUTES]
-    self_ips = {_norm_ip(ip) for ip in (node.get("TailscaleIPs") or []) if isinstance(ip, str)}
-    extra: list[str] = []
-    for entry in node.get("AllowedIPs") or []:
-        if not isinstance(entry, str):
-            continue
-        if entry.strip() in DEFAULT_ROUTES or _norm_ip(entry) in self_ips:
-            continue
-        extra.append(entry)
-    return extra
+    use_allowedips = "PrimaryRoutes" not in node
+    raw = node.get("AllowedIPs") if use_allowedips else node.get("PrimaryRoutes")
+    if raw is None:
+        return []  # null / absent -> authoritatively "no routes" (prior behavior)
+    if not isinstance(raw, list):
+        return None  # wrong type -> fail closed
+    self_ips: set[str] = set()
+    if use_allowedips and raw:
+        # A non-empty AllowedIPs is the connector's own addresses PLUS advertised
+        # routes; excluding the own addresses needs a trustworthy TailscaleIPs. If it
+        # is not a valid, non-empty IP set the exclusion cannot be trusted, so fail
+        # closed rather than count the node's own address as an advertised route.
+        valid = _valid_ip_set(node.get("TailscaleIPs"))
+        if not valid:
+            return None
+        self_ips = valid
+    routes: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            return None  # malformed element -> the whole field is untrustworthy
+        text = entry.strip()
+        if not _safe_ip_token(text):
+            return None  # scoped, dotted-mask, or over-long prefix -> Tailscale never emits
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            return None  # not a valid CIDR/IP -> fail closed
+        if net in _DEFAULT_ROUTE_NETS:
+            continue  # a (canonical) default route is not an app-connector route
+        if use_allowedips and _canon_addr(text) in self_ips:
+            continue  # the connector's own address (AllowedIPs fallback; any prefix, canonical match)
+        routes.append(text)
+    return routes
 
 
 # --------------------------------------------------------------------------- #
@@ -965,6 +1109,9 @@ def _connection_path(cur_addr: Optional[str], online: Optional[bool]) -> str:
     return "unknown"
 
 
+_UNSET: Any = object()  # sentinel: "argument not supplied" (distinct from an explicit None)
+
+
 def peer_metrics(
     status: dict[str, Any],
     available: bool,
@@ -973,6 +1120,7 @@ def peer_metrics(
     now: Optional[dt.datetime] = None,
     latency_ms: Optional[float] = None,
     ping_fn: Optional[Callable[[], Any]] = None,
+    _node: Any = _UNSET,
 ) -> dict[str, Any]:
     """Read-only per-peer counters + liveness for a connector label. Returns the
     fixed-key metrics object; ALL values null on transport failure (status
@@ -991,8 +1139,11 @@ def peer_metrics(
     is caught by ``_safe_peer_metrics`` along with any resolution error."""
     if not available:
         return _null_metrics()
-    node_id, ips = resolve_identity(status, label)
-    node = _find_node(status, node_id, ips)
+    if _node is _UNSET:
+        node_id, ips = resolve_identity(status, label)
+        node = _find_node(status, node_id, ips)
+    else:
+        node = _node  # caller already resolved this label (dedups a 2nd resolve + ambiguity warning)
     if node is None:
         return _null_metrics()
     obj = _null_metrics()
@@ -1025,13 +1176,15 @@ def _safe_peer_metrics(
     *,
     latency_ms: Optional[float] = None,
     ping_fn: Optional[Callable[[], Any]] = None,
+    _node: Any = _UNSET,
 ) -> dict[str, Any]:
     """Non-gating wrapper: metrics extraction must NEVER abort the monitor report
     (the hard rule in docs/design/metrics-collection.md), so any unexpected error
     -- including a resolution error on a malformed status or a raising ``ping_fn``
-    -- degrades to the null-filled object instead of propagating."""
+    -- degrades to the null-filled object instead of propagating. ``_node`` lets a
+    caller pass an already-resolved node so peer_metrics does not resolve twice."""
     try:
-        return peer_metrics(status, available, label, latency_ms=latency_ms, ping_fn=ping_fn)
+        return peer_metrics(status, available, label, latency_ms=latency_ms, ping_fn=ping_fn, _node=_node)
     except Exception as exc:
         eprint(f"warning: peer metrics unavailable for '{label}': {exc}")
         return _null_metrics()
@@ -1150,57 +1303,7 @@ def _nonneg_int_or_none(value: Any) -> Optional[int]:
     return value
 
 
-_PROM_DEFAULT_NETS = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
-
-
-def _prom_route_count(status: dict[str, Any], node_id: Optional[str], ips: list[str]) -> Optional[int]:
-    """Strict, Prometheus-only count of non-default advertised routes. Unlike the
-    lenient JSON `node_routes`, this returns None (⇒ omit the gauge) whenever the
-    authoritative route field is not a list or ANY element is not a valid, non-empty
-    CIDR/IP string -- so a malformed status can never manufacture a fake route count
-    (rule 4). EVERY element is parsed FIRST; the default-route and own-host
-    exclusions are then applied to the parsed network, so a non-canonical default
-    like ``0.0.0.1/0`` is still excluded and a malformed entry that merely resembles
-    a self address still omits the gauge. Never touches `node_routes`, `serving`, or
-    the health verdict."""
-    node = _find_node(status, node_id, ips)
-    if node is None:
-        return None
-    self_hosts: set[Any] = set()
-    if "PrimaryRoutes" in node:
-        raw = node.get("PrimaryRoutes")
-    else:
-        raw = node.get("AllowedIPs")
-        for ip in node.get("TailscaleIPs") or []:
-            if isinstance(ip, str):
-                try:
-                    self_hosts.add(ipaddress.ip_address(_norm_ip(ip)))
-                except ValueError:
-                    pass
-    if not isinstance(raw, list):
-        return None
-    count = 0
-    for entry in raw:
-        if not isinstance(entry, str) or not entry.strip():
-            return None  # malformed element -> omit the whole gauge
-        try:
-            net = ipaddress.ip_network(entry.strip(), strict=False)
-        except ValueError:
-            return None  # not a valid CIDR/IP -> omit the whole gauge
-        if net in _PROM_DEFAULT_NETS:
-            continue  # a (canonical) default route is not an app-connector route
-        if net.prefixlen == net.max_prefixlen and net.network_address in self_hosts:
-            continue  # the connector's own host address (AllowedIPs fallback path)
-        count += 1
-    return count
-
-
-def _prometheus_document(
-    rows: list[dict[str, Any]],
-    resolved: list[tuple[Optional[str], list[str]]],
-    status: dict[str, Any],
-    overall_healthy: bool,
-) -> str:
+def _prometheus_document(rows: list[dict[str, Any]], overall_healthy: bool) -> str:
     """Build the complete Prometheus text-exposition document from the connector
     rows. HELP/TYPE appear once per family, all its samples together; a family with
     no samples is skipped. `ai_egress_overall_healthy` is emitted exactly once, LAST
@@ -1215,7 +1318,7 @@ def _prometheus_document(
     routes: list[tuple[dict[str, str], Any]] = []
     info: list[tuple[dict[str, str], Any]] = []
 
-    for row, (node_id, ips) in zip(rows, resolved):
+    for row in rows:
         labels = {"connector": str(row["connector"]), "label": str(row["label"])}
         metrics = row["metrics"]
         if isinstance(row["online"], bool):
@@ -1234,7 +1337,7 @@ def _prometheus_document(
         age = metrics["last_handshake_age_seconds"]
         if isinstance(age, int) and not isinstance(age, bool) and age >= 0:
             handshake.append((labels, age))
-        route_count = _prom_route_count(status, node_id, ips)
+        route_count = _nonneg_int_or_none(row["routes"])  # strict node_routes count (or None)
         if route_count is not None:
             routes.append((labels, route_count))
         path = metrics["connection_path"]
@@ -1336,13 +1439,11 @@ def cmd_connectors(args: argparse.Namespace) -> int:
     # other than "Running" (including a missing / null / non-string value) as down.
     backend_down = status.get("BackendState") != "Running"
     rows: list[dict[str, Any]] = []
-    # Parallel to `rows` (NOT stored in the row dict, so the JSON stays additive):
-    # the canonical identity for the Prometheus-only strict route re-validation.
-    resolved: list[tuple[Optional[str], list[str]]] = []
     reachable_ok = True
     serving = "none"
     for role, label in (("primary", args.primary), ("fallback", args.fallback)):
         node_id, ips = resolve_identity(status, label)
+        node = _find_node(status, node_id, ips)  # resolve once; reused for metrics (avoids a 2nd ambiguity warning)
         online = node_online(status, node_id, ips)
         result = tailscale_ping(label, args.ping_timeout)
         routes = node_routes(status, node_id, ips)
@@ -1351,7 +1452,6 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             reachable_ok = False
         if route_count and serving == "none":
             serving = role
-        resolved.append((node_id, ips))
         rows.append({
             "connector": role,
             "label": label,
@@ -1363,7 +1463,7 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             # monitor's health verdict below; null-filled (and exception-isolated)
             # if unavailable. latency_ms reuses the reachability ping above (one
             # ping per connector); it is stamped only when the peer also resolves.
-            "metrics": _safe_peer_metrics(status, available, label, latency_ms=result.rtt_ms),
+            "metrics": _safe_peer_metrics(status, available, label, latency_ms=result.rtt_ms, _node=node),
         })
     # In oldest-first HA exactly one connector serves routes at a time, so the
     # pair is route-healthy when at least one advertises app-connector/subnet
@@ -1373,7 +1473,7 @@ def cmd_connectors(args: argparse.Namespace) -> int:
     order, order_reason = connector_ordering(load_devices(args.devices_json_file), args.primary, args.fallback)
     overall = "healthy" if overall_healthy else "degraded"
     if getattr(args, "prometheus", False):
-        document = _prometheus_document(rows, resolved, status, overall_healthy)
+        document = _prometheus_document(rows, overall_healthy)
         output = getattr(args, "output", None)
         if output is not None:  # NOT truthiness: an empty --output must error, not fall back to stdout
             try:
