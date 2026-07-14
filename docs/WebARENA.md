@@ -13,7 +13,7 @@ Region: Japan
 Use: App Connector first, exit-node fallback only when intentional
 ```
 
-Do not choose an IPv6-only shape for this project. Many AI services and CDNs still rely on IPv4 A records, and the client checker intentionally validates IPv4 routing. If WebARENA changes its plan mix, pick a plan that clearly includes public IPv4.
+Do not choose an IPv6-only shape for this project. Many AI services and CDNs still rely on IPv4 A records, and the client checker's pass/fail signal is IPv4 routing (it also inspects IPv6 advisorily when a domain publishes AAAA, but those findings never fail the run). If WebARENA changes its plan mix, pick a plan that clearly includes public IPv4.
 
 ## Before Bootstrap
 

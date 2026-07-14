@@ -106,15 +106,19 @@ jobs:
             /bin/bash -n "$file"
           done
 
-      - name: Real BSD route lookup (route_get + parse_route_interface)
+      - name: Real BSD route lookup (IPv4 route_get + IPv6 route_get6 + parser)
         run: |
-          # Exercise the genuine BSD `route -n get` and the interface parser on loopback
-          # (no network, root, or tailscale). AI_EGRESS_SOURCE_ONLY suppresses main().
+          # Exercise the genuine BSD `route -n get` (IPv4) and `route -n get -inet6` (IPv6)
+          # plus the interface parser on loopback (no network, root, or tailscale).
+          # AI_EGRESS_SOURCE_ONLY suppresses main().
           set -euo pipefail
           AI_EGRESS_SOURCE_ONLY=1 . ./check-client-routes.sh
-          iface="$(route_get 127.0.0.1 | parse_route_interface)"
-          [ -n "$iface" ] || { echo "empty interface from real BSD route" >&2; exit 1; }
-          echo "loopback interface: $iface"
+          iface4="$(route_get 127.0.0.1 | parse_route_interface)"
+          [ -n "$iface4" ] || { echo "empty interface from real BSD IPv4 route" >&2; exit 1; }
+          echo "IPv4 loopback interface: $iface4"
+          iface6="$(route_get6 ::1 | parse_route_interface)"
+          [ -n "$iface6" ] || { echo "empty interface from real BSD IPv6 route" >&2; exit 1; }
+          echo "IPv6 loopback interface: $iface6"
 
       - name: Run Python unit tests (BSD userland + Bash 3.2)
         run: python3 -B -m unittest discover -s tests

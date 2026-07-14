@@ -15,6 +15,19 @@ both Python CLIs report it with `--version`.
 
 ### Added
 
+- `check-client-routes.sh`: an **advisory IPv6 route check**. When a selected AI domain
+  (or the baseline) publishes AAAA records, the checker resolves them and inspects the
+  IPv6 route (`route -n get -inet6` on macOS, `ip -6 route get` on Linux) under new
+  `*-ipv6` check ids (`ai-domain-route-ipv6`, `baseline-route-ipv6`,
+  `ai-route-summary-ipv6`). IPv6 findings are advisory only — a mismatch is a `WARN`,
+  never a `FAIL`, and a domain with no AAAA is skipped cleanly — so the script's exit code
+  and the `schema_version: 1` JSON shape are unchanged and IPv4 stays the pass/fail signal.
+- `scripts/policy_tool.py`: broad CDN / shared-infrastructure domains
+  (`cloudfront.net`, `amazonaws.com`, `googleusercontent.com`, `azureedge.net`,
+  `akamaihd.net`, `fastly.net`) now `validate` with a `broad-wildcard-warning` (they can
+  route unrelated shared-CDN traffic through the connector); the separate broad-wildcard
+  blocklist still fails closed unless `--allow-broad-wildcard`. Warnings do not change the
+  exit code.
 - **macOS CI job.** A parallel `macos-latest` workflow job covers what the Linux
   matrix cannot: stock Bash 3.2 syntax (`/bin/bash -n`), the BSD userland (a real
   `route -n get` probe, the `stat -f` lock-age arm exercised by the failover

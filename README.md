@@ -317,7 +317,7 @@ Run client-side route verification on your Mac or Linux client:
 ./check-client-routes.sh
 ```
 
-It checks every IPv4 A record for the selected AI domains and reports whether they route through the Tailscale App Connector path. It also checks a baseline domain, `ipinfo.io`, to confirm ordinary traffic stays local in connector-only mode. If you intentionally use an exit node, baseline traffic through the selected exit node is expected because that is full-traffic mode.
+It checks every IPv4 A record for the selected AI domains and reports whether they route through the Tailscale App Connector path. When a domain also publishes IPv6 (AAAA) records, it inspects those too as an **advisory** check (separate `*-ipv6` check ids); IPv6 findings are informational and never fail the run, and a domain with no AAAA is skipped cleanly. It also checks a baseline domain, `ipinfo.io`, to confirm ordinary traffic stays local in connector-only mode. If you intentionally use an exit node, baseline traffic through the selected exit node is expected because that is full-traffic mode.
 
 Both diagnostic scripts use `[OK]`, `[WARN]`, and `[FAIL]`. Any `[FAIL]` exits with status `1`; warnings alone exit `0` and print a summary to stderr. For scripted support, both scripts also support `--json`; JSON output includes `schema_version: 1`, `script`, `summary`, and `checks`.
 
