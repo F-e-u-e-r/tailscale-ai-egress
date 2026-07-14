@@ -145,14 +145,17 @@ from the reachability ping so it survives even an unresolved peer),
 
 **Never a silently-wrong value (rule 4):** a null, non-finite, negative-counter,
 float64-unrepresentable, or malformed-route value is **omitted** (no sample line),
-never a fake `0`; route counts are re-validated per element with `ipaddress`. This
-strict per-element route validation is intentionally stricter than the released,
-lenient `node_routes` check that drives `overall_healthy`: for any well-formed
-status they agree, and only an adversarial/malformed route field (e.g. `0.0.0.1/0`
-or `not-a-cidr`, which real Tailscale never emits) can make the strict `_routes`
-gauge and the health sentinel diverge. Tightening the health verdict itself is a
-released-semantics change kept OUT of this additive step (tracked as a separate
-hardening PR); metrics never change the health verdict here (rule 1). **Exit code = write
+never a fake `0`; route counts come from the strict per-element `ipaddress`
+validation in `node_routes`, which backs BOTH the `_routes` gauge AND the `serving`
+/ `overall_healthy` verdict, so they always agree — a malformed route field (e.g.
+`not-a-cidr`, a dotted netmask, an IPv6 zone id, or an over-long prefix, none of which
+real Tailscale emits) fails closed to `unknown` (gauge omitted) and degraded on both,
+while a non-canonical default such as `0.0.0.1/0` is excluded as a default route
+(count `0`, gauge `0`), not counted. (An earlier additive step made only
+the gauge strict; the shared strict `node_routes` — plus non-list-`TailscaleIPs`
+crash-safety in `resolve_identity`/`_find_node`/`live_active_role` (a dict there no
+longer mis-attributes the live exit-node role) — landed with the malformed-status
+hardening.) **Exit code = write
 integrity, not health:** with `--output` a successful write exits `0` even when the
 pair is degraded (health is the `ai_egress_overall_healthy` gauge); a
 generation/write failure exits non-zero. Node-level `tailscaled_*` counters are
