@@ -291,6 +291,8 @@ wildcards are intentionally not included.
 
 The built-in packs intentionally avoid broad infrastructure or identity domains like `google.com`, `microsoft.com`, `cloudflare.com`, and generic CDN domains to reduce over-routing. Add provider-specific app, API, or asset domains manually only if your use case needs them.
 
+Two guardrails apply when you add domains: broad CDN / shared-infrastructure domains such as `cloudfront.net`, `amazonaws.com`, `fastly.net`, `akamaihd.net`, `azureedge.net`, and `googleusercontent.com` **validate with a warning** (they can pull unrelated traffic that shares the CDN through the connector), while the very broadest wildcards (`*.com`, `*.google.com`, `*.microsoft.com`, `*.cloudflare.com`, `*.googleapis.com`) are **blocked** unless you pass `--allow-broad-wildcard`.
+
 Gemini and Microsoft Copilot domains are not in the default list because they can involve broad Google or Microsoft identity, app, and CDN infrastructure. Add those domains manually only after testing the routing impact for your tailnet.
 
 ## Diagnostics

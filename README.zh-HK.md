@@ -280,6 +280,8 @@ Google wildcards。
 
 內建 packs 刻意避開太廣泛的 infrastructure 或 identity domains，例如 `google.com`、`microsoft.com`、`cloudflare.com` 和一般 CDN domains，以減低 over-routing。只有在你的 use case 需要時，才手動加入 provider-specific app、API 或 asset domains。
 
+加入 domains 時有兩層保護：廣泛的 CDN／共享基建 domains（例如 `cloudfront.net`、`amazonaws.com`、`fastly.net`、`akamaihd.net`、`azureedge.net`、`googleusercontent.com`）**validate 時只會警告**（它們可能把共用該 CDN 的無關流量也帶經 connector）；而最廣泛的 wildcards（`*.com`、`*.google.com`、`*.microsoft.com`、`*.cloudflare.com`、`*.googleapis.com`）則會被**封鎖**，除非你傳入 `--allow-broad-wildcard`。
+
 Gemini 和 Microsoft Copilot domains 沒有放入內建清單，因為它們可能牽涉較廣泛的 Google 或 Microsoft identity、app 和 CDN infrastructure。請只在測試過 tailnet routing 影響後才手動加入。
 
 ## Diagnostics
