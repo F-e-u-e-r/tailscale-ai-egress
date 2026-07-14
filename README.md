@@ -2,6 +2,12 @@
 
 Languages: English | [繁體中文（香港）](README.zh-HK.md)
 
+[![CI](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml/badge.svg)](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-1.1.1-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20VPS%20%C2%B7%20POSIX%20shell-lightgrey)
+![Telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)
+
 A small bootstrap toolkit for creating a personal Tailscale App Connector that routes selected AI-related domains through a chosen VPS egress IP, while keeping normal traffic on the user's local network or preferred exit node.
 
 > **Stable v1.x.** The 1.0 command surface is frozen — see [docs/Stability.md](docs/Stability.md); v1.1 adds opt-in failover and health-monitoring helpers (`failover-exit-node.sh`, `monitor-connectors.sh`) without changing it. Every entrypoint supports `--version` and `--help`. Licensed under [MIT](LICENSE). New here? Jump to [Which Mode Should I Use?](#which-mode-should-i-use) and the [Quick Start](#quick-start).
@@ -18,8 +24,19 @@ cd tailscale-ai-egress
 
 Choose the default `common` domains, answer `N` to Advanced Mode, paste the generated policy snippet, then finish the Tailscale node login.
 
+## Features
+
+- **🎯 Domain-selective AI egress** — route only the AI domains you choose through a VPS exit IP; everything else stays on your local network or preferred exit node.
+- **🔁 Same-region connector failover** — run two or more App Connectors under one tag so new AI-domain connections move to a healthy connector if one goes offline.
+- **🛟 Exit-node failover controller** — `failover-exit-node.sh --watch --apply` promotes a backup exit node when the primary fails its health check, with hysteresis, cooldown, and an optional post-switch notify hook.
+- **📊 Connector HA monitoring + metrics** — `monitor-connectors.sh` reports each connector's online / reachability / route state plus per-connector metrics (Tx/Rx counters, liveness, `tailscale ping` latency, connection path). Emit a node_exporter / Prometheus textfile with `--prometheus-textfile`, or read one connector with `health_check.py peer-metrics`.
+- **🧭 Guided setup, opt-in automation** — a manual policy snippet by default; opt in to auditable API-driven policy (`plan` → `apply-plan`) only when you choose, never automatically.
+- **🩺 Diagnostics, JSON-ready** — `diagnose.sh` (VPS) and `check-client-routes.sh` (client) verify routing end to end; both support `--json` for scripting.
+- **🔒 Security-first** — no telemetry; secrets only from env / hidden input; release-artifact checksum verification; auditable policy plans with `If-Match` concurrency checks; and a health engine hardened to fail closed on malformed status.
+
 ## Contents
 
+- [Features](#features)
 - [Before You Start](#before-you-start)
 - [Which Mode Should I Use?](#which-mode-should-i-use)
 - [Quick Start](#quick-start)
