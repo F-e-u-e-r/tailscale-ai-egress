@@ -8,7 +8,7 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20VPS%20%C2%B7%20POSIX%20shell-lightgrey)
 ![Telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)
 
-> `README.md` 是最新內容的主要來源。本中文文件使用香港繁體中文；台灣讀者可能會見到少量用語差異，例如「網絡」和「網路」。
+> `README.md` 是最新內容的主要來源。本中文文件使用香港繁體中文。
 
 > **Stable v1.x.** 1.0 的 command surface 已凍結，詳見 [docs/Stability.md](docs/Stability.md)；v1.1 新增 opt-in failover 與 health-monitoring helpers（`failover-exit-node.sh`、`monitor-connectors.sh`），不會改變原有 command surface。所有 entrypoint 都支援 `--version` 和 `--help`。
 
