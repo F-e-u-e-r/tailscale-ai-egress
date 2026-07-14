@@ -316,6 +316,36 @@ route_get() {
   esac
 }
 
+resolve_ipv6_all() {
+  local domain="$1"
+  if have dig; then
+    dig +short "$domain" AAAA | awk '/:/ { print }'
+  elif have getent; then
+    getent ahostsv6 "$domain" | awk '{ print $1 }' | awk '!seen[$0]++'
+  else
+    return 1
+  fi
+}
+
+route_get6() {
+  local ip_addr="$1"
+  case "$(uname -s)" in
+    Darwin)
+      if have route; then
+        route -n get -inet6 "$ip_addr" 2>/dev/null || true
+      fi
+      ;;
+    Linux)
+      if have ip; then
+        ip -6 route get "$ip_addr" 2>/dev/null || true
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 parse_route_interface() {
   case "$(uname -s)" in
     Darwin)
@@ -478,6 +508,11 @@ emit_domain_results() {
   local tailscale_count="$5"
   local possible_count="$6"
   local unknown_count="$7"
+  # id_suffix: "" for IPv4, "-ipv6" for the IPv6 pass -> distinct check ids.
+  # ai_unrouted_status: FAIL for IPv4; the IPv6 pass passes "WARN" so an IPv6 mismatch is
+  # advisory only and can never flip the script's exit code (missing AAAA is skipped upstream).
+  local id_suffix="${8:-}"
+  local ai_unrouted_status="${9:-FAIL}"
   local status
   local ip_addr
   local iface
@@ -488,11 +523,11 @@ emit_domain_results() {
       status="OK"
     elif [ $((tailscale_count + possible_count)) -gt 0 ]; then
       status="WARN"
-      record WARN "$domain has partial route coverage through App Connector; wait 1-2 minutes and rerun if this was just configured." "ai-route-summary"
+      record WARN "$domain has partial route coverage through App Connector; wait 1-2 minutes and rerun if this was just configured." "ai-route-summary${id_suffix}"
     elif [ "$unknown_count" -eq "$total" ] && [ "$USERSPACE_NETWORKING" = "1" ]; then
       status="WARN"
     else
-      status="FAIL"
+      status="$ai_unrouted_status"
     fi
   else
     status="OK"
@@ -511,41 +546,41 @@ emit_domain_results() {
     [ -n "$ip_addr" ] || continue
     case "$role:$status:$class" in
       ai:OK:tailscale)
-        record OK "$domain -> $ip_addr -> $(route_label "$iface") via Tailscale App Connector" "ai-domain-route"
+        record OK "$domain -> $ip_addr -> $(route_label "$iface") via Tailscale App Connector" "ai-domain-route${id_suffix}"
         ;;
       ai:WARN:tailscale)
-        record OK "$domain -> $ip_addr -> $(route_label "$iface") via Tailscale App Connector" "ai-domain-route"
+        record OK "$domain -> $ip_addr -> $(route_label "$iface") via Tailscale App Connector" "ai-domain-route${id_suffix}"
         ;;
       ai:WARN:possible-tailscale)
-        record WARN "$domain -> $ip_addr -> $(route_label "$iface") may be Tailscale App Connector; macOS route output is best-effort." "ai-domain-route"
+        record WARN "$domain -> $ip_addr -> $(route_label "$iface") may be Tailscale App Connector; macOS route output is best-effort." "ai-domain-route${id_suffix}"
         ;;
       ai:WARN:userspace-unknown)
-        record WARN "$domain -> $ip_addr -> $(route_label "$iface"); Linux userspace networking may hide the path for App Connector." "ai-domain-route"
+        record WARN "$domain -> $ip_addr -> $(route_label "$iface"); Linux userspace networking may hide the path for App Connector." "ai-domain-route${id_suffix}"
         ;;
       ai:WARN:*)
-        record WARN "$domain -> $ip_addr -> $(route_label "$iface") is not yet routed through Tailscale App Connector." "ai-domain-route"
+        record WARN "$domain -> $ip_addr -> $(route_label "$iface") is not yet routed through Tailscale App Connector." "ai-domain-route${id_suffix}"
         ;;
       ai:FAIL:*)
-        record FAIL "$domain -> $ip_addr -> $(route_label "$iface") is not routed through Tailscale App Connector." "ai-domain-route"
+        record FAIL "$domain -> $ip_addr -> $(route_label "$iface") is not routed through Tailscale App Connector." "ai-domain-route${id_suffix}"
         ;;
       baseline:OK:tailscale|baseline:OK:possible-tailscale)
-        record OK "$domain -> $ip_addr -> $(route_label "$iface") via selected exit node; expected because full-traffic exit-node mode is active." "baseline-route"
+        record OK "$domain -> $ip_addr -> $(route_label "$iface") via selected exit node; expected because full-traffic exit-node mode is active." "baseline-route${id_suffix}"
         ;;
       baseline:OK:*)
-        record OK "$domain -> $ip_addr -> $(route_label "$iface") normal traffic local." "baseline-route"
+        record OK "$domain -> $ip_addr -> $(route_label "$iface") normal traffic local." "baseline-route${id_suffix}"
         ;;
       baseline:WARN:tailscale|baseline:WARN:possible-tailscale)
         if [ "$EXIT_NODE_ACTIVE" = "1" ]; then
-          record OK "$domain -> $ip_addr -> $(route_label "$iface") via selected exit node; expected because full-traffic exit-node mode is active." "baseline-route"
+          record OK "$domain -> $ip_addr -> $(route_label "$iface") via selected exit node; expected because full-traffic exit-node mode is active." "baseline-route${id_suffix}"
         else
-          record WARN "$domain -> $ip_addr -> $(route_label "$iface") uses Tailscale; an exit node, broader route, or CDN over-routing may be active." "baseline-route"
+          record WARN "$domain -> $ip_addr -> $(route_label "$iface") uses Tailscale; an exit node, broader route, or CDN over-routing may be active." "baseline-route${id_suffix}"
         fi
         ;;
       baseline:WARN:*)
         if [ "$EXIT_NODE_ACTIVE" = "1" ]; then
-          record WARN "$domain -> $ip_addr -> $(route_label "$iface") is not using the selected exit node even though exit-node mode appears active." "baseline-route"
+          record WARN "$domain -> $ip_addr -> $(route_label "$iface") is not using the selected exit node even though exit-node mode appears active." "baseline-route${id_suffix}"
         else
-          record OK "$domain -> $ip_addr -> $(route_label "$iface") normal traffic local." "baseline-route"
+          record OK "$domain -> $ip_addr -> $(route_label "$iface") normal traffic local." "baseline-route${id_suffix}"
         fi
         ;;
     esac
@@ -598,6 +633,48 @@ $ips
 EOF
 
   emit_domain_results "$role" "$domain" "$results" "$total" "$tailscale_count" "$possible_count" "$unknown_count"
+}
+
+check_domain_routes_ipv6() {
+  local role="$1"
+  local domain="$2"
+  local ips
+  local ip_addr
+  local route_output
+  local iface
+  local class
+  local results=""
+  local total=0
+  local tailscale_count=0
+  local possible_count=0
+  local unknown_count=0
+
+  # Advisory IPv6 pass: resolve AAAA once and skip cleanly (no record, never FAIL) when the
+  # domain has no AAAA -- many domains are legitimately IPv4-only, and an IPv6 mismatch must
+  # not change the script's exit code (the IPv4 pass owns pass/fail).
+  ips="$(resolve_ipv6_all "$domain" || true)"
+  [ -n "$ips" ] || return 0
+
+  while IFS= read -r ip_addr; do
+    [ -n "$ip_addr" ] || continue
+    total=$((total + 1))
+    route_output="$(route_get6 "$ip_addr")"
+    iface="$(printf '%s\n' "$route_output" | parse_route_interface)"
+    class="$(classify_interface "$iface")"
+    results="${results}${ip_addr}|${iface}|${class}
+"
+    case "$class" in
+      tailscale) tailscale_count=$((tailscale_count + 1)) ;;
+      possible-tailscale) possible_count=$((possible_count + 1)) ;;
+      local) ;;
+      *) unknown_count=$((unknown_count + 1)) ;;
+    esac
+  done <<EOF
+$ips
+EOF
+
+  # "-ipv6" id suffix + "WARN" unrouted status: distinct check ids, advisory only (never FAIL).
+  emit_domain_results "$role" "$domain" "$results" "$total" "$tailscale_count" "$possible_count" "$unknown_count" "-ipv6" "WARN"
 }
 
 main() {
@@ -659,6 +736,7 @@ main() {
     esac
     checked_count=$((checked_count + 1))
     check_domain_routes ai "$domain"
+    check_domain_routes_ipv6 ai "$domain"
   done <"$domains_tmp"
   if [ "$wildcard_count" -gt 0 ]; then
     record WARN "Skipped $wildcard_count wildcard domain(s); route checks require concrete domains." "ai-domain-route" "{\"wildcards_skipped\":$wildcard_count}"
@@ -671,6 +749,7 @@ main() {
     printf '\n== Baseline route ==\n'
   fi
   check_domain_routes baseline "$BASELINE_DOMAIN"
+  check_domain_routes_ipv6 baseline "$BASELINE_DOMAIN"
 
   finish
 }

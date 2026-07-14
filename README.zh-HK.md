@@ -306,7 +306,7 @@ Gemini 和 Microsoft Copilot domains 沒有放入內建清單，因為它們可�
 ./check-client-routes.sh
 ```
 
-它會檢查每個 AI domain 的 IPv4 A records 是否經 Tailscale App Connector path，並用 `ipinfo.io` 作 baseline 確認 connector-only mode 下普通流量仍然留在本地。如果你刻意選用了 exit node，baseline traffic 經 selected exit node 是預期行為，因為那是 full-traffic mode。
+它會檢查每個 AI domain 的 IPv4 A records 是否經 Tailscale App Connector path。當 domain 同時有 IPv6（AAAA）records 時，它也會**以 advisory 方式**檢查（獨立的 `*-ipv6` check ids）；IPv6 結果只作參考、永不會令整體失敗，沒有 AAAA 的 domain 則乾淨略過。它並用 `ipinfo.io` 作 baseline 確認 connector-only mode 下普通流量仍然留在本地。如果你刻意選用了 exit node，baseline traffic 經 selected exit node 是預期行為，因為那是 full-traffic mode。
 
 兩個 diagnostics scripts 都使用 `[OK]`、`[WARN]`、`[FAIL]`。任何 `[FAIL]` 會用 exit code `1`；只有 warning 時 exit `0`，並在 stderr 印 summary。它們也支援 `--json`，輸出包含 `schema_version: 1`、`script`、`summary` 和 `checks`。
 

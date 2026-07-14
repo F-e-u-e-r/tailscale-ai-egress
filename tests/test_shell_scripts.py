@@ -1566,9 +1566,24 @@ exit 0
                 ).stdout.splitlines()
                 self.assertEqual(embedded, policy)
 
-    def _client_route_env(self, tmp, *, os_name="Darwin", status_json=None, partial=False, exit_node=False, linux_userspace=False):
+    def _client_route_env(self, tmp, *, os_name="Darwin", status_json=None, partial=False, exit_node=False, linux_userspace=False, ipv6=None, ipv4_ai_local=False):
+        # ipv6: None -> domains publish NO AAAA (the IPv6 pass skips cleanly). "routed" ->
+        # AAAA routes through Tailscale; "local" -> AAAA routes locally (advisory WARN, never
+        # FAIL); "partial" -> mixed AAAA (drives the ai-route-summary-ipv6 finding); "noroute"
+        # -> AAAA present but the IPv6 route lookup returns nothing (advisory WARN, never FAIL).
         fake_bin = Path(tmp) / "bin"
         fake_bin.mkdir()
+        self._dig_log = Path(tmp) / "dig-queries.log"   # one line per dig invocation (arity check)
+        aaaa = {
+            "routed": {"chatgpt.com": ["2606:4700::a"], "ipinfo.io": ["2001:4860::b"]},
+            "local": {"chatgpt.com": ["2606:4700::c"]},
+            "partial": {"chatgpt.com": ["2606:4700::a", "2606:4700::c"]},
+            "noroute": {"chatgpt.com": ["2606:4700::d"]},
+        }.get(ipv6, {})
+        aaaa_cases = "".join(
+            f"  {dom})\n" + "".join(f"    echo {ip6}\n" for ip6 in ips) + "    ;;\n"
+            for dom, ips in aaaa.items()
+        )
 
         if status_json is None:
             if exit_node:
@@ -1600,34 +1615,55 @@ exit 0
         self._write_fake_command(
             fake_bin,
             "dig",
-            """#!/bin/sh
+            f"""#!/bin/sh
+# argument-strict: the script calls exactly `dig +short <domain> A|AAAA` (3 args). Log each
+# invocation so a test can assert exactly one AAAA query per checker call.
+echo "$*" >> {self._dig_log}
+{{ [ "$1" = "+short" ] && [ $# -eq 3 ]; }} || {{ echo "dig: expected '+short <domain> A|AAAA', got: $*" >&2; exit 64; }}
 domain="$2"
-case "$domain" in
-  chatgpt.com)
-    echo 104.18.1.1
-    echo 104.18.1.2
-    ;;
-  ipinfo.io)
-    echo 34.117.59.81
-    ;;
-esac
+rtype="$3"
+case "$rtype" in A|AAAA) ;; *) echo "dig: expected A|AAAA, got: $rtype" >&2; exit 64 ;; esac
+if [ "$rtype" = "A" ]; then
+  case "$domain" in
+    chatgpt.com) echo 104.18.1.1; echo 104.18.1.2 ;;
+    ipinfo.io) echo 34.117.59.81 ;;
+  esac
+else
+  case "$domain" in
+{aaaa_cases}  esac
+fi
 """,
         )
 
+        ai_iface = "en0" if ipv4_ai_local else "utun8"
         if os_name == "Darwin":
-            second_iface = "en0" if partial else "utun8"
+            second_iface = "en0" if (partial or ipv4_ai_local) else "utun8"
             baseline_iface = "utun8" if exit_node else "en0"
             self._write_fake_command(
                 fake_bin,
                 "route",
                 f"""#!/bin/sh
-# argument-strict: the script must call the BSD form `route -n get <ip>`.
-[ "$1" = "-n" ] && [ "$2" = "get" ] || {{ echo "route: expected '-n get <ip>', got: $*" >&2; exit 64; }}
-eval "target=\\${{$#}}"
+# argument-strict AND family-strict: `route -n get <ipv4>` (3 args) or
+# `route -n get -inet6 <ipv6>` (4 args); an IPv4 arm rejects an IPv6 target and vice versa,
+# so dropping the `-inet6` flag fails instead of silently matching.
+if [ "$1" = "-n" ] && [ "$2" = "get" ] && [ "$3" = "-inet6" ] && [ $# -eq 4 ]; then
+  target="$4"
+  case "$target" in *:*) ;; *) echo "route: -inet6 needs an IPv6 target: $*" >&2; exit 64 ;; esac
+elif [ "$1" = "-n" ] && [ "$2" = "get" ] && [ $# -eq 3 ]; then
+  target="$3"
+  case "$target" in *:*) echo "route: IPv6 target needs -inet6: $*" >&2; exit 64 ;; esac
+else
+  echo "route: expected '-n get <ip>' or '-n get -inet6 <ip6>', got: $*" >&2; exit 64
+fi
 case "$target" in
-  100.64.0.2|104.18.1.1) iface=utun8 ;;
+  100.64.0.2) iface=utun8 ;;
+  104.18.1.1) iface={ai_iface} ;;
   104.18.1.2) iface={second_iface} ;;
   34.117.59.81) iface={baseline_iface} ;;
+  2606:4700::a) iface=utun8 ;;
+  2606:4700::c) iface=en0 ;;
+  2001:4860::b) iface=en0 ;;
+  2606:4700::d) exit 0 ;;
   *) iface=en0 ;;
 esac
 echo "interface: $iface"
@@ -1639,15 +1675,26 @@ echo "interface: $iface"
                 fake_bin,
                 "ip",
                 """#!/bin/sh
-if [ "$1" = "link" ]; then
-  exit 1
-fi
-if [ "$1" = "route" ]; then
-  eval "target=\\${{$#}}"
-  echo "$target via 192.0.2.1 dev eth0"
+# `ip link`/`ip -o link` are used for interface detection (exit 1 = no tailscale0 here);
+# the route-get forms are argument-strict; anything else is an unexpected invocation (64).
+case "$1" in
+  link) exit 1 ;;
+  -o) [ "$2" = "link" ] && exit 1 || { echo "ip: unexpected: $*" >&2; exit 64; } ;;
+esac
+if [ "$1" = "route" ] && [ "$2" = "get" ]; then
+  [ $# -eq 3 ] || { echo "ip: expected 'route get <ip>', got: $*" >&2; exit 64; }
+  case "$3" in *:*) echo "ip: IPv6 target needs -6: $*" >&2; exit 64 ;; esac
+  echo "$3 via 192.0.2.1 dev eth0"
   exit 0
 fi
-exit 1
+if [ "$1" = "-6" ] && [ "$2" = "route" ] && [ "$3" = "get" ]; then
+  [ $# -eq 4 ] || { echo "ip: expected '-6 route get <ip6>', got: $*" >&2; exit 64; }
+  case "$4" in *:*) ;; *) echo "ip: -6 needs an IPv6 target: $*" >&2; exit 64 ;; esac
+  echo "$4 via fe80::1 dev tailscale0"
+  exit 0
+fi
+echo "ip: unexpected invocation: $*" >&2
+exit 64
 """,
             )
 
@@ -1721,6 +1768,127 @@ exit 1
         self.assertEqual(payload["script"], "check-client-routes.sh")
         self.assertIn("summary", payload)
         self.assertTrue(any(check["id"] == "ai-domain-route" for check in payload["checks"]))
+
+    def _run_client_route_json(self, tmp, *, os_name="Darwin", ipv6=None, **env_kwargs):
+        domains = Path(tmp) / "domains.txt"
+        domains.write_text("chatgpt.com\n", encoding="utf-8")
+        env = self._client_route_env(tmp, os_name=os_name, ipv6=ipv6, **env_kwargs)
+        result = subprocess.run(
+            ["bash", str(ROOT / "check-client-routes.sh"), "--domains-file", str(domains), "--json"],
+            env=env, text=True, capture_output=True,
+        )
+        return result, json.loads(result.stdout)
+
+    @staticmethod
+    def _no_ipv6_leak(checks):
+        # Every check whose message carries a known IPv6 literal must use a `-ipv6` id, so no
+        # IPv6 event can leak under an IPv4 id.
+        return all(c["id"].endswith("-ipv6") for c in checks if "2606:4700" in c["message"] or "2001:4860" in c["message"])
+
+    def test_client_route_checker_ipv6_darwin_routed(self):
+        # The Darwin `route -n get -inet6` arm runs and emits distinct *-ipv6 ids.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Darwin", ipv6="routed")
+        checks = payload["checks"]
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(payload["schema_version"], 1)   # schema is unchanged (additive)
+        ai6 = [c for c in checks if c["id"] == "ai-domain-route-ipv6"]
+        self.assertTrue(ai6)
+        # status OK (routed via Tailscale) -- locks the `-inet6` flag: dropping it makes the
+        # fake reject the IPv6 target, route6 returns empty, and this becomes WARN, not OK.
+        self.assertTrue(any(c["status"] == "ok" and "2606:4700" in c["message"] for c in ai6))
+        self.assertTrue(any(c["id"] == "baseline-route-ipv6" for c in checks))   # baseline suffixed too
+        self.assertTrue(self._no_ipv6_leak(checks))
+        self.assertFalse(any(c["id"] == "ai-domain-route" and "2606:4700" in c["message"] for c in checks))
+
+    def test_client_route_checker_ipv6_linux_routed(self):
+        # The Linux `ip -6 route get` arm runs (dev tailscale0 -> tailscale -> OK), and the
+        # baseline IPv6 finding is also suffixed.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Linux", ipv6="routed")
+        checks = payload["checks"]
+        self.assertEqual(result.returncode, 0)
+        ai6 = [c for c in checks if c["id"] == "ai-domain-route-ipv6"]
+        # status OK (routed via tailscale0) -- locks the `-6` flag the same way the Darwin test
+        # locks `-inet6`: dropping it makes the family-strict fake reject the IPv6 target, so
+        # route6 returns empty and this becomes WARN instead of OK.
+        self.assertTrue(any(c["status"] == "ok" and "2606:4700" in c["message"] for c in ai6))
+        self.assertTrue(any(c["id"] == "baseline-route-ipv6" for c in checks))
+        self.assertTrue(self._no_ipv6_leak(checks))
+
+    def test_client_route_checker_ipv6_absent_aaaa_skips_clean(self):
+        # No AAAA anywhere (AI + baseline both IPv4-only) -> the IPv6 pass records NOTHING and
+        # never fails; exit stays 0. This is the exit-code-compatibility guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, ipv6=None)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(any(c["id"].endswith("-ipv6") for c in payload["checks"]))
+
+    def test_client_route_checker_ipv6_local_route_warns_never_fails(self):
+        # An AAAA that routes LOCALLY is advisory WARN, never FAIL; the script still exits 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Darwin", ipv6="local")
+        self.assertEqual(result.returncode, 0)
+        ipv6 = [c for c in payload["checks"] if c["id"].endswith("-ipv6")]
+        self.assertTrue(ipv6)                                       # the IPv6 pass ran
+        self.assertTrue(any(c["status"] == "warn" for c in ipv6))   # advisory WARN
+        self.assertFalse(any(c["status"] == "fail" for c in ipv6))  # and produced NO fail
+
+    def test_client_route_checker_ipv6_unrouted_warns_never_fails(self):
+        # AAAA present but the IPv6 route lookup returns NOTHING (unknown interface) -> advisory
+        # WARN under ai-domain-route-ipv6, never FAIL; exit 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Darwin", ipv6="noroute")
+        self.assertEqual(result.returncode, 0)
+        ai6 = [c for c in payload["checks"] if c["id"] == "ai-domain-route-ipv6"]
+        self.assertTrue(ai6)
+        self.assertTrue(any(c["status"] == "warn" for c in ai6))    # advisory WARN
+        self.assertTrue(all(c["status"] != "fail" for c in ai6))    # never FAIL
+
+    def test_client_route_checker_ipv6_partial_summary(self):
+        # Mixed AAAA coverage emits the distinct ai-route-summary-ipv6 partial-coverage finding,
+        # and each per-address IPv6 event stays under a *-ipv6 id (no leak to the IPv4 id).
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Darwin", ipv6="partial")
+        checks = payload["checks"]
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(any(c["id"] == "ai-route-summary-ipv6" for c in checks))
+        self.assertTrue(self._no_ipv6_leak(checks))
+
+    def test_client_route_checker_ipv6_resolves_aaaa_once_per_domain(self):
+        # Resolve-once: the IPv6 pass must issue exactly one AAAA query per domain (1 AI + 1
+        # baseline = 2), guarding against a double-resolution regression.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._run_client_route_json(tmp, os_name="Darwin", ipv6="routed")
+            queries = self._dig_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(sum(1 for q in queries if q.endswith(" AAAA")), 2)
+
+    def test_client_route_checker_ipv4_local_still_fails(self):
+        # The CONVERSE of the IPv6 WARN default: an all-local IPv4 AI route must still FAIL and
+        # exit 1 (the emit_domain_results `ai_unrouted_status` default is FAIL for IPv4). A run
+        # can carry an IPv6 WARN at the same time without softening the IPv4 FAIL.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, payload = self._run_client_route_json(tmp, os_name="Darwin", ipv6="local", ipv4_ai_local=True)
+        self.assertEqual(result.returncode, 1)
+        checks = payload["checks"]
+        self.assertTrue(any(c["id"] == "ai-domain-route" and c["status"] == "fail" for c in checks))
+        self.assertTrue(any(c["id"] == "ai-domain-route-ipv6" and c["status"] == "warn" for c in checks))
+
+    def test_resolve_ipv6_all_getent_dedups(self):
+        # Source-level unit test for the `getent ahostsv6` fallback (used when dig is absent):
+        # override `have` to expose only getent, install a strict fake getent that repeats an
+        # address per socket type, and assert resolve_ipv6_all returns the deduped address once.
+        snippet = (
+            "AI_EGRESS_SOURCE_ONLY=1 . ./check-client-routes.sh\n"
+            'have() { [ "$1" = getent ]; }\n'
+            'getent() { [ "$1" = ahostsv6 ] && [ "$2" = chatgpt.com ] || { echo "bad getent args: $*" >&2; return 2; }; '
+            'printf "%s\\n" "2606:4700::a SOCK_STREAM chatgpt.com" "2606:4700::a SOCK_DGRAM chatgpt.com"; }\n'
+            "resolve_ipv6_all chatgpt.com\n"
+        )
+        result = subprocess.run(["bash", "-c", snippet], cwd=str(ROOT), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout.split(), ["2606:4700::a"])   # deduped to exactly one
 
     def test_client_route_checker_json_classifies_ai_dns_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

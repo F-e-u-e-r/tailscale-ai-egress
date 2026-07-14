@@ -80,7 +80,7 @@ Verify client routes for configured AI domains:
 ./check-client-routes.sh
 ```
 
-The checker tests every IPv4 A record and reports `[OK]`, `[WARN]`, or `[FAIL]`. A short `[WARN]` period can be normal while App Connector DNS discovery and route advertisement settle.
+The checker tests every IPv4 A record and reports `[OK]`, `[WARN]`, or `[FAIL]` (it also inspects IPv6/AAAA advisorily when present; IPv6 findings never fail). A short `[WARN]` period can be normal while App Connector DNS discovery and route advertisement settle.
 
 To test failover, stop `tailscaled` on one connector, wait for Tailscale clients to detect the route change, and recheck the route or browser behavior from a client. Existing connections may break when a connector disappears. New connections should move to another online connector after Tailscale detects the route change.
 

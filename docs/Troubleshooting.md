@@ -125,9 +125,11 @@ Some low-cost VPS plans do not provide stable IPv6 egress. The bootstrap enables
 ```bash
 curl -6 https://ifconfig.co/ip
 sysctl net.ipv6.conf.all.forwarding
+dig +short chatgpt.com AAAA          # does the domain even publish IPv6?
+route -n get -inet6 <ip6>            # macOS; on Linux: ip -6 route get <ip6>
 ```
 
-If IPv6 is not needed, keep your domain checks focused on IPv4 until you have confirmed provider support.
+`check-client-routes.sh` inspects IPv6 (AAAA) routes as an **advisory** check (`*-ipv6` check ids) when a domain publishes them, and skips cleanly when it does not — IPv6 findings never fail the run, so IPv4 remains the pass/fail signal until you have confirmed provider IPv6 support.
 
 ## `tailscale up` Complains About Non-Default Flags
 

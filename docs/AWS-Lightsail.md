@@ -80,6 +80,7 @@ On a Linux client:
 ```
 
 The client checker tests every IPv4 A record for the selected AI domains and
-prints `[OK]`, `[WARN]`, or `[FAIL]` for each route. App Connector route
+prints `[OK]`, `[WARN]`, or `[FAIL]` for each route (it also inspects IPv6/AAAA
+advisorily when present; those findings never fail the run). App Connector route
 discovery can take 1-2 minutes after setup; rerun the client check if routes are
 not visible immediately.
