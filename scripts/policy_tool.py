@@ -46,6 +46,18 @@ BROAD_WILDCARD_BLOCKLIST = {
     "*.cloudflare.com",
     "*.googleapis.com",
 }
+# Broad CDN / shared-infrastructure base domains that WARN (not block): routing them
+# can pull unrelated traffic that happens to share the CDN through the connector. A
+# conservative, non-exhaustive starting set; matched against both `cdn.net` and
+# `*.cdn.net` (see normalize_domains). Blocked domains still fail; these only warn.
+BROAD_WILDCARD_WARNLIST = {
+    "cloudfront.net",
+    "amazonaws.com",
+    "googleusercontent.com",
+    "azureedge.net",
+    "akamaihd.net",
+    "fastly.net",
+}
 CONNECTOR_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 CONNECTOR_TAG_RE = re.compile(r"^tag:[a-z0-9]+(?:-[a-z0-9]+)*$")
 PLAN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
@@ -373,6 +385,22 @@ def normalize_domains(
                 "duplicate-domains",
                 "Duplicate domain entries were ignored.",
                 {"domains": sorted(duplicates)},
+            )
+        )
+
+    # Broad CDN / shared-infrastructure domains warn (do not block): `cdn.net` and
+    # `*.cdn.net` both match the base-domain warn set. `removeprefix("*.")` alone
+    # covers both forms. Domains are still returned; only surfaced when a caller
+    # collects findings (validate / plan / merge --report / apply --dry-run --report).
+    warned = sorted(d for d in clean if d.removeprefix("*.") in BROAD_WILDCARD_WARNLIST)
+    if warned and findings is not None:
+        findings.append(
+            finding(
+                "warn",
+                "broad-wildcard-warning",
+                "Broad CDN / shared-infrastructure domains can route unrelated traffic "
+                "through the connector; add them only if your use case needs them.",
+                {"domains": warned},
             )
         )
 

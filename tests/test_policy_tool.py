@@ -109,6 +109,32 @@ class PolicyToolTests(unittest.TestCase):
             tool.normalize_domains(["*.com"])
         self.assertEqual(tool.normalize_domains(["*.com"], allow_broad_wildcard=True), ["*.com"])
 
+    def test_broad_cdn_domains_warn_but_are_kept(self):
+        # A CDN / shared-infra domain WARNS (never blocks) and is still returned. Both the
+        # bare `cdn.net` and the `*.cdn.net` wildcard form match, case-insensitively.
+        for entry in ("cloudfront.net", "*.cloudfront.net", "*.CloudFront.net"):
+            with self.subTest(entry=entry):
+                fs: list = []
+                result = tool.normalize_domains([entry], findings=fs)
+                self.assertEqual(result, [entry.lower()])   # kept, not dropped or raised
+                self.assertTrue(any(f["id"] == "broad-wildcard-warning" and f["status"] == "warn" for f in fs))
+        # a non-CDN domain produces no such warning
+        fs2: list = []
+        tool.normalize_domains(["chatgpt.com"], findings=fs2)
+        self.assertFalse(any(f["id"] == "broad-wildcard-warning" for f in fs2))
+        # several warned domains produce EXACTLY ONE aggregate finding listing them all
+        # (guards against a per-domain-finding mutant).
+        fs3: list = []
+        tool.normalize_domains(["*.cloudfront.net", "amazonaws.com", "chatgpt.com"], findings=fs3)
+        warns = [f for f in fs3 if f["id"] == "broad-wildcard-warning"]
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0]["details"]["domains"], ["*.cloudfront.net", "amazonaws.com"])
+        # the shipped default domain pack must never trip the broad-wildcard warning.
+        default_domains = json.loads((ROOT / "policy" / "default-ai-domains.json").read_text(encoding="utf-8"))
+        fs4: list = []
+        tool.normalize_domains(default_domains, findings=fs4)
+        self.assertFalse(any(f["id"] == "broad-wildcard-warning" for f in fs4))
+
     def test_merge_empty_policy_builds_required_fields(self):
         merged = tool.merge_policy(
             {},
@@ -277,6 +303,27 @@ class PolicyToolTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["summary"]["warn"], 1)
         self.assertTrue(any(item["id"] == "duplicate-domains" for item in payload["findings"]))
+
+    def test_validate_warns_on_broad_cdn_domain(self):
+        # A CDN domain warns but validate still exits 0 (warnings don't fail the config).
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n*.cloudfront.net\n", encoding="utf-8")
+            result = self.run_policy_tool("validate", "--domains-file", str(domains), "--report", "json")
+        self.assertEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertGreaterEqual(payload["summary"]["warn"], 1)
+        self.assertTrue(any(item["id"] == "broad-wildcard-warning" for item in payload["findings"]))
+
+    def test_validate_fails_on_blocked_wildcard(self):
+        # A blocked broad wildcard still FAILS validate (exit 1) -- warn-list did not soften it.
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("*.com\n", encoding="utf-8")
+            result = self.run_policy_tool("validate", "--domains-file", str(domains), "--report", "json")
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertTrue(any(item["status"] == "fail" for item in payload["findings"]))
 
     def test_validate_combined_policy_and_connector_config(self):
         with tempfile.TemporaryDirectory() as tmp:
