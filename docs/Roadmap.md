@@ -23,9 +23,9 @@ Every item below is tagged so the compatibility impact is explicit up front.
 Highest user value first.
 
 - **Custom connector-tag detection in `diagnose.sh`.** `1.x additive-safe`. (**done**)
-  Today diagnostics assume the `tag:ai-egress-*` convention. Prefer the tag from
-  `generated/connector-identity.env`, then a `--connector-tag` flag, then fall
-  back to the convention.
+  Diagnostics no longer assume the `tag:ai-egress-*` convention; detection
+  precedence is the `--connector-tag` flag, then the `CONNECTOR_TAG` environment
+  variable, then `generated/connector-identity.env`, then the convention.
   *Acceptance:* diagnose works against a non-`ai-egress-*` tag with no regression
   to the default path; covered by fake-command tests.
 - **`FAILOVER_NOTIFY_CMD` hook.** `1.x additive-safe`. (**done**)
@@ -36,7 +36,7 @@ Highest user value first.
 - **macOS CI job.** `1.x additive-safe`, high maintainer value — **land early.** (**done**)
   A `macos-*` runner running `bash -n`, the smoke test, and a shell-test subset
   to cover Bash 3.2 + BSD userland (`stat -f`, `route -n get`) that only
-  fake-command tests exercise today. This protects the shared-shell-library
+  fake-command tests exercised before this job. This protects the shared-shell-library
   migration (see design docs) as real shell code starts moving.
   *Acceptance:* a green macOS job on the matrix; catches a BSD-only regression.
 - **Broad-wildcard blocklist + warn list.** `1.x additive-safe`. (**done**)
@@ -54,8 +54,8 @@ Highest user value first.
   using the attestation the release workflow already produces.
   *Acceptance:* verify runs when `gh` exists; absence degrades gracefully.
 - **OpenRC service example.** `1.x additive-safe`. (**done**)
-  `docs/examples/` currently has systemd/launchd/cron; bootstrap supports Alpine,
-  so add an OpenRC unit.
+  `docs/examples/` previously had only systemd/launchd/cron; bootstrap supports
+  Alpine, so OpenRC init scripts now ship alongside them.
   *Acceptance:* an OpenRC service file under `docs/examples/` that starts the
   controller/monitor on Alpine, referenced from the examples README.
 - **Remove deprecated `policy_tool.py apply`.** `1.x allowed exception`. (**done**)

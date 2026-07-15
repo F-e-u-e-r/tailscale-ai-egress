@@ -75,15 +75,21 @@ TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1 # skip gh provenance verification (see be
 against the release `SHA256SUMS`. If [GitHub CLI](https://cli.github.com/) `gh`
 (>= 2.93.0) is on `PATH`, it then runs `gh attestation verify` on the tarball,
 narrowed to the repo's `.github/workflows/release.yml` on `refs/tags/<tag>` at
-`github.com`. This needs network access and a `gh` new enough to be free of the
-token-leak (GHSA-8xvp-7hj6-mcj9) and false-pass (GHSA-fgw4-v983-mgp8) advisories;
-2.93.0 is the first such release.
+`github.com`. This needs network access, a `gh` new enough to be free of the
+token-leak (GHSA-8xvp-7hj6-mcj9) and false-pass (GHSA-fgw4-v983-mgp8) advisories
+(2.93.0 is the first such release), and an **authenticated** `gh` —
+`gh attestation verify` requires a github.com credential (`gh auth login` or
+`GH_TOKEN`) even for public repositories.
 
 - `gh` absent, older than 2.93.0, or reporting an unrecognized version → the
   installer prints a note and proceeds on the checksum alone (never fails for
   this reason). The vulnerable command is never invoked.
-- `gh` present and usable but the attestation is rejected → the install aborts,
-  matching the checksum's fail-closed posture.
+- `gh` new enough but **not authenticated** (gh's documented "requires
+  authentication" exit code 4) → the installer prints a note and proceeds on the
+  checksum alone. Run `gh auth login` (or set `GH_TOKEN`) to enable provenance
+  verification.
+- `gh` present, usable, and authenticated but the verification fails → the
+  install aborts, matching the checksum's fail-closed posture.
 - **`TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1`** skips attestation entirely, even
   when a usable `gh` is present. Use it for offline installs or a non-GitHub
   mirror. The `SHA256SUMS` checksum still runs, but **publisher provenance is no

@@ -134,7 +134,7 @@ runs:
 - [ ] Verify the release has the three artifacts plus `SHA256SUMS`.
 - [ ] Verify the release notes match the changelog section.
 - [ ] Download an artifact and re-check its checksum against `SHA256SUMS`.
-- [ ] With `gh` (>= 2.93.0), confirm the attestation `install.sh` relies on
+- [ ] With an authenticated `gh` (>= 2.93.0; `gh auth login`), confirm the attestation `install.sh` relies on
       verifies for the real `tar.gz` asset — the same check the installer runs:
 
       ```bash

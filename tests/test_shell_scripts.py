@@ -507,6 +507,29 @@ class ShellScriptTests(unittest.TestCase):
         )
         self.assertNotIn("fake bootstrap", result.stdout)
 
+    def test_install_attestation_unauthenticated_gh_degrades(self):
+        # gh exit code 4 is its documented "requires authentication" code:
+        # `gh attestation verify` needs a github.com credential even for public
+        # repos, and a fresh host commonly has gh installed but never logged in.
+        # That is inability-to-check, not a rejection -> checksum-only with a
+        # loud note, NOT a fatal abort (verify_exit=1 above stays fatal).
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.94.0", verify_exit=4,
+                calls_log=Path(tmp) / "gh-calls.log",
+            )
+            result, calls = self._run_install(tmp, fx, check=True)
+
+        self.assertIn("gh is not authenticated for github.com", result.stdout)
+        self.assertNotIn("attestation verification failed", result.stderr)
+        # The verify was attempted exactly once (the auth failure happened inside
+        # gh, not via a skipped call), then the install degraded and completed.
+        self.assertEqual(
+            len([c for c in calls if c["argv"][:2] == ["attestation", "verify"]]), 1
+        )
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
     def test_install_attestation_opt_out_skips(self):
         # Opt-out short-circuits before ANY gh call (empty call log), even with a
         # usable gh present.
