@@ -66,8 +66,10 @@ window for a fix before any public write-up.
 
 There is no analytics, phone-home, crash reporting, or update check. The project
 operates no servers. Every network call is either to your own infrastructure,
-your OS package mirrors, Tailscale's own services, or well-known public IP/ASN
-lookups used by diagnostics. The full inventory is in [PRIVACY.md](PRIVACY.md).
+your OS package mirrors, Tailscale's own services, GitHub's release-download /
+branch-archive / attestation (API + TUF) endpoints used by `install.sh`, or
+well-known public IP/ASN lookups used by diagnostics. The full inventory is in
+[PRIVACY.md](PRIVACY.md).
 
 ## Secret Handling
 
