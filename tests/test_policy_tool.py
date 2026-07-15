@@ -460,6 +460,56 @@ class PolicyToolTests(unittest.TestCase):
         self.assertIn("Removed", root.stdout)
         self.assertIn("apply-plan", root.stdout)
 
+    def _no_cred_env(self):
+        # Neutralize any host credential env vars so token tests are deterministic.
+        return mock.patch.dict(
+            os.environ,
+            {
+                "TAILSCALE_API_KEY": "",
+                "TAILSCALE_OAUTH_CLIENT_ID": "",
+                "TAILSCALE_OAUTH_CLIENT_SECRET": "",
+                "TAILSCALE_API_AUTH": "bearer",
+            },
+        )
+
+    def test_get_api_token_falls_back_to_oauth_when_no_api_key(self):
+        args = argparse.Namespace(
+            api_key=None, oauth_client_id="cid", oauth_client_secret="csec",
+            oauth_scopes=None, prompt_token=False,
+        )
+        with self._no_cred_env():
+            with mock.patch.object(tool, "get_oauth_token", return_value="oauth-tok") as goto:
+                token, mode = tool.get_api_token(args)
+        self.assertEqual((token, mode), ("oauth-tok", "bearer"))
+        goto.assert_called_once_with("cid", "csec", mock.ANY)
+
+    def test_get_api_token_missing_credential_raises(self):
+        args = argparse.Namespace(
+            api_key=None, oauth_client_id=None, oauth_client_secret=None,
+            oauth_scopes=None, prompt_token=False,
+        )
+        with self._no_cred_env():
+            with self.assertRaisesRegex(tool.PolicyError, "Missing credential"):
+                tool.get_api_token(args)
+
+    def test_tailscale_api_bearer_falls_back_to_basic_on_401(self):
+        with mock.patch.object(
+            tool,
+            "http_request",
+            side_effect=[
+                (401, "unauthorized", {}),
+                (200, "ok", {"ETag": "x"}),
+            ],
+        ) as hr:
+            status, text, used_mode, headers = tool.tailscale_api(
+                "POST", "/tailnet/-/acl", token="tskey-api-x", token_mode="bearer", body="{}",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(used_mode, "basic")
+        self.assertEqual(hr.call_count, 2)
+        self.assertEqual(hr.call_args_list[0].kwargs["token_mode"], "bearer")
+        self.assertEqual(hr.call_args_list[1].kwargs["token_mode"], "basic")
+
     def test_restore_policy_dry_run_validates_and_prints_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             backup = Path(tmp) / "backup.hujson"
