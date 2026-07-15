@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import select
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -241,56 +242,333 @@ class ShellScriptTests(unittest.TestCase):
 
         self.assertIn("Usage: ./bootstrap.sh", result.stdout)
 
+    def _run_install(self, tmp, fx, *, args=("--dry-run",), check=None, **overrides):
+        """Run install.sh in cwd=tmp with the fake bin on PATH; return (result, calls).
+        `calls` is the parsed fake-gh call log (empty if gh was never invoked)."""
+        calls_log = Path(tmp) / "gh-calls.log"
+        env = self._install_env(fx["fake_bin"], **overrides)
+        result = subprocess.run(
+            ["bash", str(ROOT / "install.sh"), *args],
+            cwd=tmp,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=bool(check),
+        )
+        _, logged = self._capture_log(calls_log)
+        return result, self._parse_gh_calls(logged)
+
     def test_install_wrapper_downloads_and_verifies_release_asset(self):
-        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-        asset_name = f"tailscale-ai-egress-{version}.tar.gz"
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(tmp, fx, check=True)
+
+        out = result.stdout
+        version = fx["version"]
+        asset_name = fx["asset_name"]
+        self.assertIn(
+            f"Downloading https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/download/v{version}/{asset_name}",
+            out,
+        )
+        self.assertIn(f"{asset_name}: OK", out)
+        self.assertIn("fake bootstrap --dry-run", out)
+        # Exactly one verify with the EXACT hardened argv + telemetry opt-out.
+        self._assert_single_verify(
+            calls, slug="F-e-u-e-r/tailscale-ai-egress", version=version, asset_name=asset_name
+        )
+        # Every gh invocation (the version probe too) disables telemetry.
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["telemetry"], "GH_TELEMETRY=false")
+        # Order: checksum success -> attestation verify -> extraction/bootstrap.
+        self.assertLess(out.index(f"{asset_name}: OK"), out.index("Verifying release attestation"))
+        self.assertLess(out.index("Verifying release attestation"), out.index("fake bootstrap"))
+
+    def test_install_attestation_uses_fork_repo_slug(self):
+        # A custom fork URL with a trailing slash derives owner/repo (not a
+        # hardcoded default) and parses the trailing slash correctly.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.95.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(
+                tmp, fx, check=True,
+                TAILSCALE_AI_EGRESS_REPO="https://github.com/custom-owner/custom-repo/",
+            )
+
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+        self._assert_single_verify(
+            calls, slug="custom-owner/custom-repo", version=fx["version"],
+            asset_name=fx["asset_name"],
+        )
+        flat = " ".join(a for c in calls for a in c["argv"])
+        self.assertNotIn("F-e-u-e-r", flat)
+
+    def test_install_attestation_dot_git_repo_slug(self):
+        # A `.git`-suffixed fork URL strips the suffix to owner/repo.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(
+                tmp, fx, check=True,
+                TAILSCALE_AI_EGRESS_REPO="https://github.com/custom-owner/custom-repo.git",
+            )
+
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+        self._assert_single_verify(
+            calls, slug="custom-owner/custom-repo", version=fx["version"],
+            asset_name=fx["asset_name"],
+        )
+
+    def test_install_attestation_future_major_gh_verifies(self):
+        # A future major (>= 3) is accepted -- the version floor is numeric, not lexical.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="3.0.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            _, calls = self._run_install(tmp, fx, check=True)
+
+        self._assert_single_verify(
+            calls, slug="F-e-u-e-r/tailscale-ai-egress", version=fx["version"],
+            asset_name=fx["asset_name"],
+        )
+
+    def test_install_attestation_absent_gh_skips(self):
+        # Reliable absence: PATH holds ONLY an isolated dir of symlinked real
+        # tools plus the fake curl -- no gh anywhere -- and Bash is invoked by
+        # absolute path so it does not depend on PATH resolution. `gzip` is
+        # included because GNU `tar -xzf` forks it (macOS bsdtar would hide that).
+        sha_tool = shutil.which("sha256sum") or shutil.which("shasum")
+        real_bash = shutil.which("bash")
+        if sha_tool is None or real_bash is None:
+            self.skipTest("sha256sum/shasum or bash not found on PATH")
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            release_root = tmp_path / "release-src" / f"tailscale-ai-egress-{version}"
-            release_root.mkdir(parents=True)
-            bootstrap = release_root / "bootstrap.sh"
-            bootstrap.write_text("#!/usr/bin/env bash\nprintf 'fake bootstrap %s\\n' \"$*\"\n", encoding="utf-8")
-            bootstrap.chmod(0o755)
+            fx = self._make_release_fixture(tmp_path)
+            isolated = tmp_path / "isolated"
+            isolated.mkdir()
+            for tool in ("sh", "env", "tar", "gzip", "mktemp", "grep", "cat", "cp", "rm", "dirname"):
+                real = shutil.which(tool)
+                if real is None:
+                    self.skipTest(f"required tool {tool!r} not found on PATH")
+                os.symlink(real, isolated / tool)
+            os.symlink(real_bash, isolated / "bash")
+            os.symlink(sha_tool, isolated / Path(sha_tool).name)
+            os.symlink(fx["fake_bin"] / "curl", isolated / "curl")
 
-            asset = tmp_path / asset_name
-            subprocess.run(["tar", "-czf", str(asset), "-C", str(tmp_path / "release-src"), release_root.name], check=True)
-            digest = hashlib.sha256(asset.read_bytes()).hexdigest()
-            sums = tmp_path / "SHA256SUMS"
-            sums.write_text(f"{digest}  {asset_name}\n", encoding="utf-8")
-
-            fake_bin = tmp_path / "bin"
-            fake_bin.mkdir()
-            self._write_fake_command(
-                fake_bin,
-                "curl",
-                f"""#!/bin/sh
-if [ "$1" != "-fsSLo" ]; then
-  echo "unexpected curl args: $*" >&2
-  exit 2
-fi
-out="$2"
-url="$3"
-case "$url" in
-  */SHA256SUMS) cp {sums} "$out" ;;
-  */{asset_name}) cp {asset} "$out" ;;
-  *) echo "unexpected URL: $url" >&2; exit 2 ;;
-esac
-""",
-            )
-            env = os.environ.copy()
-            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            path = str(isolated)
+            self.assertIsNone(shutil.which("gh", path=path))
+            env = {"PATH": path}
+            for key in ("HOME", "TMPDIR", "LANG", "LC_ALL"):
+                if key in os.environ:
+                    env[key] = os.environ[key]
             result = subprocess.run(
-                ["bash", str(ROOT / "install.sh"), "--dry-run"],
+                [real_bash, str(ROOT / "install.sh"), "--dry-run"],
                 cwd=tmp,
                 env=env,
                 text=True,
                 capture_output=True,
-                check=True,
             )
 
-        self.assertIn(f"Downloading https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/download/v{version}/{asset_name}", result.stdout)
-        self.assertIn(f"{asset_name}: OK", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh not found", result.stdout)
         self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_old_gh_skips(self):
+        # gh present but < 2.93.0 -> skip; the vulnerable verify is never invoked
+        # (the version probe still runs, so the log is non-empty but has no verify).
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.92.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(tmp, fx, check=True)
+
+        self.assertIn("older than 2.93.0", result.stdout)
+        self.assertEqual([c for c in calls if c["argv"][:2] == ["attestation", "verify"]], [])
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_unparseable_gh_skips(self):
+        # A non-numeric gh version (dev build) is unrecognized -> skip, not fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="DEV", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(tmp, fx, check=True)
+
+        self.assertIn("older than 2.93.0", result.stdout)
+        self.assertEqual([c for c in calls if c["argv"][:2] == ["attestation", "verify"]], [])
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_failed_version_probe_skips(self):
+        # `gh --version` exiting non-zero is treated as unusable -> skip, not fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", version_exit=1,
+                calls_log=Path(tmp) / "gh-calls.log",
+            )
+            result, calls = self._run_install(tmp, fx, check=True)
+
+        self.assertIn("older than 2.93.0", result.stdout)
+        self.assertEqual([c for c in calls if c["argv"][:2] == ["attestation", "verify"]], [])
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_verify_failure_is_fatal(self):
+        # A usable gh whose verify FAILS aborts before extraction/bootstrap.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", verify_exit=1,
+                calls_log=Path(tmp) / "gh-calls.log",
+            )
+            result, calls = self._run_install(tmp, fx)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("attestation verification failed", result.stderr)
+        self.assertEqual(
+            len([c for c in calls if c["argv"][:2] == ["attestation", "verify"]]), 1
+        )
+        self.assertNotIn("fake bootstrap", result.stdout)
+
+    def test_install_attestation_opt_out_skips(self):
+        # Opt-out short-circuits before ANY gh call (empty call log), even with a
+        # usable gh present.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(
+                tmp, fx, check=True, TAILSCALE_AI_EGRESS_SKIP_ATTESTATION="1"
+            )
+
+        self.assertIn("skipped (TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1)", result.stdout)
+        self.assertEqual(calls, [], "gh must not be invoked at all when opted out")
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_opt_out_bypasses_non_github_mirror(self):
+        # Opt-out must bypass slug derivation entirely (a non-GitHub mirror URL).
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(
+                tmp, fx, check=True,
+                TAILSCALE_AI_EGRESS_REPO="https://gitlab.com/owner/repo",
+                TAILSCALE_AI_EGRESS_SKIP_ATTESTATION="1",
+            )
+
+        self.assertIn("skipped (TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1)", result.stdout)
+        self.assertNotIn("could not derive", result.stderr)
+        self.assertEqual(calls, [], "gh must not be invoked at all when opted out")
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_non_github_url_variants_are_fatal(self):
+        # A usable gh + a REPO_URL that is not exactly https://github.com/<o>/<r>
+        # (no opt-out) fails closed BEFORE any verify: wrong host, look-alike host,
+        # owner-only, and extra path segments must all be rejected.
+        for repo_url in (
+            "https://gitlab.com/owner/repo",
+            "https://github.com.evil/owner/repo",
+            "https://github.example.com/owner/repo",
+            "https://github.com/owner",
+            "https://github.com/owner/repo/tree/main",
+        ):
+            with self.subTest(repo_url=repo_url), tempfile.TemporaryDirectory() as tmp:
+                fx = self._make_release_fixture(Path(tmp))
+                self._write_fake_gh(
+                    fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+                )
+                result, calls = self._run_install(
+                    tmp, fx, TAILSCALE_AI_EGRESS_REPO=repo_url
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("could not derive", result.stderr)
+                self.assertEqual(
+                    [c for c in calls if c["argv"][:2] == ["attestation", "verify"]], []
+                )
+                self.assertNotIn("fake bootstrap", result.stdout)
+
+    def test_install_attestation_branch_path_skips_gh(self):
+        # The unverified branch path never touches gh, even when a usable gh exists.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._make_release_fixture(Path(tmp))
+            self._write_fake_gh(
+                fx["fake_bin"], version="2.93.0", calls_log=Path(tmp) / "gh-calls.log"
+            )
+            result, calls = self._run_install(
+                tmp, fx, check=True, TAILSCALE_AI_EGRESS_BRANCH="main"
+            )
+
+        self.assertIn("downloading unverified branch archive", result.stderr)
+        self.assertEqual(calls, [], "branch path must not invoke gh at all")
+        self.assertIn("fake bootstrap --dry-run", result.stdout)
+
+    def test_install_attestation_version_gate_units(self):
+        # Direct contract test of gh_attestation_supported across the grammar.
+        func = self._install_sh_function("gh_attestation_supported")
+        cases = {
+            "2.93.0": True, "2.93.5": True, "2.94.0": True, "2.100.0": True,
+            "3.0.0": True, "10.0.0": True, "2.099.0": True, "2.93.0 (extra)": True,
+            "2.92.0": False, "2.9.0": False, "2.08.0": False, "1.99.99": False,
+            "2.93": False, "2.93.0.1": False, "2.93.0.": False, "2.93.0..": False,
+            "2..93": False, ".2.93": False, "2.93.0-rc.1": False, "2.93.0+local": False,
+            "DEV": False, "": False,
+        }
+        for ver, expected in cases.items():
+            with self.subTest(version=ver):
+                driver = (
+                    f'gh() {{ printf "gh version {ver}\\n"; }}\n'
+                    f"{func}\n"
+                    "if gh_attestation_supported; then echo SUPPORTED; else echo skip; fi\n"
+                )
+                r = subprocess.run(["bash", "-c", driver], text=True, capture_output=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                got = "SUPPORTED" in r.stdout
+                self.assertEqual(got, expected, f"{ver!r}: out={r.stdout!r} err={r.stderr!r}")
+
+    def test_install_attestation_repo_slug_units(self):
+        # Direct contract test of derive_repo_slug: HTTPS-github.com only.
+        func = self._install_sh_function("derive_repo_slug")
+        cases = {
+            "https://github.com/F-e-u-e-r/tailscale-ai-egress": "F-e-u-e-r/tailscale-ai-egress",
+            "https://github.com/owner/repo/": "owner/repo",
+            "https://github.com/owner/repo.git": "owner/repo",
+            "https://github.com/owner/repo.git/": "owner/repo",
+            "https://github.com/owner/repo.js": "owner/repo.js",
+            "http://github.com/owner/repo": None,
+            "git@github.com:owner/repo.git": None,
+            "https://gitlab.com/owner/repo": None,
+            "https://github.com.evil/owner/repo": None,
+            "https://github.example.com/owner/repo": None,
+            "https://github.com/owner": None,
+            "https://github.com/owner/repo/tree/main": None,
+            "https://github.com/owner/": None,
+            "https://github.com/": None,
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                driver = (
+                    f"{func}\n"
+                    f'if out="$(derive_repo_slug "{url}")"; then printf "OK:%s" "$out"; '
+                    'else printf REJECT; fi\n'
+                )
+                r = subprocess.run(["bash", "-c", driver], text=True, capture_output=True)
+                if expected is None:
+                    self.assertEqual(r.stdout, "REJECT", f"{url}: {r.stdout!r} {r.stderr!r}")
+                else:
+                    self.assertEqual(r.stdout, f"OK:{expected}", f"{url}: {r.stdout!r} {r.stderr!r}")
 
     def test_bootstrap_uses_ai_egress_domains_file_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -612,6 +890,162 @@ cat "{tmp}/connector-identity.env"
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
         return path
+
+    def _make_release_fixture(self, tmp_path):
+        """Build a fake release tarball + SHA256SUMS and a fake `curl` that
+        serves them for the release (-fsSLo) and branch (-fsSL) download forms.
+        Returns dict(version, asset_name, asset, sums, fake_bin)."""
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        asset_name = f"tailscale-ai-egress-{version}.tar.gz"
+        release_root = tmp_path / "release-src" / f"tailscale-ai-egress-{version}"
+        release_root.mkdir(parents=True)
+        bootstrap = release_root / "bootstrap.sh"
+        bootstrap.write_text(
+            "#!/usr/bin/env bash\nprintf 'fake bootstrap %s\\n' \"$*\"\n",
+            encoding="utf-8",
+        )
+        bootstrap.chmod(0o755)
+        asset = tmp_path / asset_name
+        subprocess.run(
+            ["tar", "-czf", str(asset), "-C", str(tmp_path / "release-src"), release_root.name],
+            check=True,
+        )
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+        sums = tmp_path / "SHA256SUMS"
+        sums.write_text(f"{digest}  {asset_name}\n", encoding="utf-8")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        self._write_fake_command(
+            fake_bin,
+            "curl",
+            f"""#!/bin/sh
+if [ "$1" = "-fsSLo" ]; then
+  out="$2"
+  url="$3"
+  case "$url" in
+    */SHA256SUMS) cp {sums} "$out" ;;
+    */{asset_name}) cp {asset} "$out" ;;
+    *) echo "unexpected URL: $url" >&2; exit 2 ;;
+  esac
+elif [ "$1" = "-fsSL" ]; then
+  url="$2"
+  case "$url" in
+    */archive/refs/heads/*.tar.gz) cat {asset} ;;
+    *) echo "unexpected URL: $url" >&2; exit 2 ;;
+  esac
+else
+  echo "unexpected curl args: $*" >&2
+  exit 2
+fi
+""",
+        )
+        return {
+            "version": version,
+            "asset_name": asset_name,
+            "asset": asset,
+            "sums": sums,
+            "fake_bin": fake_bin,
+        }
+
+    def _write_fake_gh(self, fake_bin, *, version="2.93.0", verify_exit=0,
+                       version_exit=0, calls_log=None):
+        """Write a fake `gh` that logs EVERY invocation to calls_log -- the
+        GH_TELEMETRY env value plus each argument with `\\037` (unit-separator)
+        boundaries -- then answers `--version` and `attestation verify`. An
+        absent/empty calls_log proves gh was never run; the boundaries let a test
+        assert the exact argv vector (so `--hostname github.com.evil` or a dropped
+        flag fails) and the telemetry opt-out, not just substrings."""
+        log_block = ""
+        if calls_log is not None:
+            log_block = (
+                "{ "
+                "printf 'ENV\\037GH_TELEMETRY=%s\\n' \"${GH_TELEMETRY-<unset>}\"; "
+                "printf 'ARGV'; for a in \"$@\"; do printf '\\037%s' \"$a\"; done; "
+                "printf '\\n'; "
+                f"}} >> {calls_log}\n"
+            )
+        self._write_fake_command(
+            fake_bin,
+            "gh",
+            f"""#!/bin/sh
+{log_block}if [ "$1" = "--version" ]; then
+  printf 'gh version {version} (2026-01-01)\\n'
+  printf 'https://github.com/cli/cli/releases/tag/v{version}\\n'
+  exit {version_exit}
+fi
+if [ "$1" = "attestation" ] && [ "$2" = "verify" ]; then
+  exit {verify_exit}
+fi
+echo "unexpected gh args: $*" >&2
+exit 3
+""",
+        )
+
+    def _install_sh_function(self, name):
+        """Extract a top-level `name() { ... }` shell function from install.sh so
+        a test can source and drive it in isolation (the function closes with a
+        `}` at column 0; the internal `}` all live inside `${...}` on their line)."""
+        lines = (ROOT / "install.sh").read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}()"))
+        out = [lines[start]]
+        for line in lines[start + 1:]:
+            out.append(line)
+            if line == "}":
+                break
+        return "\n".join(out)
+
+    def _parse_gh_calls(self, text):
+        """Parse a fake-gh calls log into [{'telemetry': str, 'argv': [str, ...]}]."""
+        calls = []
+        telemetry = None
+        for line in text.splitlines():
+            if line.startswith("ENV\x1f"):
+                telemetry = line.split("\x1f", 1)[1]
+            elif line.startswith("ARGV"):
+                calls.append({"telemetry": telemetry, "argv": line.split("\x1f")[1:]})
+                telemetry = None
+        return calls
+
+    def _assert_single_verify(self, calls, *, slug, version, asset_name):
+        """Assert exactly one `attestation verify` with the EXACT hardened argv
+        vector and the telemetry opt-out. Returns that call."""
+        verifies = [c for c in calls if c["argv"][:2] == ["attestation", "verify"]]
+        self.assertEqual(len(verifies), 1, f"expected exactly one verify call: {calls}")
+        argv = verifies[0]["argv"]
+        self.assertTrue(argv[2].endswith(asset_name), f"tarball arg: {argv[2]}")
+        self.assertEqual(
+            argv[3:],
+            [
+                "--repo", slug,
+                "--signer-workflow", f"{slug}/.github/workflows/release.yml",
+                "--source-ref", f"refs/tags/v{version}",
+                "--hostname", "github.com",
+            ],
+        )
+        self.assertEqual(verifies[0]["telemetry"], "GH_TELEMETRY=false")
+        return verifies[0]
+
+    def _capture_log(self, path):
+        """Snapshot a fake-command log's (exists, text) before the enclosing
+        TemporaryDirectory is cleaned up -- assertions run after the `with`."""
+        if path.exists():
+            return True, path.read_text(encoding="utf-8")
+        return False, ""
+
+    def _install_env(self, fake_bin, **overrides):
+        """A clean environment for install.sh tests: the installer's env knobs
+        cleared, the fake bin prepended to PATH, then explicit overrides."""
+        env = os.environ.copy()
+        for key in (
+            "TAILSCALE_AI_EGRESS_BRANCH",
+            "TAILSCALE_AI_EGRESS_VERSION",
+            "TAILSCALE_AI_EGRESS_REPO",
+            "TAILSCALE_AI_EGRESS_SKIP_ATTESTATION",
+        ):
+            env.pop(key, None)
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        env.update({key: str(value) for key, value in overrides.items()})
+        return env
 
     def _bootstrap_dry_run_env(self, tmp, *, self_status=None):
         fake_bin = Path(tmp) / "bin"

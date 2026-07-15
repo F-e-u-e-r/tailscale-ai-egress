@@ -126,12 +126,23 @@ git push origin vX.Y.Z
 ```
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
-`tar.gz` + `zip` + `SHA256SUMS`, extracts the matching `CHANGELOG.md` section as
-release notes, and creates the GitHub release. After it runs:
+`tar.gz` + `zip` + `SHA256SUMS`, produces a **build-provenance attestation** for
+those artifacts (`actions/attest`, SLSA provenance v1), extracts the matching
+`CHANGELOG.md` section as release notes, and creates the GitHub release. After it
+runs:
 
 - [ ] Verify the release has the three artifacts plus `SHA256SUMS`.
 - [ ] Verify the release notes match the changelog section.
 - [ ] Download an artifact and re-check its checksum against `SHA256SUMS`.
+- [ ] With `gh` (>= 2.93.0), confirm the attestation `install.sh` relies on
+      verifies for the real `tar.gz` asset — the same check the installer runs:
+
+      ```bash
+      gh attestation verify tailscale-ai-egress-<version>.tar.gz \
+        --repo F-e-u-e-r/tailscale-ai-egress \
+        --signer-workflow F-e-u-e-r/tailscale-ai-egress/.github/workflows/release.yml \
+        --source-ref refs/tags/v<version> --hostname github.com
+      ```
 
 ## 12. Post-release
 

@@ -15,6 +15,17 @@ both Python CLIs report it with `--version`.
 
 ### Added
 
+- `install.sh`: **optional build-provenance attestation verification** for release
+  downloads. When [GitHub CLI](https://cli.github.com/) `gh` (>= 2.93.0) is present, the
+  installer runs `gh attestation verify` on the downloaded release tarball after the
+  `SHA256SUMS` checksum, narrowed to this repo's `.github/workflows/release.yml` on the
+  exact `refs/tags/<tag>` at `github.com`. A missing, older, or unrecognized `gh` degrades
+  to checksum-only and never fails for that reason (the token-leak GHSA-8xvp-7hj6-mcj9 and
+  false-pass GHSA-fgw4-v983-mgp8 advisories are avoided by requiring 2.93.0); an attestation
+  a usable `gh` actively rejects is fatal. `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` opts out
+  (offline installs or a non-GitHub mirror) — the checksum still runs, publisher provenance
+  does not. The release workflow already produces these attestations, so no `release.yml`
+  change was needed; the unverified `TAILSCALE_AI_EGRESS_BRANCH` path is unaffected.
 - `check-client-routes.sh`: an **advisory IPv6 route check**. When a selected AI domain
   (or the baseline) publishes AAAA records, the checker resolves them and inspects the
   IPv6 route (`route -n get -inet6` on macOS, `ip -6 route get` on Linux) under new

@@ -32,7 +32,7 @@ Choose the default `common` domains, answer `N` to Advanced Mode, paste the gene
 - **📊 Connector HA monitoring + metrics** — `monitor-connectors.sh` reports each connector's online / reachability / route state plus per-connector metrics (Tx/Rx counters, liveness, `tailscale ping` latency, connection path). Emit a node_exporter / Prometheus textfile with `--prometheus-textfile`, or read one connector with `health_check.py peer-metrics`.
 - **🧭 Guided setup, opt-in automation** — a manual policy snippet by default; opt in to auditable API-driven policy (`plan` → `apply-plan`) only when you choose, never automatically.
 - **🩺 Diagnostics, JSON-ready** — `diagnose.sh` (VPS) and `check-client-routes.sh` (client) verify routing end to end; both support `--json` for scripting.
-- **🔒 Security-first** — no telemetry; secrets only from env / hidden input; release-artifact checksum verification; auditable policy plans with `If-Match` concurrency checks; and a health engine hardened to fail closed on malformed status.
+- **🔒 Security-first** — no telemetry; secrets only from env / hidden input; release-artifact checksum plus optional `gh` build-provenance attestation verification; auditable policy plans with `If-Match` concurrency checks; and a health engine hardened to fail closed on malformed status.
 
 ## Contents
 
@@ -421,7 +421,7 @@ See [SECURITY.md](SECURITY.md) for the full security model. Highlights:
 
 - Auth keys and API tokens are read from environment variables or hidden terminal input and are never written to repo files or logs. Use `tskey-api-...` only for Admin Console policy updates and `tskey-auth-...` only for registering the VPS node.
 - `tailscale up` uses `--auth-key=file:...` so keys never appear in shell history. Non-interactive runs must set `TAILSCALE_AUTHKEY`, or the installer exits instead of waiting for browser login.
-- `install.sh` verifies downloaded release artifacts against the release `SHA256SUMS` by default, and `bootstrap.sh` will not pass `tailscale up --reset` on a fresh node without asking first.
+- `install.sh` verifies downloaded release artifacts against the release `SHA256SUMS` by default. When [GitHub CLI](https://cli.github.com/) `gh` (>= 2.93.0) is present it additionally verifies the release tarball's **build provenance attestation**, narrowed to this repo's release workflow on the exact tag; a missing, older, or unrecognized `gh` degrades to checksum-only (never failing), while an attestation that a usable `gh` actively rejects is fatal. Set `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` to opt out (e.g. offline installs or a non-GitHub mirror) — the checksum still runs, but publisher provenance is no longer verified. `bootstrap.sh` will not pass `tailscale up --reset` on a fresh node without asking first.
 - Advanced Mode writes an auditable plan (with the original `current.hujson` and SHA-256 checks) before applying, and `apply-plan` uses the planning `ETag` with `If-Match` to detect concurrent edits instead of overwriting them silently.
 - The generated policy grants `autogroup:member` access to `autogroup:internet` and auto-approves `0.0.0.0/0` and `::/0` for the connector tag — required for broad app-connector egress, but it widens a restrictive tailnet policy, so protect ownership of `tag:ai-egress-*`.
 - Manual mode needs no Tailscale API credential. This project collects no telemetry and sends no logs to project-owned servers.
