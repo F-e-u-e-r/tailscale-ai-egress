@@ -70,20 +70,32 @@ Highest user value first.
 ## Next — v1.3 (`1.x additive-safe`)
 
 - **Connector-failover apply mode (flagship).** `1.x additive-safe` (new opt-in
-  script / flag). Design-first — see
+  script + a connector-scoped `policy_tool.py` planning subcommand). **Design
+  decided** — see
   [design/connector-failover-apply.md](design/connector-failover-apply.md).
-  Reuses the exit-node controller's observe-first / hysteresis / cooldown /
-  fail-closed / readback skeleton and the auditable `plan` / `apply-plan`
-  pipeline. Open question in the design doc: a new `failover-connectors.sh
-  --apply` (leaning toward this, to preserve the monitor's "never switches"
-  promise) vs. extending `monitor-connectors.sh`.
-  *Acceptance:* observe-only by default; `--apply` produces an auditable plan
-  bundle via `plan`/`apply-plan` and honors the design doc's fail-closed matrix;
-  fake-command tests cover the no-apply, apply, and fail-closed paths.
+  Same-tag native HA stays the default and recommended model, and the monitor
+  stays read-only. Apply mode is a separate ADVANCED mode — the **distinct-tag
+  active connector switch** — an operator-invoked, one-shot, auditable forced
+  selection of which connector pool (tag) serves the AI domain set, for the
+  online-but-bad cases native selection cannot see (wrong egress IP, degraded
+  provider path, provider quota, manual evacuation). It composes with native
+  HA (which keeps operating inside each pool) and does not replace it; there
+  is no automatic watcher in v1.3.
+  *Acceptance:* observe-only without `--apply` (report + plan bundle only);
+  the switch goes through `plan`/`apply-plan` (auditable, restorable) with
+  readback, honoring the design doc's fail-closed precondition matrix; the
+  same-tag default's behavior is untouched; the design doc's
+  pre-implementation gate is satisfied — its operator docs (deployment
+  models, migration both directions, rollback, warnings) are MERGED before
+  implementation work opens; fake-command tests cover the no-apply, apply,
+  fail-closed, and readback-mismatch paths.
 - **Multi-fallback support.** `1.x additive-safe`.
   `FALLBACK_EXIT_NODE` accepts a comma-separated list tried in order; state
   schema adds `nodes.fallbacks[]` and bumps `schema_version` to 2 while keeping
-  v1 read-compatibility. Coordinate the bump with apply mode's state changes.
+  v1 read-compatibility. The connector-switch apply mode keeps its own separate
+  state file (see
+  [design/connector-failover-apply.md](design/connector-failover-apply.md)), so
+  this bump is scoped to the exit-node controller's state alone.
   *Acceptance:* an ordered fallback list is tried in order; `schema_version: 2`
   state is written and pre-existing v1 state still reads; tests cover ordered
   fallback and the v1 read-compat path.
