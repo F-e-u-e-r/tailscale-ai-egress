@@ -22,43 +22,43 @@ Every item below is tagged so the compatibility impact is explicit up front.
 
 Highest user value first.
 
-- **Custom connector-tag detection in `diagnose.sh`.** `1.x additive-safe`.
+- **Custom connector-tag detection in `diagnose.sh`.** `1.x additive-safe`. (**done**)
   Today diagnostics assume the `tag:ai-egress-*` convention. Prefer the tag from
   `generated/connector-identity.env`, then a `--connector-tag` flag, then fall
   back to the convention.
   *Acceptance:* diagnose works against a non-`ai-egress-*` tag with no regression
   to the default path; covered by fake-command tests.
-- **`FAILOVER_NOTIFY_CMD` hook.** `1.x additive-safe`.
+- **`FAILOVER_NOTIFY_CMD` hook.** `1.x additive-safe`. (**done**)
   Opt-in command run on switch success/failure, with `role` / `label` / `reason`
   passed via the environment. No telemetry, no server — just a user command.
   *Acceptance:* fires on switch with the documented environment; absence is a
   no-op; a failing hook never changes the switch outcome.
-- **macOS CI job.** `1.x additive-safe`, high maintainer value — **land early.**
+- **macOS CI job.** `1.x additive-safe`, high maintainer value — **land early.** (**done**)
   A `macos-*` runner running `bash -n`, the smoke test, and a shell-test subset
   to cover Bash 3.2 + BSD userland (`stat -f`, `route -n get`) that only
   fake-command tests exercise today. This protects the shared-shell-library
   migration (see design docs) as real shell code starts moving.
   *Acceptance:* a green macOS job on the matrix; catches a BSD-only regression.
-- **Broad-wildcard blocklist + warn list.** `1.x additive-safe`.
+- **Broad-wildcard blocklist + warn list.** `1.x additive-safe`. (**done**)
   Keep the fail-list, add a warn-list for CDN/infra wildcards
   (`cloudfront.net`, `amazonaws.com`, `googleusercontent.com`, `azureedge.net`,
   `akamaihd.net`, `fastly.net`, …) that warn rather than block.
   *Acceptance:* warned domains validate with a warning; blocked ones still fail;
   tests for both.
-- **IPv6 route check in `check-client-routes.sh`.** `1.x additive-safe`.
+- **IPv6 route check in `check-client-routes.sh`.** `1.x additive-safe`. (**done**)
   Add AAAA + `ip -6 route get` as a new check id; JSON schema only gains fields.
   *Acceptance:* new check id present; existing `schema_version: 1` consumers
   unaffected.
-- **`install.sh` optional attestation verify.** `1.x additive-safe`.
+- **`install.sh` optional attestation verify.** `1.x additive-safe`. (**done**)
   When `gh` is present, run `gh attestation verify` on the downloaded release,
   using the attestation the release workflow already produces.
   *Acceptance:* verify runs when `gh` exists; absence degrades gracefully.
-- **OpenRC service example.** `1.x additive-safe`.
+- **OpenRC service example.** `1.x additive-safe`. (**done**)
   `docs/examples/` currently has systemd/launchd/cron; bootstrap supports Alpine,
   so add an OpenRC unit.
   *Acceptance:* an OpenRC service file under `docs/examples/` that starts the
   controller/monitor on Alpine, referenced from the examples README.
-- **Remove deprecated `policy_tool.py apply`.** `1.x allowed exception`.
+- **Remove deprecated `policy_tool.py apply`.** `1.x allowed exception`. (**done**)
   [Stability](Stability.md) already flags it for removal; the CLI has printed a
   "deprecated; will be removed after one release" warning since v1.0, and v1.1.0
   has shipped. Use `plan` + `apply-plan`.
@@ -147,8 +147,8 @@ Per [Stability](Stability.md), to keep the trust boundary small:
 
 ## Process (any time)
 
-- **Dependabot** for the SHA-pinned GitHub Actions.
+- **Dependabot** for the SHA-pinned GitHub Actions. (**done**)
 - **Coverage ratchet** — the CI floor is now 70% (ratcheted up from 55%), focused
-  on `policy_tool` API error branches.
+  on `policy_tool` API error branches. (**done**)
 - **Bilingual doc drift check** in CI comparing the entrypoint lists in
-  `README.md` and `README.zh-HK.md`.
+  `README.md` and `README.zh-HK.md`. (**done**)
