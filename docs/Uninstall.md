@@ -30,7 +30,7 @@ python3 scripts/policy_tool.py list-plans
 python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id>
 ```
 
-Legacy backup restore (from the deprecated direct `apply`):
+Legacy backup restore (from the former direct `apply` command):
 
 ```bash
 ./rollback.sh --list

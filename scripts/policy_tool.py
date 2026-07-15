@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render, merge, and optionally apply a Tailscale app connector policy.
+"""Render, merge, validate, and plan/apply-plan a Tailscale app connector policy.
 
 This intentionally uses only the Python standard library so it can run on a
 fresh Linux VPS without installing Node packages.
@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 API_BASE = "https://api.tailscale.com/api/v2"
@@ -391,7 +391,7 @@ def normalize_domains(
     # Broad CDN / shared-infrastructure domains warn (do not block): `cdn.net` and
     # `*.cdn.net` both match the base-domain warn set. `removeprefix("*.")` alone
     # covers both forms. Domains are still returned; only surfaced when a caller
-    # collects findings (validate / plan / merge --report / apply --dry-run --report).
+    # collects findings (validate / plan / merge --report).
     warned = sorted(d for d in clean if d.removeprefix("*.") in BROAD_WILDCARD_WARNLIST)
     if warned and findings is not None:
         findings.append(
@@ -1655,123 +1655,13 @@ def list_policy_plans(args: argparse.Namespace) -> int:
     return 0
 
 
-def apply_policy(args: argparse.Namespace) -> int:
-    report = new_report("apply") if args.report else None
-    deprecated_message = (
-        "Direct 'apply' is deprecated and will be removed after one release; "
-        "use 'plan' then inspect the bundle and run 'apply-plan <plan-dir>'."
+def apply_removed(_args: argparse.Namespace) -> NoReturn:
+    # Migration tombstone: the direct 'apply' command was removed after its
+    # one-release deprecation. Auditable planning replaces it.
+    raise PolicyError(
+        "'apply' has been removed. Create an auditable bundle with 'plan', review "
+        "it, then run 'apply-plan <plan-dir>'. See docs/Stability.md."
     )
-    if report is not None:
-        add_finding(report, "warn", "apply-deprecated", deprecated_message)
-    else:
-        eprint(f"warning: {deprecated_message}")
-    domains, config_findings = validate_domain_config_for_args(args)
-    if report is not None:
-        add_findings(report, config_findings)
-    config_failure = first_failure(config_findings)
-    if config_failure is not None:
-        if report is not None:
-            emit_report(report, args.report, sys.stderr)
-            return 1
-        raise PolicyError(config_failure["message"])
-
-    token, token_mode = get_api_token(args)
-    path = tailnet_path(args.tailnet, "/acl")
-    status, current_text, used_mode, get_headers = tailscale_api("GET", path, token=token, token_mode=token_mode)
-    if status < 200 or status >= 300:
-        raise PolicyError(f"Could not fetch current policy ({status}): {safe_response_text(current_text)}")
-    etag = case_insensitive_header(get_headers, "ETag")
-
-    backup_path = write_backup(Path(args.backup_dir), current_text)
-    if report is not None:
-        add_finding(report, "info", "backup-saved", "Saved current policy backup.", {"path": str(backup_path)})
-    else:
-        eprint(f"Saved current policy backup: {backup_path}")
-
-    policy, policy_findings = validate_policy_text(current_text, connector_tag=args.connector_tag)
-    if report is not None:
-        add_findings(report, policy_findings)
-    policy_failure = first_failure(policy_findings)
-    if policy is None or policy_failure is not None:
-        if report is not None:
-            emit_report(report, args.report, sys.stderr)
-            return 1
-        raise PolicyError(policy_failure["message"] if policy_failure else "Could not parse current policy.")
-
-    merged = merge_with_report(
-        policy,
-        connector_name=args.connector_name,
-        connector_tag=args.connector_tag,
-        domains=domains,
-        tag_owner=args.tag_owner,
-        member_src=args.member_src,
-        report=report,
-    )
-    merged_text = dumps(merged)
-
-    if args.output:
-        try:
-            Path(args.output).write_text(merged_text, encoding="utf-8")
-        except OSError as exc:
-            raise PolicyError(f"Could not write {args.output}: {exc}") from exc
-        if report is not None:
-            add_finding(report, "info", "merged-policy-output", "Wrote merged policy output.", {"path": args.output})
-        else:
-            eprint(f"Wrote merged policy: {args.output}")
-
-    validate_path = tailnet_path(args.tailnet, "/acl/validate")
-    status, validate_text, used_mode, _ = tailscale_api(
-        "POST",
-        validate_path,
-        token=token,
-        token_mode=used_mode,
-        body=merged_text,
-        allow_basic_fallback=False,
-    )
-    if status < 200 or status >= 300:
-        raise PolicyError(f"Tailscale policy validation failed ({status}): {safe_response_text(validate_text)}")
-    if report is not None:
-        add_finding(report, "ok", "tailscale-api-validate", "Tailscale policy validation passed.")
-    else:
-        eprint("Tailscale policy validation passed.")
-
-    if args.dry_run:
-        if args.diff:
-            sys.stderr.write(
-                unified_policy_diff(
-                    current_text,
-                    merged_text,
-                    fromfile="current API policy",
-                )
-            )
-        print(merged_text, end="")
-        if report is not None:
-            add_finding(report, "info", "dry-run", "Dry run only; policy was not applied.")
-        if report is not None:
-            emit_report(report, args.report, sys.stderr)
-        else:
-            eprint("Dry run only; policy was not applied.")
-        return 0
-
-    apply_headers = {"If-Match": etag} if etag else None
-    status, apply_text, used_mode, _ = tailscale_api(
-        "POST",
-        path,
-        token=token,
-        token_mode=used_mode,
-        body=merged_text,
-        allow_basic_fallback=False,
-        extra_headers=apply_headers,
-    )
-    if status == 412:
-        raise PolicyError(
-            "Tailscale policy changed after it was fetched (ETag conflict). "
-            "Re-run the command to merge with the latest policy."
-        )
-    if status < 200 or status >= 300:
-        raise PolicyError(f"Tailscale policy apply failed ({status}): {safe_response_text(apply_text)}")
-    eprint("Tailscale policy applied.")
-    return 0
 
 
 def restore_policy(args: argparse.Namespace) -> None:
@@ -2019,7 +1909,11 @@ def main(argv: list[str] | None = None) -> int:
     restore_plan.add_argument("--prompt-token", action="store_true")
     restore_plan.add_argument("--yes", action="store_true")
 
-    apply = subparsers.add_parser("apply", help="Fetch, merge, validate, and apply tailnet policy.")
+    apply = subparsers.add_parser(
+        "apply",
+        help="Removed — use 'plan' then 'apply-plan'.",
+        description="'apply' has been removed. Use 'plan' to create an auditable bundle, then 'apply-plan <plan-dir>'.",
+    )
     add_common_args(apply)
     add_report_arg(apply)
     apply.add_argument("--tailnet", default=os.environ.get("TAILSCALE_TAILNET", "-"))
@@ -2100,9 +1994,7 @@ def main(argv: list[str] | None = None) -> int:
             return restore_policy_plan(args)
 
         if args.command == "apply":
-            if (args.diff or args.report) and not args.dry_run:
-                raise PolicyError("--diff and --report are only supported with apply --dry-run.")
-            return apply_policy(args)
+            return apply_removed(args)
 
         if args.command == "restore":
             restore_policy(args)

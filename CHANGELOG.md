@@ -106,6 +106,17 @@ both Python CLIs report it with `--version`.
   `scripts/lib/common.sh` is therefore a runtime dependency of those scripts and
   is verified in the release package. CI lints with `shellcheck -x`.
 
+### Removed
+
+- `scripts/policy_tool.py`: the deprecated direct **`apply`** command has been
+  removed. It printed a runtime "deprecated; will be removed after one release"
+  warning since v1.0, and v1.1.0 has shipped, so per [Stability](docs/Stability.md)'s
+  allowed-exception policy it is gone. `apply` is now a migration tombstone: any
+  non-help invocation (including old flag combinations) exits non-zero with a pointer to the
+  auditable workflow — create a bundle with `plan`, review it, then `apply-plan
+  <plan-dir>`. `plan`, `apply-plan`, `restore`, and `restore-plan` are unchanged;
+  `rollback.sh` still restores any timestamped backups the former `apply` created.
+
 ### Fixed
 
 - Docs: the Quick Start lists Alpine as supported, but the wrappers are Bash while

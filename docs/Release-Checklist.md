@@ -72,22 +72,21 @@ every entrypoint):
 Confirm the privileged commands are printed, no live diagnostics run, and no
 Advanced Mode prompt appears without credentials.
 
-## 7. Policy plan / apply-plan dry run
+## 7. Policy plan preview (no policy write)
 
-With a **read-capable** API or OAuth credential against a scratch tailnet:
+With a **read-capable** API or OAuth credential against a scratch tailnet. `plan`
+only fetches and validates — it never writes the policy — so this is safe to run:
 
 ```bash
 # Generate an auditable bundle (fetches + validates; does not apply).
 python3 scripts/policy_tool.py plan --tailnet - \
   --domains-file policy/default-ai-domains.json
 
-# Inspect the bundle, do NOT apply during the checklist.
+# Inspect the bundle, do NOT apply during the checklist. The plan already wrote a
+# full preview of the merged policy and its diff — no separate preview command.
 ls generated/policy-plans/plan.*/
 sed -n '1,40p' generated/policy-plans/plan.*/diff.patch
-
-# Optional: preview the merged policy without writing anything.
-python3 scripts/policy_tool.py apply --tailnet - --dry-run --diff \
-  --domains-file policy/default-ai-domains.json
+cat generated/policy-plans/plan.*/merged.json
 ```
 
 `apply-plan` itself writes the policy, so it is exercised by the mocked unit

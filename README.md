@@ -252,7 +252,7 @@ python3 scripts/policy_tool.py apply-plan generated/policy-plans/plan.<plan-id>
 python3 scripts/policy_tool.py list-plans
 ```
 
-To opt in through the installer instead, export `TAILSCALE_API_KEY` (or the `TAILSCALE_OAUTH_CLIENT_ID` / `TAILSCALE_OAUTH_CLIENT_SECRET` pair) and `TAILSCALE_TAILNET`, then run `./bootstrap.sh` and answer `y` at the Advanced Mode prompt. The older `policy_tool.py apply` command is deprecated in favor of `plan` plus `apply-plan`. If the credential is missing, planning fails, or you decline the exact apply confirmation, the installer falls back to guided manual mode.
+To opt in through the installer instead, export `TAILSCALE_API_KEY` (or the `TAILSCALE_OAUTH_CLIENT_ID` / `TAILSCALE_OAUTH_CLIENT_SECRET` pair) and `TAILSCALE_TAILNET`, then run `./bootstrap.sh` and answer `y` at the Advanced Mode prompt. The former `policy_tool.py apply` command has been removed; use `plan` plus `apply-plan`. If the credential is missing, planning fails, or you decline the exact apply confirmation, the installer falls back to guided manual mode.
 
 Full details — local preview/merge flows (`validate`, `merge --diff`) and the plan bundle contents (`current.hujson`, `merged.json`, `diff.patch`, `manifest.json`): [docs/Tailscale-API-mode.md](docs/Tailscale-API-mode.md).
 
@@ -378,7 +378,7 @@ python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id
 
 `restore-plan` validates `current.hujson`, fetches a fresh `ETag`, asks for `RESTORE <plan-id>`, then restores the captured pre-apply policy. During `./bootstrap.sh`, if Advanced Mode applies a plan but `tailscale up` then fails, the installer automatically attempts `restore-plan` for that bundle before exiting.
 
-Legacy direct `apply` saves timestamped backups in `generated/`; `rollback.sh` restores those:
+The former direct `apply` command saved timestamped backups in `generated/`; `rollback.sh` still restores any such pre-existing backups:
 
 ```bash
 ./rollback.sh            # restore the latest backup

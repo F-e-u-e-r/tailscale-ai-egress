@@ -421,85 +421,44 @@ class PolicyToolTests(unittest.TestCase):
         self.assertEqual(payload["tagOwners"]["tag:ai-egress-jp"], ["autogroup:admin"])
         self.assertEqual(payload["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["domains"], ["chatgpt.com"])
 
-    def test_apply_dry_run_fetches_validates_and_reports_without_apply(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            domains = Path(tmp) / "domains.txt"
-            domains.write_text("chatgpt.com\n", encoding="utf-8")
-            args = argparse.Namespace(
-                domains_file=str(domains),
-                connector_name="AI-Egress-JP",
-                connector_tag="tag:ai-egress-jp",
-                tag_owner="autogroup:admin",
-                member_src="autogroup:member",
-                allow_broad_wildcard=False,
-                report="json",
-                tailnet="-",
-                api_key="tskey-api-test",
-                oauth_client_id=None,
-                oauth_client_secret=None,
-                oauth_scopes=None,
-                prompt_token=False,
-                backup_dir=tmp,
-                output=None,
-                dry_run=True,
-                diff=False,
-            )
-            with mock.patch.object(
-                tool,
-                "tailscale_api",
-                side_effect=[
-                    (200, "{}\n", "bearer", {"ETag": "abc"}),
-                    (200, "ok", "bearer", {}),
-                ],
-            ) as api:
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-                with mock.patch.object(sys, "stdout", stdout):
-                    with mock.patch.object(sys, "stderr", stderr):
-                        rc = tool.apply_policy(args)
+    def test_apply_command_is_removed_with_pointer(self):
+        # The direct 'apply' command is a migration tombstone: any historical
+        # invocation exits 1 and points at plan / apply-plan.
+        invocations = (
+            ["apply"],
+            [
+                "apply", "--tailnet", "-",
+                "--domains-file", str(ROOT / "policy/default-ai-domains.json"),
+                "--dry-run", "--diff",
+            ],
+            # --diff WITHOUT --dry-run proves the obsolete --diff/--report guard is
+            # gone: it must reach the removal pointer, not the guard's error.
+            ["apply", "--diff", "--tailnet", "-"],
+        )
+        for argv in invocations:
+            with self.subTest(argv=argv):
+                result = self.run_policy_tool(*argv)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                # Assert the full, unique tombstone message (not just fragments) so
+                # only dispatch reaching apply_removed can satisfy it — a differently
+                # worded guard sharing "'plan'"/"'apply-plan'" would not.
+                self.assertIn("'apply' has been removed.", result.stderr)
+                self.assertIn("with 'plan'", result.stderr)
+                self.assertIn("'apply-plan <plan-dir>'", result.stderr)
+                self.assertNotIn("only supported with apply --dry-run", result.stderr)
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(api.call_count, 2)
-        self.assertIn('"tagOwners"', stdout.getvalue())
-        report = json.loads(stderr.getvalue())
-        self.assertTrue(any(item["id"] == "dry-run" for item in report["findings"]))
-
-    def test_legacy_apply_uses_mixed_case_etag_for_if_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            domains = Path(tmp) / "domains.txt"
-            domains.write_text("chatgpt.com\n", encoding="utf-8")
-            args = argparse.Namespace(
-                domains_file=str(domains),
-                connector_name="AI-Egress-JP",
-                connector_tag="tag:ai-egress-jp",
-                tag_owner="autogroup:admin",
-                member_src="autogroup:member",
-                allow_broad_wildcard=False,
-                report=None,
-                tailnet="-",
-                api_key="tskey-api-test",
-                oauth_client_id=None,
-                oauth_client_secret=None,
-                oauth_scopes=None,
-                prompt_token=False,
-                backup_dir=tmp,
-                output=None,
-                dry_run=False,
-                diff=False,
-            )
-            with mock.patch.object(
-                tool,
-                "tailscale_api",
-                side_effect=[
-                    (200, "{}\n", "bearer", {"Etag": "legacy-etag"}),
-                    (200, "ok", "bearer", {}),
-                    (200, "applied", "bearer", {}),
-                ],
-            ) as api:
-                rc = tool.apply_policy(args)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(api.call_args_list[2].kwargs["extra_headers"], {"If-Match": "legacy-etag"})
+    def test_apply_help_shows_removal_pointer(self):
+        # `apply --help` is handled by argparse before dispatch, so the pointer
+        # must live in the subparser description (not just the handler)...
+        sub = self.run_policy_tool("apply", "--help")
+        self.assertEqual(sub.returncode, 0)
+        self.assertIn("'apply' has been removed.", sub.stdout)
+        self.assertIn("'apply-plan <plan-dir>'", sub.stdout)
+        # ...and the top-level command listing (what people scan) must flag it too.
+        root = self.run_policy_tool("--help")
+        self.assertEqual(root.returncode, 0)
+        self.assertIn("Removed", root.stdout)
+        self.assertIn("apply-plan", root.stdout)
 
     def test_restore_policy_dry_run_validates_and_prints_backup(self):
         with tempfile.TemporaryDirectory() as tmp:

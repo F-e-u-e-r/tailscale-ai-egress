@@ -32,9 +32,9 @@ These commands, their documented flags, and their `--json` schemas
   `apply-plan`, `list-plans`, `restore-plan`, `restore`, `domains`)
 
 New optional flags may be added. Existing flags, their meanings, and the JSON
-output shape will not change incompatibly within 1.x. The deprecated
-`policy_tool.py apply` command may be removed in a future minor; use
-`plan` + `apply-plan`.
+output shape will not change incompatibly within 1.x. The `policy_tool.py apply`
+command has been removed after its one-release deprecation; use `plan` +
+`apply-plan` (running `apply` now prints that pointer and exits non-zero).
 
 ### Plan manifest schema
 

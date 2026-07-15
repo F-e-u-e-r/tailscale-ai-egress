@@ -40,7 +40,7 @@ full matrix and the current manual validation status.
 - **Client OS:** macOS (App Store or standalone Tailscale) and Linux (normal TUN
   mode, plus the userspace-networking warning path).
 - **Modes:** App Connector only, same-region connector failover, exit-node
-  fallback (enabled/disabled), and Advanced policy plan/apply/restore.
+  fallback (enabled/disabled), and Advanced policy plan/apply-plan/restore.
 
 ## What is out of scope
 

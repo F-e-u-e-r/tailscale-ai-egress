@@ -242,7 +242,7 @@ python3 scripts/policy_tool.py apply-plan generated/policy-plans/plan.<plan-id>
 python3 scripts/policy_tool.py list-plans
 ```
 
-如要改用 installer opt in，先 export `TAILSCALE_API_KEY`（或 `TAILSCALE_OAUTH_CLIENT_ID` / `TAILSCALE_OAUTH_CLIENT_SECRET` 一對）和 `TAILSCALE_TAILNET`，再執行 `./bootstrap.sh`，在 Advanced Mode prompt 回答 `y`。舊的 `policy_tool.py apply` 已 deprecated，建議改用 `plan` + `apply-plan`。如果 credential 缺失、planning 失敗，或你沒有輸入正確 apply confirmation，installer 會 fallback 到 guided manual mode。
+如要改用 installer opt in，先 export `TAILSCALE_API_KEY`（或 `TAILSCALE_OAUTH_CLIENT_ID` / `TAILSCALE_OAUTH_CLIENT_SECRET` 一對）和 `TAILSCALE_TAILNET`，再執行 `./bootstrap.sh`，在 Advanced Mode prompt 回答 `y`。舊的 `policy_tool.py apply` 已移除，請改用 `plan` + `apply-plan`。如果 credential 缺失、planning 失敗，或你沒有輸入正確 apply confirmation，installer 會 fallback 到 guided manual mode。
 
 完整細節（local preview/merge 流程與 plan bundle 內容）：[docs/Tailscale-API-mode.md](docs/Tailscale-API-mode.md)。
 
@@ -367,7 +367,7 @@ python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id
 
 `restore-plan` 會驗證 `current.hujson`、fetch fresh `ETag`、要求你輸入 `RESTORE <plan-id>`，然後 restore apply 前捕捉到的 policy。在 `./bootstrap.sh` 期間，如果 Advanced Mode 已 apply plan 但之後 `tailscale up` 失敗，installer 會先自動嘗試 `restore-plan` 才退出。
 
-Legacy direct `apply` 仍會在 `generated/` 儲存 timestamped backups；`rollback.sh` 只處理這些：
+舊的 direct `apply` command 曾在 `generated/` 儲存 timestamped backups；`rollback.sh` 仍可還原這些既有 backups：
 
 ```bash
 ./rollback.sh            # restore 最新 backup
