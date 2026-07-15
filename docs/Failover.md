@@ -140,7 +140,7 @@ tailscale set --exit-node=<your-primary>
 ./failover-exit-node.sh --once
 ```
 
-iOS and Android cannot run this watcher (switch the exit node in the app); Windows is not yet supported. See [Configuration](Configuration.md) for the full list of `failover.env` settings, and the `docs/examples/` directory for ready-made systemd, launchd, and cron units.
+iOS and Android cannot run this watcher (switch the exit node in the app); Windows is not yet supported. See [Configuration](Configuration.md) for the full list of `failover.env` settings, and the `docs/examples/` directory for ready-made systemd, OpenRC, launchd, and cron units.
 
 ### Post-Switch Diagnostics With `peer-metrics`
 

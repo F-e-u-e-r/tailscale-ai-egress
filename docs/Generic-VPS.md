@@ -25,6 +25,8 @@ App Connector mode is selective and usually light on transfer. Exit-node fallbac
 
 ## Setup
 
+> **Alpine:** run `apk add bash git` first — the scripts are Bash and Alpine ships only BusyBox `ash`.
+
 ```bash
 git clone https://github.com/F-e-u-e-r/tailscale-ai-egress.git
 cd tailscale-ai-egress

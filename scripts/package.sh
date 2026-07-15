@@ -126,10 +126,17 @@ if [ "$CHECK" = "1" ]; then
     restore-connector.sh rollback.sh install.sh
     policy/default-ai-domains.json scripts/policy_tool.py
     scripts/health_check.py examples/failover.env.example
-    scripts/validation-e2e.sh scripts/lib/common.sh)
+    scripts/validation-e2e.sh scripts/lib/common.sh
+    docs/examples/openrc/failover-exit-node docs/examples/openrc/monitor-connectors
+    docs/examples/openrc/failover-exit-node.confd docs/examples/openrc/monitor-connectors.confd)
   missing=""
   for req in "${required[@]}"; do
     [ -f "$verify_dir/$PREFIX/$req" ] || missing="$missing $req"
+  done
+  # OpenRC init scripts must ship executable (a shebang alone is not enough).
+  not_exec=""
+  for exe in docs/examples/openrc/failover-exit-node docs/examples/openrc/monitor-connectors; do
+    [ -x "$verify_dir/$PREFIX/$exe" ] || not_exec="$not_exec $exe"
   done
   # Ensure ignored/sensitive paths did not leak into the archive.
   leaked=""
@@ -138,6 +145,7 @@ if [ "$CHECK" = "1" ]; then
   done
   rm -rf "$verify_dir"
   [ -z "$missing" ] || die "archive is missing required file(s):$missing"
+  [ -z "$not_exec" ] || die "archive file(s) not executable:$not_exec"
   [ -z "$leaked" ] || die "archive unexpectedly contains:$leaked"
   printf 'Packaging check passed.\n'
 fi
