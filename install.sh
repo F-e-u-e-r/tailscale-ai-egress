@@ -53,7 +53,10 @@ gh_attestation_supported() {
   local out line ver major minor patch
   # GH_TELEMETRY=false: this project sends no telemetry, so do not let gh phone
   # home on our behalf either (gh telemetry defaults on since 2.91.0).
-  out="$(GH_TELEMETRY=false gh --version 2>/dev/null)" || return 1
+  # GH_NO_UPDATE_NOTIFIER=1: gh separately checks for its own new releases once
+  # every 24h on ANY command; PRIVACY.md promises "no update check", so disable
+  # that phone-home too on every gh invocation.
+  out="$(GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 gh --version 2>/dev/null)" || return 1
   line="${out%%$'\n'*}"
   case "$line" in
     'gh version '*) ver="${line#gh version }" ;;
@@ -142,7 +145,7 @@ else
       || { printf 'error: could not derive an https://github.com owner/repo slug from %s; set TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1 for a non-GitHub mirror.\n' "$REPO_URL" >&2; exit 1; }
     printf 'Verifying release attestation with gh (repo %s) ...\n' "$repo_slug"
     attest_rc=0
-    GH_TELEMETRY=false gh attestation verify "$archive_path" \
+    GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 gh attestation verify "$archive_path" \
           --repo "$repo_slug" \
           --signer-workflow "$repo_slug/.github/workflows/release.yml" \
           --source-ref "refs/tags/$release_tag" \

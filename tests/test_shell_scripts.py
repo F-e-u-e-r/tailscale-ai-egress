@@ -347,10 +347,12 @@ class ShellScriptTests(unittest.TestCase):
         self._assert_single_verify(
             calls, slug="F-e-u-e-r/tailscale-ai-egress", version=version, asset_name=asset_name
         )
-        # Every gh invocation (the version probe too) disables telemetry.
+        # Every gh invocation (the version probe too) disables telemetry AND
+        # gh's own update notifier (PRIVACY.md promises "no update check").
         self.assertTrue(calls)
         for call in calls:
             self.assertEqual(call["telemetry"], "GH_TELEMETRY=false")
+            self.assertEqual(call["update_notifier"], "GH_NO_UPDATE_NOTIFIER=1")
         # Order: checksum success -> attestation verify -> extraction/bootstrap.
         self.assertLess(out.index(f"{asset_name}: OK"), out.index("Verifying release attestation"))
         self.assertLess(out.index("Verifying release attestation"), out.index("fake bootstrap"))
@@ -1041,7 +1043,7 @@ fi
     def _write_fake_gh(self, fake_bin, *, version="2.93.0", verify_exit=0,
                        version_exit=0, calls_log=None):
         """Write a fake `gh` that logs EVERY invocation to calls_log -- the
-        GH_TELEMETRY env value plus each argument with `\\037` (unit-separator)
+        GH_TELEMETRY + GH_NO_UPDATE_NOTIFIER env values plus each argument with `\\037` (unit-separator)
         boundaries -- then answers `--version` and `attestation verify`. An
         absent/empty calls_log proves gh was never run; the boundaries let a test
         assert the exact argv vector (so `--hostname github.com.evil` or a dropped
@@ -1050,7 +1052,8 @@ fi
         if calls_log is not None:
             log_block = (
                 "{ "
-                "printf 'ENV\\037GH_TELEMETRY=%s\\n' \"${GH_TELEMETRY-<unset>}\"; "
+                "printf 'ENV\\037GH_TELEMETRY=%s\\037GH_NO_UPDATE_NOTIFIER=%s\\n' "
+                "\"${GH_TELEMETRY-<unset>}\" \"${GH_NO_UPDATE_NOTIFIER-<unset>}\"; "
                 "printf 'ARGV'; for a in \"$@\"; do printf '\\037%s' \"$a\"; done; "
                 "printf '\\n'; "
                 f"}} >> {calls_log}\n"
@@ -1086,15 +1089,24 @@ exit 3
         return "\n".join(out)
 
     def _parse_gh_calls(self, text):
-        """Parse a fake-gh calls log into [{'telemetry': str, 'argv': [str, ...]}]."""
+        """Parse a fake-gh calls log into
+        [{'telemetry': str, 'update_notifier': str, 'argv': [str, ...]}]."""
         calls = []
         telemetry = None
+        update_notifier = None
         for line in text.splitlines():
             if line.startswith("ENV\x1f"):
-                telemetry = line.split("\x1f", 1)[1]
+                fields = line.split("\x1f")[1:]
+                telemetry = fields[0]
+                update_notifier = fields[1] if len(fields) > 1 else None
             elif line.startswith("ARGV"):
-                calls.append({"telemetry": telemetry, "argv": line.split("\x1f")[1:]})
+                calls.append({
+                    "telemetry": telemetry,
+                    "update_notifier": update_notifier,
+                    "argv": line.split("\x1f")[1:],
+                })
                 telemetry = None
+                update_notifier = None
         return calls
 
     def _assert_single_verify(self, calls, *, slug, version, asset_name):
@@ -1114,6 +1126,7 @@ exit 3
             ],
         )
         self.assertEqual(verifies[0]["telemetry"], "GH_TELEMETRY=false")
+        self.assertEqual(verifies[0]["update_notifier"], "GH_NO_UPDATE_NOTIFIER=1")
         return verifies[0]
 
     def _capture_log(self, path):

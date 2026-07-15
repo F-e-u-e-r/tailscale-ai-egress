@@ -19,13 +19,16 @@ directory.
 | Tailscale control plane (e.g. `login.tailscale.com`, `controlplane.tailscale.com`, DERP relays) | `tailscale up` registers the node and joins your tailnet | Always |
 | GitHub release downloads (`github.com/.../releases/download/...`, often redirected to GitHub's release asset storage) | Downloads the tagged source artifact and `SHA256SUMS` | Only if you run `install.sh` outside a checkout without `TAILSCALE_AI_EGRESS_BRANCH` |
 | GitHub branch archive (`codeload.github.com` via `install.sh`) | Downloads an unverified development branch tarball | Only if you run `install.sh` outside a checkout with `TAILSCALE_AI_EGRESS_BRANCH` |
+| GitHub Attestations API (`api.github.com`) and TUF trust-root hosts (`tuf-repo.github.com`, `tuf-repo-cdn.sigstore.dev`, `tmaproduction.blob.core.windows.net`) | `gh attestation verify` fetches the release's build-provenance attestation and the Sigstore/TUF trust roots that validate it | Only on a release install when an authenticated `gh` >= 2.93.0 is present and `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` is not set |
 | `https://ifconfig.co/country-iso` | Detect the VPS country code for the derived connector identity | Only in non-dry-run `bootstrap.sh` when `REGION` is unset and `curl` or `wget` is available |
 | `https://ifconfig.co` | The post-install `diagnose.sh` run (see below) | At the end of a non-dry-run bootstrap |
 | `https://api.tailscale.com` | Advanced Mode policy automation (see below) | Only if you explicitly opt into Advanced Mode |
 
 `install.sh` is a thin wrapper. By default it verifies downloaded release
 artifacts against `SHA256SUMS`; branch archives are intentionally called out as
-unverified. For stricter provenance, clone a reviewed tag and run
+unverified. When it invokes `gh` for the optional attestation verification, it
+sets `GH_TELEMETRY=false` and `GH_NO_UPDATE_NOTIFIER=1` on every call, so gh
+sends no telemetry and performs no update check on this project's behalf. For stricter provenance, clone a reviewed tag and run
 `./bootstrap.sh` directly instead of piping `install.sh` from the network. See
 [docs/Stability.md](docs/Stability.md).
 

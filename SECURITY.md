@@ -57,9 +57,10 @@ window for a fix before any public write-up.
 - Does not proxy traffic through servers owned by this project.
 - Does not store API keys or auth keys in repo files.
 - Does not communicate with external services beyond package repositories,
-  Tailscale services, public IP/DNS checks, and the Tailscale API when you
-  explicitly opt into Advanced Mode. See [PRIVACY.md](PRIVACY.md) for the exact
-  list of endpoints.
+  Tailscale services, public IP/DNS checks, GitHub's release-download and
+  attestation/TUF endpoints during `install.sh` verification, and the Tailscale
+  API when you explicitly opt into Advanced Mode. See [PRIVACY.md](PRIVACY.md)
+  for the exact list of endpoints.
 
 ## No Telemetry, No Project Servers
 
