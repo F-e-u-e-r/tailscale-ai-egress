@@ -50,7 +50,8 @@ mypy scripts
 ```bash
 python3 -B -m unittest discover -s tests
 python3 -m coverage run -m unittest discover -s tests
-python3 -m coverage report --fail-under=55
+python3 -m coverage report --fail-under=70
+python3 scripts/check_readme_parity.py   # README.md / README.zh-HK.md entrypoint parity
 ```
 
 ## 5. Credential-free smoke test

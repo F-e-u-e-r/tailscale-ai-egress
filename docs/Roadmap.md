@@ -148,7 +148,7 @@ Per [Stability](Stability.md), to keep the trust boundary small:
 ## Process (any time)
 
 - **Dependabot** for the SHA-pinned GitHub Actions.
-- **Coverage ratchet** from 55% toward 70%, focused on `policy_tool` API error
-  branches.
+- **Coverage ratchet** — the CI floor is now 70% (ratcheted up from 55%), focused
+  on `policy_tool` API error branches.
 - **Bilingual doc drift check** in CI comparing the entrypoint lists in
   `README.md` and `README.zh-HK.md`.

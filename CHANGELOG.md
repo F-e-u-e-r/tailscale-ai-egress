@@ -15,6 +15,14 @@ both Python CLIs report it with `--version`.
 
 ### Added
 
+- **CI: bilingual README doc-drift check.** `scripts/check_readme_parity.py` (stdlib-only) fails if
+  `README.md` and `README.zh-HK.md` do not mention the same set of entrypoints (the 10 top-level `*.sh`
+  plus `policy_tool.py`/`health_check.py`), catching "added to one language's README, forgot the other."
+  Matching is filename-bounded, and a `tests/test_docs.py` suite proves it catches drift in both directions.
+  Wired into CI on the 3.12 Linux leg.
+- **Dependabot for the pinned GitHub Actions.** `.github/dependabot.yml` (weekly, grouped, `ci`-prefixed)
+  keeps the SHA-pinned actions current; the version annotations in `ci.yml`/`release.yml` were moved inline
+  (`uses: …@sha # vX.Y.Z`) so Dependabot updates the SHA and the comment together.
 - **OpenRC service examples for Alpine.** `docs/examples/openrc/{failover-exit-node,monitor-connectors}`
   (mode 0755) run the failover controller / read-only HA monitor under `supervise-daemon` — the closest
   OpenRC analogue to systemd `Restart=` — with `need net`/`need tailscale` ordering, a `start_pre`
@@ -99,6 +107,10 @@ both Python CLIs report it with `--version`.
 
 ### Changed
 
+- **CI coverage floor ratcheted 55% → 70%** (`.github/workflows/ci.yml`). Added targeted
+  `tests/test_policy_tool.py` tests for previously-uncovered `policy_tool` API error paths (OAuth-token
+  fallback, missing-credential, and the bearer→basic 401 retry), nudging `policy_tool.py` coverage up; TOTAL
+  is ~77%.
 - Internal refactor (no behavior change): `enable-exit-node.sh`,
   `disable-exit-node.sh`, and `restore-connector.sh` now source the shared
   `scripts/lib/common.sh` for `run_root` (as `ai_egress_run_root`), completing the

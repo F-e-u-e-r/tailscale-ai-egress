@@ -129,13 +129,14 @@ mypy scripts
 # 4. Python unit tests and coverage gate
 python3 -B -m unittest discover -s tests
 python3 -m coverage run -m unittest discover -s tests
-python3 -m coverage report --fail-under=55
+python3 -m coverage report --fail-under=70
 
 # 5. Credential-free smoke test (local + dry-run paths only)
 ./scripts/smoke-test.sh
 
-# 6. Offline docs link check
+# 6. Offline docs link check + bilingual README entrypoint parity (if docs/READMEs changed)
 python3 scripts/check_docs_links.py
+python3 scripts/check_readme_parity.py
 
 # 7. Packaging check
 ./scripts/package.sh --check

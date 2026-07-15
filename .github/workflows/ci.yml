@@ -13,11 +13,9 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      # actions/checkout v5.0.0
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      # actions/setup-python v6.0.0
-      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -64,6 +62,11 @@ jobs:
         run: |
           python3 scripts/check_docs_links.py
 
+      - name: README bilingual parity
+        if: matrix.python-version == '3.12'
+        run: |
+          python3 scripts/check_readme_parity.py
+
       - name: Packaging check
         run: |
           ./scripts/package.sh --check
@@ -72,7 +75,7 @@ jobs:
         if: matrix.python-version == '3.12'
         run: |
           python3 -m coverage run -m unittest discover -s tests
-          python3 -m coverage report --fail-under=55
+          python3 -m coverage report --fail-under=70
 
   # Second job (parallel, advisory): covers what the Linux job cannot -- stock Bash 3.2
   # and the BSD userland (`stat -f`, `route -n get`, `shasum`). Deliberately does NOT
@@ -84,11 +87,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      # actions/checkout v5.0.0
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      # actions/setup-python v6.0.0
-      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: "3.12"
 
