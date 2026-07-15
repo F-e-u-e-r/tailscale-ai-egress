@@ -36,10 +36,12 @@ both Python CLIs report it with `--version`.
   downloads. When [GitHub CLI](https://cli.github.com/) `gh` (>= 2.93.0) is present, the
   installer runs `gh attestation verify` on the downloaded release tarball after the
   `SHA256SUMS` checksum, narrowed to this repo's `.github/workflows/release.yml` on the
-  exact `refs/tags/<tag>` at `github.com`. A missing, older, or unrecognized `gh` degrades
-  to checksum-only and never fails for that reason (the token-leak GHSA-8xvp-7hj6-mcj9 and
+  exact `refs/tags/<tag>` at `github.com`. A missing, older, unrecognized, or
+  unauthenticated `gh` degrades to checksum-only and never fails for that reason
+  (`gh attestation verify` requires a github.com credential even for public repos and
+  exits with gh's documented authentication code 4; the token-leak GHSA-8xvp-7hj6-mcj9 and
   false-pass GHSA-fgw4-v983-mgp8 advisories are avoided by requiring 2.93.0); an attestation
-  a usable `gh` actively rejects is fatal. `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` opts out
+  an authenticated `gh` actively rejects is fatal. `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` opts out
   (offline installs or a non-GitHub mirror) — the checksum still runs, publisher provenance
   does not. The release workflow already produces these attestations, so no `release.yml`
   change was needed; the unverified `TAILSCALE_AI_EGRESS_BRANCH` path is unaffected.

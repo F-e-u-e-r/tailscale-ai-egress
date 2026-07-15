@@ -53,7 +53,10 @@ gh_attestation_supported() {
   local out line ver major minor patch
   # GH_TELEMETRY=false: this project sends no telemetry, so do not let gh phone
   # home on our behalf either (gh telemetry defaults on since 2.91.0).
-  out="$(GH_TELEMETRY=false gh --version 2>/dev/null)" || return 1
+  # GH_NO_UPDATE_NOTIFIER=1: gh separately checks for its own new releases once
+  # every 24h on ANY command; PRIVACY.md promises "no update check", so disable
+  # that phone-home too on every gh invocation.
+  out="$(GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 gh --version 2>/dev/null)" || return 1
   line="${out%%$'\n'*}"
   case "$line" in
     'gh version '*) ver="${line#gh version }" ;;
@@ -128,8 +131,9 @@ else
   # Publisher provenance (optional; additive to the SHA256SUMS checksum above).
   # When a safe gh is present, verify the release tarball's build attestation,
   # narrowed to this repo's release workflow on the exact tag. gh absent / too
-  # old / opt-out all degrade to checksum-only; only an actual verify failure
-  # (a usable gh that ran) is fatal, mirroring the checksum's fail-closed posture.
+  # old / unauthenticated / opt-out all degrade to checksum-only; only an actual
+  # verify failure by an authenticated gh is fatal, mirroring the checksum's
+  # fail-closed posture.
   if [ "${TAILSCALE_AI_EGRESS_SKIP_ATTESTATION:-0}" = "1" ]; then
     printf 'note: attestation verification skipped (TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1); the SHA256SUMS checksum was verified.\n'
   elif ! command -v gh >/dev/null 2>&1; then
@@ -140,11 +144,19 @@ else
     repo_slug="$(derive_repo_slug "$REPO_URL")" \
       || { printf 'error: could not derive an https://github.com owner/repo slug from %s; set TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1 for a non-GitHub mirror.\n' "$REPO_URL" >&2; exit 1; }
     printf 'Verifying release attestation with gh (repo %s) ...\n' "$repo_slug"
-    if ! GH_TELEMETRY=false gh attestation verify "$archive_path" \
+    attest_rc=0
+    GH_TELEMETRY=false GH_NO_UPDATE_NOTIFIER=1 gh attestation verify "$archive_path" \
           --repo "$repo_slug" \
           --signer-workflow "$repo_slug/.github/workflows/release.yml" \
           --source-ref "refs/tags/$release_tag" \
-          --hostname github.com; then
+          --hostname github.com || attest_rc=$?
+    if [ "$attest_rc" -eq 4 ]; then
+      # gh's documented "requires authentication" exit code (`gh help exit-codes`):
+      # `gh attestation verify` needs a github.com credential even for public
+      # repos, and a fresh host often has gh installed but never `gh auth login`ed.
+      # Inability to check is not a rejection -> degrade to checksum-only, loudly.
+      printf 'note: gh is not authenticated for github.com, so publisher provenance was not verified. Run "gh auth login" (or set GH_TOKEN) to enable attestation verification, or set TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1 to silence this note. The SHA256SUMS checksum was verified.\n'
+    elif [ "$attest_rc" -ne 0 ]; then
       printf 'error: attestation verification failed for %s\n' "$asset_name" >&2
       exit 1
     fi

@@ -57,16 +57,20 @@ window for a fix before any public write-up.
 - Does not proxy traffic through servers owned by this project.
 - Does not store API keys or auth keys in repo files.
 - Does not communicate with external services beyond package repositories,
-  Tailscale services, public IP/DNS checks, and the Tailscale API when you
-  explicitly opt into Advanced Mode. See [PRIVACY.md](PRIVACY.md) for the exact
-  list of endpoints.
+  Tailscale services, public IP/DNS checks, GitHub's release-download /
+  branch-archive and attestation (API + TUF) endpoints used by `install.sh`
+  downloads and its optional release verification (branch archives are
+  downloaded unverified), and the Tailscale API when you explicitly opt into
+  Advanced Mode. See [PRIVACY.md](PRIVACY.md) for the exact list of endpoints.
 
 ## No Telemetry, No Project Servers
 
 There is no analytics, phone-home, crash reporting, or update check. The project
 operates no servers. Every network call is either to your own infrastructure,
-your OS package mirrors, Tailscale's own services, or well-known public IP/ASN
-lookups used by diagnostics. The full inventory is in [PRIVACY.md](PRIVACY.md).
+your OS package mirrors, Tailscale's own services, GitHub's release-download /
+branch-archive / attestation (API + TUF) endpoints used by `install.sh`, or
+well-known public IP/ASN lookups used by diagnostics. The full inventory is in
+[PRIVACY.md](PRIVACY.md).
 
 ## Secret Handling
 
