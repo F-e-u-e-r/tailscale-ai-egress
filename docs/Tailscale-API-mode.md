@@ -89,7 +89,7 @@ python3 scripts/policy_tool.py merge \
   --diff
 ```
 
-Advanced API plan/apply flow:
+Advanced API plan / apply-plan flow:
 
 ```bash
 TAILSCALE_API_KEY="tskey-api-..." \
@@ -107,9 +107,9 @@ python3 scripts/policy_tool.py list-plans
 
 For scripted checks, add `--report json` to `validate` or `merge`. Plan bundles put the review report into `manifest.json` for valid plans and `report.invalid.json` for failed validation artifacts.
 
-## CI/CD Dry Run
+## CI/CD (validate / plan only, no write)
 
-Production automation should stop at validation or dry run unless a human-reviewed deployment step intentionally applies the policy:
+Production automation should stop at `validate` or `plan` — neither writes the policy — unless a human-reviewed deployment step intentionally applies the plan with `apply-plan`:
 
 ```bash
 python3 scripts/policy_tool.py validate \
@@ -145,7 +145,7 @@ It contains `current.hujson`, `merged.json`, `diff.patch`, `manifest.json`, and 
 
 If validation fails, artifacts are written under `generated/policy-plans/failed.<plan-id>/` with no valid `manifest.json`. Inspect `report.invalid.json`, and when available, `current.hujson`, `merged.json`, and `diff.patch`.
 
-The older direct `apply` command is retained for one release as a compatibility path, but it prints a deprecation warning. Prefer `plan` plus `apply-plan`.
+The former direct `apply` command has been removed; use `plan` plus `apply-plan`. Running `apply` now prints that pointer and exits non-zero.
 
 ## Manual Snippet
 
@@ -184,7 +184,7 @@ python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id
 
 `restore-plan` restores the `current.hujson` captured before that plan was applied. It verifies the saved SHA-256, validates the policy with Tailscale, fetches a fresh current policy `ETag`, and requires exact `RESTORE <plan-id>` confirmation. A restored plan can be restored again; the original `restored_at` is preserved and later successful restores are appended to `restored_at_history`.
 
-Legacy direct `apply` still saves timestamped backups:
+The former direct `apply` command saved timestamped backups (`rollback.sh` still restores any pre-existing ones):
 
 ```text
 generated/tailnet-policy.backup.YYYYMMDDTHHMMSSZ.hujson

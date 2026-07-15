@@ -59,9 +59,9 @@ Highest user value first.
   *Acceptance:* an OpenRC service file under `docs/examples/` that starts the
   controller/monitor on Alpine, referenced from the examples README.
 - **Remove deprecated `policy_tool.py apply`.** `1.x allowed exception`.
-  [Stability](Stability.md) already flags it for removal; the CHANGELOG said
-  "will be removed after one release," and one release has passed. Use `plan` +
-  `apply-plan`.
+  [Stability](Stability.md) already flags it for removal; the CLI has printed a
+  "deprecated; will be removed after one release" warning since v1.0, and v1.1.0
+  has shipped. Use `plan` + `apply-plan`.
   *Acceptance:* `apply` is gone with a clear pointer to `plan`/`apply-plan`; a
   test asserts the helpful error; CHANGELOG documents the removal.
 

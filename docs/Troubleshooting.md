@@ -167,9 +167,9 @@ python3 scripts/policy_tool.py plan \
 Common API failure cases:
 
 - `401` or `403`: check whether the API key/OAuth client has policy-file access, and confirm `TAILSCALE_TAILNET=-` or the explicit tailnet name is correct.
-- `412`: the Admin Console policy changed between plan and apply. Regenerate the plan against the latest policy before applying.
+- `412`: the Admin Console policy changed between `plan` and `apply-plan`. Regenerate the plan against the latest policy before re-running `apply-plan`.
 - Validation errors: inspect `generated/policy-plans/failed.<plan-id>/report.invalid.json` and any generated `merged.json` or `diff.patch`.
-- Manifest update errors after a successful apply or restore: inspect the current Admin Console policy before retrying. The tool reports that the API write succeeded, but it could not update `manifest.json`.
+- Manifest update errors after a successful `apply-plan` or `restore`: inspect the current Admin Console policy before retrying. The tool reports that the API write succeeded, but it could not update `manifest.json`.
 - Network timeouts: raise `TAILSCALE_API_TIMEOUT`, for example `export TAILSCALE_API_TIMEOUT=120`.
 
 If validation fails, inspect:

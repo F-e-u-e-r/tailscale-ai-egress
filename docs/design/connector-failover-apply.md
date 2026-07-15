@@ -92,7 +92,7 @@ the same requirement, so coordinate the bump).
 | Primary health | Fallback health | Current role | Action |
 |---|---|---|---|
 | healthy | * | primary | none |
-| failed (≥ N) | healthy | primary | propose switch → plan+apply → readback |
+| failed (≥ N) | healthy | primary | propose switch → plan → apply switch → readback |
 | failed | failed | primary | **none** (fail-closed; nowhere safe to go) |
 | recovered (≥ M) | * | fallback | switch back (if `RESTORE_PRIMARY=1`) after cooldown |
 | ambiguous / unreadable | * | * | **none** (fail-closed) |

@@ -63,14 +63,14 @@ the 1.0 validated set.
 | Exit-node fallback enabled | Automated (enable helper) + Manual | _pending_ | Baseline traffic expected via exit node |
 | Exit-node fallback disabled | Automated (disable helper) + Manual | _pending_ | Connector tag must remain present |
 | Exit-node primary/fallback failover | Automated (controller + health engine) + Manual | _pending_ | macOS/Linux controller; see [Failover.md](Failover.md) |
-| Advanced policy plan/apply/restore | Automated (mocked API) + Manual (one real dry-run credential) | _pending_ | See [Tailscale-API-mode.md](Tailscale-API-mode.md) |
+| Advanced policy plan/apply-plan/restore | Automated (mocked API) + Manual (one real read-capable credential, `plan` only — no write) | _pending_ | See [Tailscale-API-mode.md](Tailscale-API-mode.md) |
 
 ## What CI already covers
 
 These run on every push (no real infrastructure needed):
 
 - Shell syntax (`bash -n`) and `shellcheck` for all entrypoints.
-- Python unit tests: policy parsing/merge/validate, plan/apply/restore against a
+- Python unit tests: policy parsing/merge/validate, plan/apply-plan/restore against a
   mocked Tailscale API, secret redaction, and domain normalization.
 - Diagnostics fake-command tests for `diagnose.sh` and `check-client-routes.sh`
   across connector-only, exit-node, userspace-networking, and failure states on
