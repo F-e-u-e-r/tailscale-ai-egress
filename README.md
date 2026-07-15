@@ -146,6 +146,8 @@ Cost and latency depend on your VPS region, bandwidth allowance, and Tailscale p
 
 On a fresh Linux VPS (Ubuntu, Debian, Fedora, CentOS, or Alpine), clone the published repo. This README assumes the repo is published at `F-e-u-e-r/tailscale-ai-egress`:
 
+> **Alpine:** run `apk add bash git` first — the scripts are Bash and Alpine ships only BusyBox `ash`.
+
 ```bash
 git clone https://github.com/F-e-u-e-r/tailscale-ai-egress.git
 cd tailscale-ai-egress

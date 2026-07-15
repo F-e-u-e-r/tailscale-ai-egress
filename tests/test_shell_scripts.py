@@ -61,6 +61,74 @@ class ShellScriptTests(unittest.TestCase):
             with self.subTest(script=script):
                 subprocess.run(["bash", "-n", str(ROOT / script)], check=True)
 
+    @staticmethod
+    def _openrc_code_lines(text):
+        """Return the non-comment, inline-comment-stripped code lines of an
+        openrc-run script (so a comment mentioning `--apply` cannot mask a mutated
+        `command_args`, and exact assignment values can be asserted)."""
+        lines = []
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            stripped = stripped.split("#", 1)[0].strip()  # no '#' occurs inside these values
+            if stripped:
+                lines.append(stripped)
+        return lines
+
+    def test_openrc_examples_are_valid(self):
+        openrc = ROOT / "docs" / "examples" / "openrc"
+        specs = {
+            "failover-exit-node": {"command_args": "--watch --apply", "respawn_delay": "10"},
+            "monitor-connectors": {"command_args": "--watch", "respawn_delay": "30"},
+        }
+        for svc, spec in specs.items():
+            path = openrc / svc
+            with self.subTest(service=svc):
+                self.assertTrue(path.exists(), f"{svc} missing")
+                self.assertEqual(path.stat().st_mode & 0o111, 0o111, f"{svc} must be executable")
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(text.splitlines()[0], "#!/sbin/openrc-run")
+                syntax = subprocess.run(["sh", "-n", str(path)], text=True, capture_output=True)
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+                code = self._openrc_code_lines(text)
+                self.assertIn(f'command="/opt/tailscale-ai-egress/{svc}.sh"', code)
+                # Exact command_args (list membership, not substring): a controller
+                # mutated to "--watch" no longer matches "--watch --apply".
+                self.assertIn(f'command_args="{spec["command_args"]}"', code)
+                self.assertIn('supervisor="supervise-daemon"', code)
+                self.assertIn(f"respawn_delay={spec['respawn_delay']}", code)
+                # respawn_max=0 (unlimited); removing it restores OpenRC's default of 10.
+                self.assertIn("respawn_max=0", code)
+                self.assertIn('directory="/opt/tailscale-ai-egress"', code)
+                self.assertIn('pidfile="/run/${RC_SVCNAME}.pid"', code)
+                # Crash-loop safety fields must survive edits with their real values
+                # (an empty output_log= or a dropped log line must fail this test).
+                self.assertIn(
+                    f'required_files="/opt/tailscale-ai-egress/{svc}.sh '
+                    f'/opt/tailscale-ai-egress/scripts/health_check.py"',
+                    code,
+                )
+                self.assertIn('output_log="/var/log/${RC_SVCNAME}.log"', code)
+                self.assertIn('error_log="/var/log/${RC_SVCNAME}.log"', code)
+                self.assertIn("need net", code)
+                self.assertIn("need tailscale", code)
+                body = "\n".join(code)
+                self.assertIn("start_pre()", body)
+                # The preflight must actually check the deps and fail loudly, not just
+                # loop over them: a no-op `for _dep in bash python3; do :; done` must fail.
+                self.assertRegex(body, r"for\s+\w+\s+in\s+bash\s+python3\b")
+                self.assertIn("command -v", body)
+                self.assertIn("eerror", body)
+                self.assertIn("return 1", body)
+
+        for confd in ("failover-exit-node.confd", "monitor-connectors.confd"):
+            path = openrc / confd
+            with self.subTest(confd=confd):
+                self.assertTrue(path.exists(), f"{confd} missing")
+                self.assertEqual(path.stat().st_mode & 0o111, 0, f"{confd} must not be executable")
+
     def test_common_lib_rejects_direct_execution(self):
         # scripts/lib/common.sh is a source-only library; running it directly must
         # fail with a clear message rather than silently doing nothing.

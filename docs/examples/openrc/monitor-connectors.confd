@@ -1,0 +1,14 @@
+# /etc/conf.d/monitor-connectors — optional overrides for monitor-connectors.sh.
+#
+# The wrapper already self-loads /opt/tailscale-ai-egress/generated/failover.env;
+# use this file only to override a single value. OpenRC sources this file, so values
+# must be `export`ed to reach the supervised child process.
+
+#export PRIMARY_CONNECTOR=ai-egress-jp-01
+#export FALLBACK_CONNECTOR=ai-egress-sg-01
+#export REQUIRE_ROUTES=1
+
+# Optional: enables device.created ordering. TAILSCALE_API_KEY is a SECRET and is read
+# only from the environment (never from failover.env). If you uncomment it, first run
+# `chmod 0600 /etc/conf.d/monitor-connectors`. Keep this file 0644 only while fully commented.
+#export TAILSCALE_API_KEY=tskey-api-...

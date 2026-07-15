@@ -151,7 +151,7 @@ by `generated/failover.lock.d`); both stay local and are never committed. The
 optional `device.created` ordering check in `monitor-connectors.sh` uses
 `TAILSCALE_API_KEY` when present and otherwise reports `ordering=unavailable`
 without failing. See [Failover](Failover.md) for the full workflow and the
-`docs/examples/` directory for systemd, launchd, and cron units.
+`docs/examples/` directory for systemd, OpenRC, launchd, and cron units.
 
 ## Recommended Auth Key Settings
 

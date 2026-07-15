@@ -15,6 +15,15 @@ both Python CLIs report it with `--version`.
 
 ### Added
 
+- **OpenRC service examples for Alpine.** `docs/examples/openrc/{failover-exit-node,monitor-connectors}`
+  (mode 0755) run the failover controller / read-only HA monitor under `supervise-daemon` — the closest
+  OpenRC analogue to systemd `Restart=` — with `need net`/`need tailscale` ordering, a `start_pre`
+  interpreter check, and `required_files` (wrapper + health engine) so a missing dependency is a loud
+  `rc-service start` failure rather than a silent respawn loop. Optional `*.confd` overrides ship alongside;
+  `docs/examples/README.md` documents the prerequisites, install/enable/start commands, and a `logrotate`
+  (`copytruncate`) stanza for the append-only service logs. `scripts/package.sh --check` now asserts all four
+  files ship and the two init scripts are executable, and a `test_openrc_examples_are_valid` test locks the
+  `sh -n` syntax, exact `command_args`, and the crash-loop safety fields.
 - `install.sh`: **optional build-provenance attestation verification** for release
   downloads. When [GitHub CLI](https://cli.github.com/) `gh` (>= 2.93.0) is present, the
   installer runs `gh attestation verify` on the downloaded release tarball after the
@@ -99,6 +108,10 @@ both Python CLIs report it with `--version`.
 
 ### Fixed
 
+- Docs: the Quick Start lists Alpine as supported, but the wrappers are Bash while
+  Alpine ships only BusyBox `ash`, so `./bootstrap.sh` failed on a stock Alpine host.
+  `README.md`, `README.zh-HK.md`, and `docs/Generic-VPS.md` now note `apk add bash git`
+  as an Alpine prerequisite before cloning.
 - `scripts/health_check.py`: reading a `--status-json-file` that is not valid UTF-8
   now fails closed (treated as unavailable status) instead of raising
   `UnicodeDecodeError`, so `peer-metrics` keeps its always-exit-0 contract and the

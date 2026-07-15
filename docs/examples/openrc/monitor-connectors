@@ -1,0 +1,52 @@
+#!/sbin/openrc-run
+# Tailscale AI Egress — connector high-availability monitor (Alpine/OpenRC)
+#
+# Read-only: this monitor never changes anything; it only reports connector health.
+#
+# Prerequisites (Alpine ships BusyBox ash, not Bash; logrotate is separate too):
+#   apk add bash python3 logrotate
+#   # install Tailscale (https://tailscale.com/download) and authenticate it:
+#   rc-service tailscale start && tailscale up
+#   # place this repo at /opt/tailscale-ai-egress and configure the values in
+#   #   /opt/tailscale-ai-egress/generated/failover.env  (PRIMARY_CONNECTOR, FALLBACK_CONNECTOR, ...)
+#
+# Install (run as root, or prefix each command with doas/sudo):
+#   install -m 0755 docs/examples/openrc/monitor-connectors /etc/init.d/monitor-connectors
+#   install -m 0644 docs/examples/openrc/monitor-connectors.confd /etc/conf.d/monitor-connectors  # optional
+#   rc-update add monitor-connectors default
+#   rc-service monitor-connectors start
+#
+# Output goes to /var/log/monitor-connectors.log; rotate it with logrotate (see
+# docs/examples/README.md).
+
+name="Tailscale AI Egress connector HA monitor"
+description="Watches connector health and reports (read-only)"
+
+command="/opt/tailscale-ai-egress/monitor-connectors.sh"
+command_args="--watch"
+directory="/opt/tailscale-ai-egress"
+# Both the wrapper AND the health engine it hard-requires must exist, else the
+# wrapper exits immediately and supervise-daemon respawns it forever.
+required_files="/opt/tailscale-ai-egress/monitor-connectors.sh /opt/tailscale-ai-egress/scripts/health_check.py"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# supervise-daemon is the closest OpenRC analogue to systemd Restart=: it respawns
+# the foreground watcher after a delay on any unexpected exit (it does not single out
+# a clean exit the way Restart=on-failure does). The watcher normally never exits.
+supervisor="supervise-daemon"
+respawn_delay=30
+respawn_max=0                            # 0 = unlimited respawns (supervise-daemon)
+output_log="/var/log/${RC_SVCNAME}.log"  # capture the child's stdout/stderr so
+error_log="/var/log/${RC_SVCNAME}.log"   # failures stay visible (rotate — see README)
+
+depend() {
+	need net
+	need tailscale                       # Alpine's Tailscale OpenRC service
+}
+
+start_pre() {
+	# Fail loudly at start instead of crash-looping if a hard dependency is absent.
+	for _dep in bash python3; do
+		command -v "$_dep" >/dev/null 2>&1 || { eerror "$_dep is required (apk add $_dep)"; return 1; }
+	done
+}

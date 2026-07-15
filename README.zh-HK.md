@@ -147,6 +147,8 @@ App Connector 可理解為經 tagged Tailscale 裝置做 domain-selective routin
 
 在全新 Linux VPS（Ubuntu、Debian、Fedora、CentOS 或 Alpine）clone repo。以下假設 published repo 是 `F-e-u-e-r/tailscale-ai-egress`：
 
+> **Alpine：** 先執行 `apk add bash git`——這些 script 是 Bash，而 Alpine 只內建 BusyBox `ash`。
+
 ```bash
 git clone https://github.com/F-e-u-e-r/tailscale-ai-egress.git
 cd tailscale-ai-egress

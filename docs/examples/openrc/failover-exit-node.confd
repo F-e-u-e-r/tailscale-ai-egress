@@ -1,0 +1,14 @@
+# /etc/conf.d/failover-exit-node — optional overrides for failover-exit-node.sh.
+#
+# The wrapper already self-loads /opt/tailscale-ai-egress/generated/failover.env;
+# use this file only to point elsewhere or override a single value. OpenRC sources
+# this file, so values must be `export`ed to reach the supervised child process.
+
+#export FAILOVER_ENV=/opt/tailscale-ai-egress/generated/failover.env
+#export PRIMARY_EXIT_NODE=ai-egress-jp-01
+#export FALLBACK_EXIT_NODE=ai-egress-sg-01
+
+# Running as root needs no sudo setting (root runs `tailscale set` directly). For an
+# UNPRIVILEGED operator: run `tailscale set --operator=<user>` once, then set 0 below.
+# Use 1 only with a deliberately configured non-interactive sudo.
+#export AI_EGRESS_USE_SUDO=0
