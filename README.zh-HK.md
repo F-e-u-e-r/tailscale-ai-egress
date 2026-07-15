@@ -34,7 +34,7 @@ cd tailscale-ai-egress
 - **📊 Connector HA 監察 + metrics** — `monitor-connectors.sh` 報告每台 connector 的 online／可達性／route 狀態，以及 per-connector metrics（Tx/Rx counters、liveness、`tailscale ping` latency、connection path）。用 `--prometheus-textfile` 輸出 node_exporter／Prometheus textfile，或用 `health_check.py peer-metrics` 讀單一 connector。
 - **🧭 引導式設定，automation 需 opt in** — 預設只產生手動 policy snippet；只有你選擇時才 opt in 可審核的 API policy（`plan` → `apply-plan`），永不自動執行。
 - **🩺 診斷，支援 JSON** — `diagnose.sh`（VPS）和 `check-client-routes.sh`（client）端到端驗證 routing，兩者都支援 `--json` 供 scripting 使用。
-- **🔒 安全優先** — 不收集 telemetry；secrets 只從 env／hidden input 讀取；驗證 release artifact checksum；可審核 policy plan 配 `If-Match` concurrency check；health engine 對 malformed status fail closed。
+- **🔒 安全優先** — 不收集 telemetry；secrets 只從 env／hidden input 讀取；驗證 release artifact checksum，並可選用 `gh` build-provenance attestation 驗證；可審核 policy plan 配 `If-Match` concurrency check；health engine 對 malformed status fail closed。
 
 ## 目錄
 
@@ -409,7 +409,7 @@ AI_EGRESS_DOMAINS_FILE=/path/to/domains.txt
 
 - Auth keys 和 API tokens 只從 environment variables 或 hidden terminal input 讀取，不會寫入 repo files 或 logs。`tskey-api-...` 只用於 Admin Console policy 更新，`tskey-auth-...` 只用於註冊 VPS node。
 - `tailscale up` 使用 `--auth-key=file:...`，避免 key 出現在 shell history。非互動執行必須設定 `TAILSCALE_AUTHKEY`，否則 installer 會退出而不會一直等 browser login。
-- `install.sh` 預設會用 release 的 `SHA256SUMS` 驗證下載的 artifact；`bootstrap.sh` 在 fresh node 上不會未經詢問就傳入 `tailscale up --reset`。
+- `install.sh` 預設會用 release 的 `SHA256SUMS` 驗證下載的 artifact。若系統有 [GitHub CLI](https://cli.github.com/) `gh`（>= 2.93.0），還會額外驗證 release tarball 的 **build provenance attestation**，並收窄到本 repo 的 release workflow 及該 exact tag；`gh` 缺失、過舊或版本無法辨識會退回只做 checksum（不會失敗），但當一個可用的 `gh` 主動拒絕 attestation 時則屬 fatal。設 `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1` 可以退出此驗證（例如離線安裝或非 GitHub mirror）——checksum 仍會執行，但不再驗證 publisher provenance。`bootstrap.sh` 在 fresh node 上不會未經詢問就傳入 `tailscale up --reset`。
 - Advanced Mode 在套用前會寫入可審核 plan（包含原始 `current.hujson` 和 SHA-256 checks），`apply-plan` 會用 planning 時的 `ETag` 搭配 `If-Match`，偵測之後發生的 policy 變更而不是靜默覆寫。
 - 產生的 policy 會 grant `autogroup:member` → `autogroup:internet`，並為 connector tag auto-approve `0.0.0.0/0` 和 `::/0`——這是 broad app-connector egress 所需，但會擴大 restrictive policy，請小心保護 `tag:ai-egress-*` ownership。
 - Manual mode 不需要任何 Tailscale API credential。本專案不收集 telemetry，也不會把 logs 傳到 project-owned servers。

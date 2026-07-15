@@ -90,6 +90,10 @@ git checkout v1.0.0
 `install.sh` remains available for convenience. Outside a checkout, it downloads
 the tagged release artifact for `VERSION` (or `TAILSCALE_AI_EGRESS_VERSION`) and
 verifies it against that release's `SHA256SUMS` before running `bootstrap.sh`.
+When `gh` (>= 2.93.0) is present it also verifies the tarball's build-provenance
+attestation against the release workflow on the exact tag; a missing/older/
+unrecognized `gh` degrades to checksum-only, and `TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1`
+opts out (see [Configuration.md](Configuration.md#remote-installer-installsh)).
 Setting `TAILSCALE_AI_EGRESS_BRANCH` switches to a development branch archive
 and prints an unverified-download warning.
 
