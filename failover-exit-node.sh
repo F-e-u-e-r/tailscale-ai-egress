@@ -3,7 +3,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.2.0}"
 
 # Initialised early so the cleanup trap is safe even on Bash 3.2 early exits.
 tmp_files=()
