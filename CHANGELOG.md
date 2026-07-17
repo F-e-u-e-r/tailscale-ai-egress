@@ -13,6 +13,8 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-17
+
 ### Added
 
 - **CI: bilingual README doc-drift check.** `scripts/check_readme_parity.py` (stdlib-only) fails if
@@ -376,7 +378,8 @@ are summarized from project history.
 - `bootstrap.sh` connector setup, `diagnose.sh`, `check-client-routes.sh`,
   `rollback.sh`, the common domain list, and Manual Guided Mode policy snippets.
 
-[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.2.0
 [1.1.1]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.1
 [1.1.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.0
 [1.0.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.0.0

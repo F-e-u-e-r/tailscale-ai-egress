@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.1.1}"
+VERSION="${VERSION:-1.2.0}"
 GENERATED_DIR="${GENERATED_DIR:-$ROOT_DIR/generated}"
 TAILSCALE_TAILNET="${TAILSCALE_TAILNET:--}"
 DRY_RUN="${DRY_RUN:-0}"

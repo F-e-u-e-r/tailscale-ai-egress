@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 # Kept in lock-step with the VERSION file (checked by tests/test_release_metadata.py).
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 STATE_SCHEMA_VERSION = 1
 
