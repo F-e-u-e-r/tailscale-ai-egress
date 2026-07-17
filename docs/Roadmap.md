@@ -1,6 +1,6 @@
 # Roadmap
 
-This is a **non-binding** planning document for direction beyond v1.1.1. It does
+This is a **non-binding** planning document for direction beyond v1.2.0. It does
 not promise dates or delivery. The binding contract is [Stability](Stability.md):
 within 1.x nothing under its "Frozen surface" changes incompatibly, and GUI /
 provider provisioning / telemetry / additional proxy protocols stay out of scope.
@@ -18,9 +18,10 @@ Every item below is tagged so the compatibility impact is explicit up front.
 
 ---
 
-## Now — v1.2 candidates (`1.x additive-safe` unless noted)
+## Shipped in v1.2.0 (`1.x additive-safe` unless noted)
 
-Highest user value first.
+All items below landed and ship in the v1.2.0 release; acceptance notes are
+kept for the record.
 
 - **Custom connector-tag detection in `diagnose.sh`.** `1.x additive-safe`. (**done**)
   Diagnostics no longer assume the `tag:ai-egress-*` convention; detection
