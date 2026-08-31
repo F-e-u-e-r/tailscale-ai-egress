@@ -19,8 +19,11 @@ reading on:
   Everything from [Intended Topology](#intended-topology) through
   [Health Checks](#health-checks) below — topology, oldest-first primary
   selection, bootstrap, the second-machine policy prompt, verification —
-  describes Model A. If you do not have a reason to force which pool egresses
-  your AI traffic, use Model A and stop at the end of those sections.
+  describes Model A, and the later
+  [Exit-Node Failover](#exit-node-failover-full-traffic) and
+  [Taking One Machine Out](#taking-one-machine-out) sections apply to both
+  models. If you do not have a reason to force which pool egresses your AI
+  traffic, use Model A and skip the Advanced Mode section.
 - **Model B — distinct-tag pools with forced selection (advanced, opt-in,
   planned for v1.3).** Primary and fallback connector pools live under
   distinct tags, and an operator-invoked, auditable switch forces which pool
@@ -233,9 +236,9 @@ What you will actually see, and what to do:
 | Report shows policy fields `unavailable` | No policy credential | Report degrades to status-only; a switch (`--to` / `--apply`) refuses instead |
 | Refusal: managed entry missing, or duplicate `--connector-name` matches | Ambiguous target entry | Fix `--connector-name` (default `AI-Egress-<REGION>`) or the policy |
 | Refusal: target tag not in `tagOwners`, or autoApprovers/DNS-grant readiness missing | The target pool is not declared | Run the [`--declare` setup step](#adopting-model-b-a-to-b) |
-| Refusal: target pool has zero online tagged nodes (at plan time, and re-checked right before apply) | Nowhere safe to go | Bring a fallback-pool node online first |
+| Refusal: target pool has zero online tagged nodes (at plan time, and re-checked right before apply) | Nowhere safe to go | Bring an online node up in the **target** pool first (whichever pool `--to` names) |
 | Refusal: status or policy unreadable or ambiguous | Fail-closed on bad input | Investigate `tailscale status --json` / the credential; retry when clean |
-| Refusal while planning: the policy changed between the script's pre-flight and the planner's fetch | Concurrent-edit protection (the scripted path pins the expected `connectors` value; the planner re-checks every precondition against its own fetched snapshot) | Re-run the switch |
+| Refusal while planning: the policy changed between the script's pre-flight and the planner's fetch | Concurrent-edit protection (the scripted path pins the expected `connectors` value; the planner re-checks every policy-derived precondition against its own fetched snapshot) | Re-run the switch |
 | `apply-plan` refuses with an ETag conflict (412) | The policy changed after the bundle was created | Regenerate the plan; nothing was written |
 | Cooldown warning (last switch younger than `CONNECTOR_SWITCH_COOLDOWN`; shows the previous switch's timestamp and plan id) | Anti-fat-finger advisory, not a lockout | The `APPLY <plan-id>` confirmation still stands — proceed only deliberately |
 | Readback mismatch after apply (re-read once for propagation lag) | The policy did not read back as the target | **Nothing further is written automatically**; the tool reports loudly and exits non-zero — see [Rollback](#rollback-model-b) |
@@ -275,7 +278,7 @@ one exception, flagged below.
 1. **Declare the fallback pool in policy first:**
 
    ```bash
-   # v1.3 — not yet released
+   # connector-plan: v1.3 — not yet released (apply-plan already ships today)
    python3 scripts/policy_tool.py connector-plan --declare tag:<fallback>
    python3 scripts/policy_tool.py apply-plan generated/policy-plans/plan.<plan-id>
    ```
@@ -289,9 +292,11 @@ one exception, flagged below.
    undeclared tag).
 2. **Provision the fallback pool.** Preferred: a **new node** — follow
    [Bootstrap The Two Machines](#bootstrap-the-two-machines) with these
-   Model B overrides: set the fallback tag
-   (`CONNECTOR_HOSTNAME=... REGION=... ./bootstrap.sh` with the fallback
-   tag's auth key; the bootstrap already advertises BOTH
+   Model B overrides: set the fallback tag EXPLICITLY
+   (`CONNECTOR_TAG=tag:<fallback> CONNECTOR_HOSTNAME=... REGION=...
+   ./bootstrap.sh` with the fallback tag's auth key — `CONNECTOR_TAG` must be
+   set, because `REGION` alone derives the original region tag and would
+   advertise the Model A tag instead; the bootstrap already advertises BOTH
    `--advertise-connector` and `--advertise-tags`, which an app connector
    needs), **answer `n` at the policy prompt, and do not manually merge the
    generated policy snippet** — the ordinary policy path is a full additive

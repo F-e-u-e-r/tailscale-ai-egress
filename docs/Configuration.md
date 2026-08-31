@@ -200,8 +200,9 @@ controller and monitor keys: environment first, then
   prominent warning with the previous switch's timestamp and plan id.
   **Advisory only:** there is no hard refusal and no `--force` flag — the
   existing `APPLY <plan-id>` confirmation still stands between the warning
-  and any write. An "already active" no-op touches neither the state file
-  nor the cooldown clock.
+  and any write. An "already active" attempt is refused before any bundle is
+  generated (a no-op: it touches neither the state file nor the cooldown
+  clock).
 - **State file: `generated/connector-switch-state.json`** (`schema_version:
   1`; fields `active_tag`, `previous_connectors` — the verbatim pre-switch
   array — `last_switch_at`, `last_plan_id`). Written atomically, and only
