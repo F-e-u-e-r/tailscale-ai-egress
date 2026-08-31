@@ -376,7 +376,7 @@ python3 scripts/policy_tool.py list-plans
 python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id>
 ```
 
-`restore-plan` validates `current.hujson`, fetches a fresh `ETag`, asks for `RESTORE <plan-id>`, then restores the captured pre-apply policy. During `./bootstrap.sh`, if Advanced Mode applies a plan but `tailscale up` then fails, the installer automatically attempts `restore-plan` for that bundle before exiting.
+`restore-plan` validates `current.hujson`, fetches a fresh `ETag`, asks for `RESTORE <plan-id>`, then restores the captured pre-apply policy. Note that it rewrites the entire policy from the captured snapshot — any policy edit made after that snapshot is lost. During `./bootstrap.sh`, if Advanced Mode applies a plan but `tailscale up` then fails, the installer automatically attempts `restore-plan` for that bundle before exiting.
 
 The former direct `apply` command saved timestamped backups in `generated/`; `rollback.sh` still restores any such pre-existing backups:
 

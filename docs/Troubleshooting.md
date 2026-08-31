@@ -180,4 +180,4 @@ generated/policy-plans/failed.<plan-id>/merged.json
 generated/policy-plans/failed.<plan-id>/diff.patch
 ```
 
-Rollback options are documented in the README and `docs/Tailscale-API-mode.md`. In short, use `python3 scripts/policy_tool.py list-plans` and `python3 scripts/policy_tool.py restore-plan <plan-dir>` for v0.4 plan restores. Use `./rollback.sh --list` only for legacy `tailnet-policy.backup.*.hujson` files.
+Rollback options are documented in the README and `docs/Tailscale-API-mode.md`. In short, use `python3 scripts/policy_tool.py list-plans` and `python3 scripts/policy_tool.py restore-plan <plan-dir>` for v0.4 plan restores (`restore-plan` rewrites the entire policy from the captured snapshot — any policy edit made after that snapshot is lost). Use `./rollback.sh --list` only for legacy `tailnet-policy.backup.*.hujson` files.

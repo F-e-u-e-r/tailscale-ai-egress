@@ -159,6 +159,64 @@ optional `device.created` ordering check in `monitor-connectors.sh` uses
 without failing. See [Failover](Failover.md) for the full workflow and the
 `docs/examples/` directory for systemd, OpenRC, launchd, and cron units.
 
+## Connector Switch (Model B, v1.3)
+
+> **Status: planned for v1.3 — not yet released.** These settings belong to
+> the advanced distinct-tag connector switch
+> ([Failover — Advanced Mode](Failover.md#advanced-mode-distinct-tag-active-connector-switch-model-b));
+> the tool that reads them ships with v1.3. They are documented ahead of
+> implementation by the design's pre-implementation gate.
+
+**Not to be confused with the v1.1 settings above.** These keys are for the
+v1.3 connector-*switch* tool and are distinct from similarly-named settings:
+`PRIMARY_CONNECTOR_TAG` / `FALLBACK_CONNECTOR_TAG` name pool **tags** for the
+switch, while `PRIMARY_CONNECTOR` / `FALLBACK_CONNECTOR` name node
+**hostnames** for the read-only monitor; `CONNECTOR_SWITCH_COOLDOWN` belongs
+to the switch tool, while `COOLDOWN` belongs to the exit-node controller; and
+the switch keeps its own `generated/connector-switch-state.json`, separate
+from the exit-node controller's `generated/failover-state.json`.
+
+```bash
+# v1.3 — not yet released
+PRIMARY_CONNECTOR_TAG=tag:ai-egress-jp    # the primary pool's connector tag
+FALLBACK_CONNECTOR_TAG=tag:ai-egress-jp2  # the fallback pool's connector tag
+CONNECTOR_SWITCH_COOLDOWN=600             # advisory warning window after a switch, seconds
+```
+
+These keys follow the same `failover.env` precedence as the exit-node
+controller and monitor keys: environment first, then
+`generated/failover.env`, then built-in defaults.
+
+- **`PRIMARY_CONNECTOR_TAG` / `FALLBACK_CONNECTOR_TAG`** — both are required
+  for any switch: present, valid `tag:` syntax, and distinct, or the switch
+  refuses with a configuration pointer. `--to` must name one of the pair.
+  Which pool is *active* is never configured here — it is read from the live
+  policy.
+- **`CONNECTOR_SWITCH_COOLDOWN`** — default `600`. An integer number of
+  seconds in `[0, 86400]`; `0` disables the warning; out-of-range or
+  non-numeric values are rejected with a clear error before any probing or
+  switching (matching the validation style of the settings above). If the
+  last recorded switch is younger than this window, the tool prints a
+  prominent warning with the previous switch's timestamp and plan id.
+  **Advisory only:** there is no hard refusal and no `--force` flag — the
+  existing `APPLY <plan-id>` confirmation still stands between the warning
+  and any write. An "already active" attempt is refused before any bundle is
+  generated (a no-op: it touches neither the state file nor the cooldown
+  clock).
+- **State file: `generated/connector-switch-state.json`** (`schema_version:
+  1`; fields `active_tag`, `previous_connectors` — the verbatim pre-switch
+  array — `last_switch_at`, `last_plan_id`). Written atomically, and only
+  after a successful apply **and** readback; never on plan-only runs or a
+  readback mismatch. An absent file is normal (cold start): report mode
+  derives the active pool from the live policy, which is always the source of
+  truth — when the file disagrees with reality, that is reported as drift and
+  the file's fields are advisory until the next successful scripted switch.
+  Safe to delete when leaving Model B.
+- **`--connector-name` interplay** — the switch targets the managed
+  app-connector entry matching `--connector-name` (default
+  `AI-Egress-<REGION>`, as elsewhere in this project). It must match exactly
+  one entry; zero or duplicate matches refuse the switch (ambiguous target).
+
 ## Recommended Auth Key Settings
 
 When the installer asks for `Tailscale node auth key`, use a pre-authentication auth key from the Tailscale Admin Console Keys page. It should start with `tskey-auth-...`. Do not paste a `tskey-api-...` API token here; API tokens are only for Admin Console policy updates.
