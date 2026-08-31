@@ -365,7 +365,7 @@ python3 scripts/policy_tool.py list-plans
 python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id>
 ```
 
-`restore-plan` 會驗證 `current.hujson`、fetch fresh `ETag`、要求你輸入 `RESTORE <plan-id>`，然後 restore apply 前捕捉到的 policy。在 `./bootstrap.sh` 期間，如果 Advanced Mode 已 apply plan 但之後 `tailscale up` 失敗，installer 會先自動嘗試 `restore-plan` 才退出。
+`restore-plan` 會驗證 `current.hujson`、fetch fresh `ETag`、要求你輸入 `RESTORE <plan-id>`，然後 restore apply 前捕捉到的 policy。留意它會用捕捉到的 snapshot 覆寫整份 policy — snapshot 之後的任何 policy 修改都會遺失。在 `./bootstrap.sh` 期間，如果 Advanced Mode 已 apply plan 但之後 `tailscale up` 失敗，installer 會先自動嘗試 `restore-plan` 才退出。
 
 舊的 direct `apply` command 曾在 `generated/` 儲存 timestamped backups；`rollback.sh` 仍可還原這些既有 backups：
 

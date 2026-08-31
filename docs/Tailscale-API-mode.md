@@ -182,7 +182,7 @@ python3 scripts/policy_tool.py list-plans
 python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id>
 ```
 
-`restore-plan` restores the `current.hujson` captured before that plan was applied. It verifies the saved SHA-256, validates the policy with Tailscale, fetches a fresh current policy `ETag`, and requires exact `RESTORE <plan-id>` confirmation. A restored plan can be restored again; the original `restored_at` is preserved and later successful restores are appended to `restored_at_history`.
+`restore-plan` restores the `current.hujson` captured before that plan was applied. It rewrites the entire policy from that captured snapshot — any policy edit made after the snapshot is lost. It verifies the saved SHA-256, validates the policy with Tailscale, fetches a fresh current policy `ETag`, and requires exact `RESTORE <plan-id>` confirmation. A restored plan can be restored again; the original `restored_at` is preserved and later successful restores are appended to `restored_at_history`.
 
 The former direct `apply` command saved timestamped backups (`rollback.sh` still restores any pre-existing ones):
 

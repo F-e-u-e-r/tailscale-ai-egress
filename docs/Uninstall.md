@@ -30,6 +30,9 @@ python3 scripts/policy_tool.py list-plans
 python3 scripts/policy_tool.py restore-plan generated/policy-plans/plan.<plan-id>
 ```
 
+`restore-plan` rewrites the entire policy from the captured snapshot — any
+policy edit made after that snapshot is lost.
+
 Legacy backup restore (from the former direct `apply` command):
 
 ```bash
