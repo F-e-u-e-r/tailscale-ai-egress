@@ -1403,6 +1403,439 @@ def create_policy_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+# Sentinel distinguishing "--expected-from omitted" (no compare-and-swap) from
+# "--expected-from null" (a real CAS value expecting an absent/null connectors).
+_EXPECTED_FROM_UNSET = object()
+
+# Both default-route CIDRs an app-connector pool must auto-approve.
+_DEFAULT_ROUTE_CIDRS = ("0.0.0.0/0", "::/0")
+
+
+def cas_equal(left: Any, right: Any) -> bool:
+    """Type-strict deep equality for compare-and-swap on the raw connectors value.
+
+    Plain ``==`` treats ``True == 1`` and ``[True] == [1]`` as equal, so a JSON
+    ``true`` would spuriously match ``1``. This checks ``type()`` exactly (with
+    ``bool`` distinct from ``int``) and recurses through lists/dicts, giving the
+    verbatim semantics the switch CAS promises (order, case, multiplicity, shape,
+    and JSON type all significant).
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(cas_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(cas_equal(left[key], right[key]) for key in left)
+    return left == right
+
+
+def find_managed_connector_coords(policy: dict[str, Any], connector_name: str) -> list[tuple[int, int]]:
+    """Every ``(nodeAttrs index, connector index)`` whose app-connector name matches.
+
+    Exhaustive (never first-match-and-break) and defensive: non-dict attrs,
+    non-dict ``app`` values, non-list app-connector arrays, and non-dict entries
+    are skipped without raising. Upstream shape validation has already
+    fail-closed genuinely malformed policies; this walk must stay
+    TypeError-free regardless so 0/>1 matches surface as refusals, not crashes.
+    """
+    coords: list[tuple[int, int]] = []
+    node_attrs = policy.get("nodeAttrs")
+    if not isinstance(node_attrs, list):
+        return coords
+    for attr_index, attr in enumerate(node_attrs):
+        if not isinstance(attr, dict):
+            continue
+        app = attr.get("app")
+        if not isinstance(app, dict):
+            continue
+        connectors = app.get(APP_CONNECTORS_KEY)
+        if not isinstance(connectors, list):
+            continue
+        for connector_index, connector in enumerate(connectors):
+            if isinstance(connector, dict) and connector.get("name") == connector_name:
+                coords.append((attr_index, connector_index))
+    return coords
+
+
+def pool_readiness_error(policy: dict[str, Any], target_tag: str, member_src: str) -> str | None:
+    """Return a specific error if the target pool is not switch-ready, else None.
+
+    Containment, not equality: a route approver list or DNS grant carrying the
+    target tag ALONGSIDE other values still satisfies readiness, and
+    ``tagOwners[target]`` may be owned by any principal. Defensive against
+    inner-value type surprises the shape validator does not deeply check (a
+    scalar where a list is expected reads as a miss, never a crash, and a bare
+    ``in`` on a non-list is never allowed to false-satisfy).
+    """
+    tag_owners = policy.get("tagOwners")
+    owners = tag_owners.get(target_tag) if isinstance(tag_owners, dict) else None
+    if not (isinstance(owners, list) and len(owners) > 0):
+        return f"Target tag {target_tag!r} is not declared in tagOwners; run connector-plan --declare first."
+
+    auto_approvers = policy.get("autoApprovers")
+    routes = auto_approvers.get("routes") if isinstance(auto_approvers, dict) else None
+    if not isinstance(routes, dict):
+        return f"autoApprovers.routes is missing; run connector-plan --declare {target_tag} first."
+    for route in _DEFAULT_ROUTE_CIDRS:
+        approvers = routes.get(route)
+        if not (isinstance(approvers, list) and target_tag in approvers):
+            return (
+                f"autoApprovers.routes[{route!r}] does not auto-approve {target_tag!r}; "
+                f"run connector-plan --declare {target_tag} first."
+            )
+
+    grants = policy.get("grants")
+    if isinstance(grants, list):
+        for grant in grants:
+            if not isinstance(grant, dict):
+                continue
+            src = grant.get("src")
+            dst = grant.get("dst")
+            ip = grant.get("ip")
+            if (
+                isinstance(src, list)
+                and member_src in src
+                and isinstance(dst, list)
+                and target_tag in dst
+                and isinstance(ip, list)
+                and "tcp:53" in ip
+                and "udp:53" in ip
+            ):
+                return None
+    return (
+        f"No member->{target_tag} DNS grant (tcp:53/udp:53) is present; "
+        f"run connector-plan --declare {target_tag} first."
+    )
+
+
+def mutate_switch(policy: dict[str, Any], coords: tuple[int, int], target_tag: str) -> dict[str, Any]:
+    """Switch mutation: exact one-element replacement of the located connectors.
+
+    Deepcopies its input; NEVER ``ordered_union``. A separate function so the
+    falsification corpus can monkeypatch it without touching the reference
+    builder the allowlist guard compares against.
+    """
+    mutated = copy.deepcopy(policy)
+    attr_index, connector_index = coords
+    mutated["nodeAttrs"][attr_index]["app"][APP_CONNECTORS_KEY][connector_index]["connectors"] = [target_tag]
+    return mutated
+
+
+def reference_switch(policy: dict[str, Any], coords: tuple[int, int], target_tag: str) -> dict[str, Any]:
+    """The minimal allowed switch end-state: current with ONLY that one
+    connectors list replaced. Built independently of ``mutate_switch`` so the
+    allowlist guard (``mutated == reference``) catches any extra semantic change.
+    """
+    reference = copy.deepcopy(policy)
+    attr_index, connector_index = coords
+    reference["nodeAttrs"][attr_index]["app"][APP_CONNECTORS_KEY][connector_index]["connectors"] = [target_tag]
+    return reference
+
+
+def _declare_apply(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> None:
+    """Apply the three declaration surfaces additively, in place. Absent parent
+    containers are created via ensure_dict/ensure_list (no KeyError path)."""
+    tag_owners = ensure_dict(policy, "tagOwners")
+    tag_owners[target_tag] = ordered_union(tag_owners.get(target_tag), [tag_owner])
+
+    auto_approvers = ensure_dict(policy, "autoApprovers")
+    routes = ensure_dict(auto_approvers, "routes")
+    for route in _DEFAULT_ROUTE_CIDRS:
+        routes[route] = ordered_union(routes.get(route), [target_tag])
+
+    grants = ensure_list(policy, "grants")
+    dns_grant = {"src": [member_src], "dst": [target_tag], "ip": ["tcp:53", "udp:53"]}
+    if grant_key(dns_grant) not in {grant_key(g) for g in grants if isinstance(g, dict)}:
+        grants.append(dns_grant)
+
+
+def mutate_declare(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> dict[str, Any]:
+    """Declare mutation (deepcopy in, mutated out). Separate function so the
+    falsification corpus can monkeypatch it independently of the reference."""
+    mutated = copy.deepcopy(policy)
+    _declare_apply(mutated, target_tag, tag_owner, member_src)
+    return mutated
+
+
+def reference_declare(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> dict[str, Any]:
+    """The minimal allowed declare end-state: current with EXACTLY the three
+    declaration surfaces added. Independent witness for the allowlist guard."""
+    reference = copy.deepcopy(policy)
+    _declare_apply(reference, target_tag, tag_owner, member_src)
+    return reference
+
+
+def _plan_switch(
+    policy: dict[str, Any],
+    *,
+    connector_name: str,
+    target_tag: str,
+    member_src: str,
+    expected_from: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Returns (mutated_policy, manifest_extra, fail_finding). Exactly one of the
+    first pair / the finding is populated."""
+    coords = find_managed_connector_coords(policy, connector_name)
+    if len(coords) == 0:
+        return None, None, finding(
+            "fail", "managed-entry", f"No app-connector entry named {connector_name!r} was found."
+        )
+    if len(coords) > 1:
+        return None, None, finding(
+            "fail",
+            "managed-entry",
+            f"{len(coords)} app-connector entries are named {connector_name!r}; the switch target is ambiguous.",
+        )
+
+    attr_index, connector_index = coords[0]
+    entry = policy["nodeAttrs"][attr_index]["app"][APP_CONNECTORS_KEY][connector_index]
+    has_connectors = "connectors" in entry
+    current_value = entry.get("connectors") if has_connectors else None
+
+    readiness = pool_readiness_error(policy, target_tag, member_src)
+    if readiness is not None:
+        return None, None, finding("fail", "pool-readiness", readiness)
+
+    if expected_from is not _EXPECTED_FROM_UNSET and not cas_equal(current_value, expected_from):
+        return None, None, finding(
+            "fail",
+            "expected-from-mismatch",
+            f"Current connectors {current_value!r} does not equal --expected-from {expected_from!r}; "
+            "the policy changed since you read it. Regenerate the switch.",
+        )
+
+    if current_value == [target_tag]:
+        return None, None, finding(
+            "fail", "already-active", f"{target_tag} is already the sole active connector pool; nothing to switch."
+        )
+
+    mutated = mutate_switch(policy, coords[0], target_tag)
+    reference = reference_switch(policy, coords[0], target_tag)
+    if mutated != reference:
+        return None, None, finding(
+            "fail",
+            "connector-only-diff",
+            "The switch produced a change beyond the single managed connectors list; refusing to emit the bundle.",
+        )
+
+    manifest_extra = {
+        "operation": "switch-connectors",
+        "from": current_value,
+        "to": target_tag,
+        "connector_name": connector_name,
+    }
+    return mutated, manifest_extra, None
+
+
+def _plan_declare(
+    policy: dict[str, Any],
+    *,
+    target_tag: str,
+    tag_owner: str,
+    member_src: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Returns (mutated_policy, manifest_extra, fail_finding)."""
+    mutated = mutate_declare(policy, target_tag, tag_owner, member_src)
+    if mutated == policy:
+        return None, None, finding(
+            "fail",
+            "declare-already-ready",
+            f"{target_tag} is already declared (tagOwners, both default-route auto-approvers, and the DNS grant "
+            "are all present); nothing to declare.",
+        )
+
+    reference = reference_declare(policy, target_tag, tag_owner, member_src)
+    if mutated != reference:
+        return None, None, finding(
+            "fail",
+            "connector-only-diff",
+            "The declaration produced a change beyond tagOwners, the default-route auto-approvers, and the DNS "
+            "grant; refusing to emit the bundle.",
+        )
+
+    manifest_extra = {"operation": "declare-pool", "to": target_tag}
+    return mutated, manifest_extra, None
+
+
+def connector_plan(args: argparse.Namespace) -> int:
+    plan_id = new_plan_id()
+    if not PLAN_ID_RE.match(plan_id):
+        raise PolicyError(f"Generated invalid plan id: {plan_id}")
+    plans_dir = Path(args.plans_dir)
+    report = new_report("connector-plan")
+    created_at = isoformat_utc()
+
+    is_switch = args.switch_to is not None
+    target_tag = args.switch_to if is_switch else args.declare
+
+    # CONFIG stage (pre-fetch): failures write failed artifacts, mirroring plan's
+    # config-finding handling.
+    config_findings: list[dict[str, Any]] = []
+    tag_error = connector_tag_error(target_tag)
+    if tag_error:
+        config_findings.append(finding("fail", "connector-plan-target", tag_error, {"tag": target_tag}))
+    if is_switch:
+        name_error = connector_name_error(args.connector_name)
+        if name_error:
+            config_findings.append(finding("fail", "connector-name", name_error, {"connector_name": args.connector_name}))
+
+    expected_from: Any = _EXPECTED_FROM_UNSET
+    if args.expected_from is not _EXPECTED_FROM_UNSET:
+        if not is_switch:
+            config_findings.append(
+                finding("fail", "expected-from-misuse", "--expected-from is only valid with --switch-to.")
+            )
+        else:
+            try:
+                expected_from = json.loads(args.expected_from)
+            except (json.JSONDecodeError, ValueError) as exc:
+                config_findings.append(
+                    finding("fail", "expected-from-invalid", f"--expected-from is not valid JSON: {exc}")
+                )
+
+    add_findings(report, config_findings)
+    if first_failure(config_findings) is not None:
+        path = failed_plan_artifacts(plans_dir=plans_dir, plan_id=plan_id, report=report)
+        print_plan_result(status="failed", plan_id=plan_id, path=path, report=report, diff_text=None)
+        return 1
+
+    # Token acquisition, fetch, and the ETag requirement all raise PolicyError
+    # directly (no artifacts), exactly as create_policy_plan does.
+    token, token_mode = get_api_token(args)
+    acl_path = tailnet_path(args.tailnet, "/acl")
+    status, current_text, used_mode, get_headers = tailscale_api("GET", acl_path, token=token, token_mode=token_mode)
+    if status < 200 or status >= 300:
+        raise PolicyError(f"Could not fetch current policy ({status}): {safe_response_text(current_text)}")
+    etag = case_insensitive_header(get_headers, "ETag")
+    if not etag:
+        raise PolicyError(
+            "planning-etag-missing: the Tailscale API did not return a policy ETag. Refusing to plan a connector "
+            "switch that could later apply without compare-and-swap (If-Match) protection."
+        )
+
+    # Shape validation with connector_tag=None: the plan-mode "auto-approvers
+    # already present" advisory is inapplicable here (readiness owns that check)
+    # and would otherwise appear as a success finding.
+    policy, policy_findings = validate_policy_text(current_text, connector_tag=None)
+    add_findings(report, policy_findings)
+    if policy is None or first_failure(policy_findings) is not None:
+        path = failed_plan_artifacts(plans_dir=plans_dir, plan_id=plan_id, report=report, current_text=current_text)
+        print_plan_result(status="failed", plan_id=plan_id, path=path, report=report, diff_text=None)
+        return 1
+
+    if is_switch:
+        mutated, manifest_extra, fail_finding = _plan_switch(
+            policy,
+            connector_name=args.connector_name,
+            target_tag=target_tag,
+            member_src=args.member_src,
+            expected_from=expected_from,
+        )
+    else:
+        mutated, manifest_extra, fail_finding = _plan_declare(
+            policy,
+            target_tag=target_tag,
+            tag_owner=args.tag_owner,
+            member_src=args.member_src,
+        )
+    if fail_finding is not None:
+        add_findings(report, [fail_finding])
+        path = failed_plan_artifacts(plans_dir=plans_dir, plan_id=plan_id, report=report, current_text=current_text)
+        print_plan_result(status="failed", plan_id=plan_id, path=path, report=report, diff_text=None)
+        return 1
+    assert mutated is not None and manifest_extra is not None
+
+    merged_text = dumps(mutated)
+    diff_text = unified_policy_diff(current_text, merged_text, fromfile="current API policy")
+    _merged_policy, merged_findings = validate_policy_text(merged_text, connector_tag=None)
+    add_findings(report, merged_findings)
+    if first_failure(merged_findings) is not None:
+        path = failed_plan_artifacts(
+            plans_dir=plans_dir,
+            plan_id=plan_id,
+            report=report,
+            current_text=current_text,
+            merged_text=merged_text,
+            diff_text=diff_text,
+        )
+        print_plan_result(status="failed", plan_id=plan_id, path=path, report=report, diff_text=diff_text)
+        return 1
+
+    validate_path = tailnet_path(args.tailnet, "/acl/validate")
+    status, validate_text, used_mode, _ = tailscale_api(
+        "POST",
+        validate_path,
+        token=token,
+        token_mode=used_mode,
+        body=merged_text,
+        allow_basic_fallback=True,
+    )
+    if status < 200 or status >= 300:
+        add_finding(
+            report,
+            "fail",
+            "tailscale-api-validate",
+            f"Tailscale policy validation failed ({status}): {safe_response_text(validate_text)}",
+            {"status": status},
+        )
+        path = failed_plan_artifacts(
+            plans_dir=plans_dir,
+            plan_id=plan_id,
+            report=report,
+            current_text=current_text,
+            merged_text=merged_text,
+            diff_text=diff_text,
+        )
+        print_plan_result(status="failed", plan_id=plan_id, path=path, report=report, diff_text=diff_text)
+        return 1
+    add_finding(report, "ok", "tailscale-api-validate", "Tailscale policy validation passed.")
+
+    preview_text = preview_policy_with_api(
+        args,
+        token=token,
+        token_mode=used_mode,
+        merged_text=merged_text,
+        report=report,
+    )
+
+    refresh_summary(report)
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "tool_version": __version__,
+        "plan_id": plan_id,
+        "status": "valid",
+        "created_at": created_at,
+        "tailnet": args.tailnet,
+        "connector_tag": target_tag,
+        "current_sha256": sha256_text(current_text),
+        "merged_sha256": sha256_text(merged_text),
+        "etag": etag,
+        "summary": report["summary"],
+        "findings": report["findings"],
+    }
+    # Additive operation metadata (schema_version stays 1). Switch records
+    # connector_name + verbatim from/to; declare records only to. domains_sha256
+    # is intentionally omitted (this command never reads domains).
+    manifest.update(manifest_extra)
+
+    path = valid_plan_artifacts(
+        plans_dir=plans_dir,
+        plan_id=plan_id,
+        manifest=manifest,
+        current_text=current_text,
+        merged_text=merged_text,
+        diff_text=diff_text,
+        preview_text=preview_text,
+    )
+    print_plan_result(status="valid", plan_id=plan_id, path=path, report=report, diff_text=diff_text)
+    print(f"Apply with: python3 scripts/policy_tool.py apply-plan {path}")
+    return 0
+
+
 def confirm_exact_action(*, action: str, plan_id: str, yes: bool) -> None:
     expected = f"{action} {plan_id}"
     if yes:
@@ -1601,6 +2034,16 @@ def collect_plan_records(plans_dir: Path) -> list[dict[str, Any]]:
                     "connector_tag": manifest.get("connector_tag", ""),
                     "path": str(child),
                 }
+                # Additive connector-plan operation metadata, copied by KEY
+                # PRESENCE (never a default): a declare-pool manifest has no
+                # 'from' key, while a switch whose pre-switch connectors were
+                # absent carries a genuine JSON null 'from'.
+                if "operation" in manifest:
+                    record["operation"] = manifest.get("operation")
+                    if "to" in manifest:
+                        record["to"] = manifest.get("to")
+                    if "from" in manifest:
+                        record["from"] = manifest.get("from")
             except PolicyError as exc:
                 record = {
                     "status": "invalid",
@@ -1645,14 +2088,36 @@ def list_policy_plans(args: argparse.Namespace) -> int:
     print(f"{'STATUS':<10} {'PLAN ID':<26} {'CREATED AT':<22} {'CONNECTOR':<20} PATH")
     for record in records:
         connector = record.get("connector_name") or record.get("connector_tag") or "-"
-        print(
+        line = (
             f"{str(record.get('status', '-')):<10} "
             f"{str(record.get('plan_id', '-')):<26} "
             f"{str(record.get('created_at', '-')):<22} "
             f"{str(connector):<20} "
             f"{record.get('path', '-')}"
         )
+        annotation = connector_plan_annotation(record)
+        if annotation:
+            line = f"{line} {annotation}"
+        print(line)
     return 0
+
+
+def connector_plan_annotation(record: dict[str, Any]) -> str:
+    """Trailing same-row annotation for a connector-plan record, or "" for a
+    legacy/ordinary plan. Defensive: renders whatever companion keys are present
+    and never assumes a known operation, so a malformed or unknown-operation
+    manifest cannot abort the whole listing."""
+    if "operation" not in record:
+        return ""
+    operation = record.get("operation")
+    to_tag = record.get("to")
+    if operation == "switch-connectors":
+        from_rendered = json.dumps(record["from"], separators=(",", ":")) if "from" in record else "?"
+        return f"[switch-connectors: {from_rendered} -> {to_tag if to_tag is not None else '?'}]"
+    if operation == "declare-pool":
+        return f"[declare-pool: {to_tag if to_tag is not None else '?'}]"
+    # Unknown operation: surface it raw rather than assuming a renderer.
+    return f"[{operation}]"
 
 
 def apply_removed(_args: argparse.Namespace) -> NoReturn:
@@ -1885,6 +2350,37 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--prompt-token", action="store_true")
     plan.add_argument("--plans-dir", default="generated/policy-plans")
 
+    connector_plan_cmd = subparsers.add_parser(
+        "connector-plan",
+        help="Plan a connector-scoped policy change (advanced Model B): switch the active pool or declare a pool.",
+    )
+    connector_plan_op = connector_plan_cmd.add_mutually_exclusive_group(required=True)
+    connector_plan_op.add_argument(
+        "--switch-to",
+        metavar="tag:<pool>",
+        help="Replace the managed connector entry's connectors with exactly this one tag.",
+    )
+    connector_plan_op.add_argument(
+        "--declare",
+        metavar="tag:<pool>",
+        help="Add tagOwners + default-route auto-approvers + the DNS grant for this tag (no routing change).",
+    )
+    connector_plan_cmd.add_argument("--connector-name", default=default_connector_name())
+    connector_plan_cmd.add_argument("--tag-owner", default=DEFAULT_TAG_OWNER)
+    connector_plan_cmd.add_argument("--member-src", default=DEFAULT_MEMBER_SRC)
+    connector_plan_cmd.add_argument(
+        "--expected-from",
+        default=_EXPECTED_FROM_UNSET,
+        help="Switch only: refuse unless the current connectors value equals this exact JSON (compare-and-swap).",
+    )
+    connector_plan_cmd.add_argument("--tailnet", default=os.environ.get("TAILSCALE_TAILNET", "-"))
+    connector_plan_cmd.add_argument("--api-key")
+    connector_plan_cmd.add_argument("--oauth-client-id")
+    connector_plan_cmd.add_argument("--oauth-client-secret")
+    connector_plan_cmd.add_argument("--oauth-scopes")
+    connector_plan_cmd.add_argument("--prompt-token", action="store_true")
+    connector_plan_cmd.add_argument("--plans-dir", default="generated/policy-plans")
+
     apply_plan = subparsers.add_parser("apply-plan", help="Apply an existing valid policy plan bundle.")
     apply_plan.add_argument("plan_dir")
     apply_plan.add_argument("--tailnet")
@@ -1983,6 +2479,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "plan":
             return create_policy_plan(args)
+
+        if args.command == "connector-plan":
+            return connector_plan(args)
 
         if args.command == "apply-plan":
             return apply_policy_plan(args)

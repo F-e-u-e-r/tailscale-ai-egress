@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime as dt
 import io
 import json
@@ -1079,6 +1080,789 @@ class PolicyToolTests(unittest.TestCase):
 
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
+
+
+READY_POLICY = {
+    "tagOwners": {"tag:ai-egress-jp": ["autogroup:admin"], "tag:ai-egress-jp2": ["autogroup:admin"]},
+    "autoApprovers": {
+        "routes": {
+            "0.0.0.0/0": ["tag:ai-egress-jp", "tag:ai-egress-jp2"],
+            "::/0": ["tag:ai-egress-jp", "tag:ai-egress-jp2"],
+        }
+    },
+    "grants": [
+        {"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp"], "ip": ["tcp:53", "udp:53"]},
+        {"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp2"], "ip": ["tcp:53", "udp:53"]},
+    ],
+    "nodeAttrs": [
+        {
+            "target": ["*"],
+            "app": {
+                tool.APP_CONNECTORS_KEY: [
+                    {"name": "AI-Egress-JP", "connectors": ["tag:ai-egress-jp"], "domains": ["chatgpt.com"]}
+                ]
+            },
+        }
+    ],
+}
+
+
+class ConnectorPlanUnitTests(unittest.TestCase):
+    def test_cas_equal_type_strict(self):
+        self.assertFalse(tool.cas_equal([True], [1]))
+        self.assertTrue(tool.cas_equal([True], [True]))
+        self.assertFalse(tool.cas_equal("TAG:X", "tag:x"))
+        self.assertFalse(tool.cas_equal(["a", "b"], ["b", "a"]))
+        self.assertFalse(tool.cas_equal(["a", "a"], ["a"]))
+        self.assertFalse(tool.cas_equal("tag:x", ["tag:x"]))
+        self.assertFalse(tool.cas_equal([], None))
+        self.assertTrue(tool.cas_equal(None, None))
+        self.assertTrue(tool.cas_equal(["tag:x"], ["tag:x"]))
+
+    def test_find_managed_connector_coords_counts_and_defensive(self):
+        self.assertEqual(tool.find_managed_connector_coords(READY_POLICY, "AI-Egress-JP"), [(0, 0)])
+        self.assertEqual(tool.find_managed_connector_coords(READY_POLICY, "Nope"), [])
+        # Defensive: malformed shapes are skipped, never raised on.
+        malformed = {"nodeAttrs": ["x", {"app": "notdict"}, {"app": {tool.APP_CONNECTORS_KEY: "notlist"}}]}
+        self.assertEqual(tool.find_managed_connector_coords(malformed, "AI-Egress-JP"), [])
+        self.assertEqual(tool.find_managed_connector_coords({"nodeAttrs": "notlist"}, "AI-Egress-JP"), [])
+
+    def test_pool_readiness_containment_and_misses(self):
+        self.assertIsNone(tool.pool_readiness_error(READY_POLICY, "tag:ai-egress-jp2", "autogroup:member"))
+        # Undeclared tag.
+        self.assertIsNotNone(tool.pool_readiness_error(READY_POLICY, "tag:ai-egress-xx", "autogroup:member"))
+        # Route among others still satisfies (containment, not equality).
+        among = copy.deepcopy(READY_POLICY)
+        among["autoApprovers"]["routes"]["0.0.0.0/0"] = ["tag:other", "tag:ai-egress-jp2", "tag:more"]
+        self.assertIsNone(tool.pool_readiness_error(among, "tag:ai-egress-jp2", "autogroup:member"))
+        # DNS grant with extra ip entries still satisfies.
+        rich = copy.deepcopy(READY_POLICY)
+        rich["grants"][1]["ip"] = ["tcp:53", "udp:53", "tcp:443"]
+        self.assertIsNone(tool.pool_readiness_error(rich, "tag:ai-egress-jp2", "autogroup:member"))
+
+    def test_pool_readiness_inner_value_wrong_types_are_misses_not_crashes(self):
+        scalar_owner = copy.deepcopy(READY_POLICY)
+        scalar_owner["tagOwners"]["tag:ai-egress-jp2"] = "autogroup:admin"
+        self.assertIsNotNone(tool.pool_readiness_error(scalar_owner, "tag:ai-egress-jp2", "autogroup:member"))
+        scalar_route = copy.deepcopy(READY_POLICY)
+        scalar_route["autoApprovers"]["routes"]["0.0.0.0/0"] = "tag:ai-egress-jp2"
+        self.assertIsNotNone(tool.pool_readiness_error(scalar_route, "tag:ai-egress-jp2", "autogroup:member"))
+        scalar_ip = copy.deepcopy(READY_POLICY)
+        scalar_ip["grants"][1]["ip"] = "tcp:53"
+        self.assertIsNotNone(tool.pool_readiness_error(scalar_ip, "tag:ai-egress-jp2", "autogroup:member"))
+
+    def test_pool_readiness_parent_absent_is_miss(self):
+        self.assertIsNotNone(tool.pool_readiness_error({"nodeAttrs": []}, "tag:ai-egress-jp2", "autogroup:member"))
+        owners_only = {"tagOwners": {"tag:ai-egress-jp2": ["autogroup:admin"]}}
+        self.assertIsNotNone(tool.pool_readiness_error(owners_only, "tag:ai-egress-jp2", "autogroup:member"))
+
+
+class ConnectorPlanTests(unittest.TestCase):
+    def cplan_args(self, tmp, *, switch_to=None, declare=None, connector_name="AI-Egress-JP",
+                   expected_from=tool._EXPECTED_FROM_UNSET, member_src="autogroup:member",
+                   tag_owner="autogroup:admin", api_key="tskey-api-test"):
+        return argparse.Namespace(
+            switch_to=switch_to,
+            declare=declare,
+            connector_name=connector_name,
+            tag_owner=tag_owner,
+            member_src=member_src,
+            expected_from=expected_from,
+            tailnet="-",
+            api_key=api_key,
+            oauth_client_id=None,
+            oauth_client_secret=None,
+            oauth_scopes=None,
+            prompt_token=False,
+            plans_dir=str(Path(tmp) / "policy-plans"),
+        )
+
+    def run_cplan(self, args, *, current, etag="planning-etag", get_status=200):
+        current_text = tool.dumps(current) if not isinstance(current, str) else current
+        get_headers = {"ETag": etag} if etag is not None else {}
+        with mock.patch.object(
+            tool,
+            "tailscale_api",
+            side_effect=[
+                (get_status, current_text, "bearer", get_headers),
+                (200, "ok", "bearer", {}),
+                (200, "{}\n", "bearer", {}),
+            ],
+        ):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                rc = tool.connector_plan(args)
+        return rc, stdout.getvalue()
+
+    def only_plan(self, tmp):
+        plans = list((Path(tmp) / "policy-plans").glob("plan.*"))
+        self.assertEqual(len(plans), 1, plans)
+        return plans[0]
+
+    def only_failed(self, tmp):
+        failed = list((Path(tmp) / "policy-plans").glob("failed.*"))
+        self.assertEqual(len(failed), 1, failed)
+        return failed[0]
+
+    def manifest_of(self, plan_dir):
+        return json.loads((plan_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    def failed_finding_ids(self, failed_dir):
+        report = json.loads((failed_dir / "report.invalid.json").read_text(encoding="utf-8"))
+        return [f["id"] for f in report["findings"] if f["status"] == "fail"]
+
+    # --- switch happy + manifest shape ---
+    def test_switch_happy_replaces_connectors_and_records_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 0)
+            plan_dir = self.only_plan(tmp)
+            merged = json.loads((plan_dir / "merged.json").read_text(encoding="utf-8"))
+            entry = merged["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]
+            self.assertEqual(entry["connectors"], ["tag:ai-egress-jp2"])
+            self.assertEqual(entry["domains"], ["chatgpt.com"])  # untouched
+            man = self.manifest_of(plan_dir)
+            self.assertEqual(man["operation"], "switch-connectors")
+            self.assertEqual(man["from"], ["tag:ai-egress-jp"])
+            self.assertEqual(man["to"], "tag:ai-egress-jp2")
+            self.assertEqual(man["connector_tag"], "tag:ai-egress-jp2")
+            self.assertEqual(man["connector_name"], "AI-Egress-JP")
+            self.assertEqual(man["etag"], "planning-etag")
+
+    def test_switch_manifest_omits_domains_sha256(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            self.run_cplan(args, current=READY_POLICY)
+            man = self.manifest_of(self.only_plan(tmp))
+            self.assertNotIn("domains_sha256", man)
+
+    def test_switch_manifest_key_set_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            self.run_cplan(args, current=READY_POLICY)
+            man = self.manifest_of(self.only_plan(tmp))
+            expected = {
+                "schema_version", "tool_version", "plan_id", "status", "created_at", "tailnet",
+                "connector_tag", "current_sha256", "merged_sha256", "etag", "summary", "findings",
+                "operation", "from", "to", "connector_name",
+            }
+            self.assertEqual(set(man.keys()), expected)
+            self.assertEqual(man["schema_version"], 1)
+
+    def test_switch_diff_touches_only_connectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            self.run_cplan(args, current=READY_POLICY)
+            diff = (self.only_plan(tmp) / "diff.patch").read_text(encoding="utf-8")
+            changed = [ln for ln in diff.splitlines() if ln[:1] in {"+", "-"} and not ln.startswith(("+++", "---"))]
+            self.assertTrue(all("ai-egress-jp" in ln for ln in changed), changed)
+
+    # --- reconciliation shapes (raw drift recovery) ---
+    def _switch_from(self, tmp, current_connectors_present, current_value):
+        policy = copy.deepcopy(READY_POLICY)
+        entry = policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]
+        if current_connectors_present:
+            entry["connectors"] = current_value
+        else:
+            del entry["connectors"]
+        args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+        rc, _ = self.run_cplan(args, current=policy)
+        return rc
+
+    def test_switch_reconciles_empty_multi_outofpair_string_absent(self):
+        for present, value, label in [
+            (True, [], "empty"),
+            (True, ["tag:ai-egress-jp", "tag:ai-egress-jp2"], "multi"),
+            (True, ["tag:something-else"], "out-of-pair"),
+            (True, "tag:ai-egress-jp", "string"),
+            (False, None, "absent"),
+        ]:
+            with tempfile.TemporaryDirectory() as tmp:
+                rc = self._switch_from(tmp, present, value)
+                self.assertEqual(rc, 0, label)
+                man = self.manifest_of(self.only_plan(tmp))
+                self.assertEqual(man["from"], value if present else None, label)
+                merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    merged["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"],
+                    ["tag:ai-egress-jp2"], label,
+                )
+
+    def test_switch_already_active_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp")
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 1)
+            self.assertIn("already-active", self.failed_finding_ids(self.only_failed(tmp)))
+
+    # --- CAS ---
+    def test_switch_cas_match_proceeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", expected_from='["tag:ai-egress-jp"]')
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 0)
+
+    def test_switch_cas_mismatches_refuse(self):
+        cases = {
+            "order": '["tag:ai-egress-jp2","tag:ai-egress-jp"]',
+            "string-vs-list": '"tag:ai-egress-jp"',
+        }
+        for label, expected in cases.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                policy = copy.deepcopy(READY_POLICY)
+                policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"] = [
+                    "tag:ai-egress-jp", "tag:ai-egress-jp2"
+                ] if label == "order" else ["tag:ai-egress-jp"]
+                args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", expected_from=expected)
+                rc, _ = self.run_cplan(args, current=policy)
+                self.assertEqual(rc, 1, label)
+                self.assertIn("expected-from-mismatch", self.failed_finding_ids(self.only_failed(tmp)), label)
+
+    def test_switch_cas_null_matches_absent_connectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = copy.deepcopy(READY_POLICY)
+            del policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"]
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", expected_from="null")
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+            self.assertEqual(self.manifest_of(self.only_plan(tmp))["from"], None)
+
+    def test_switch_cas_null_vs_present_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", expected_from="null")
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 1)
+            self.assertIn("expected-from-mismatch", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_switch_expected_from_omitted_performs_no_cas(self):
+        # A present current that would fail any CAS still proceeds when --expected-from is omitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 0)
+
+    def test_switch_expected_from_invalid_json_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", expected_from="{not json")
+            # config-stage refusal: no API calls happen.
+            stdout = io.StringIO()
+            with mock.patch.object(tool, "tailscale_api") as api:
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 1)
+            api.assert_not_called()
+            self.assertIn("expected-from-invalid", self.failed_finding_ids(self.only_failed(tmp)))
+
+    # --- managed entry ---
+    def test_switch_missing_managed_entry_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", connector_name="AI-Egress-NOPE")
+            rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 1)
+            self.assertIn("managed-entry", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_switch_duplicate_managed_entry_refuses_same_and_cross_block(self):
+        for spread in ("same-block", "cross-block"):
+            with tempfile.TemporaryDirectory() as tmp:
+                policy = copy.deepcopy(READY_POLICY)
+                dup = {"name": "AI-Egress-JP", "connectors": ["tag:x"]}
+                if spread == "same-block":
+                    policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY].append(dup)
+                else:
+                    policy["nodeAttrs"].append({"target": ["*"], "app": {tool.APP_CONNECTORS_KEY: [dup]}})
+                args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+                rc, _ = self.run_cplan(args, current=policy)
+                self.assertEqual(rc, 1, spread)
+                self.assertIn("managed-entry", self.failed_finding_ids(self.only_failed(tmp)), spread)
+
+    # --- readiness ---
+    def test_switch_readiness_single_misses_refuse(self):
+        def strip(mut):
+            p = copy.deepcopy(READY_POLICY)
+            mut(p)
+            return p
+        mutators = {
+            "tagowners-absent": lambda p: p["tagOwners"].pop("tag:ai-egress-jp2"),
+            "tagowners-empty": lambda p: p["tagOwners"].__setitem__("tag:ai-egress-jp2", []),
+            "one-route-missing": lambda p: p["autoApprovers"]["routes"]["::/0"].remove("tag:ai-egress-jp2"),
+            "dns-grant-absent": lambda p: p["grants"].pop(1),
+            "dns-missing-udp": lambda p: p["grants"][1].__setitem__("ip", ["tcp:53"]),
+        }
+        for label, mut in mutators.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+                rc, _ = self.run_cplan(args, current=strip(mut))
+                self.assertEqual(rc, 1, label)
+                self.assertIn("pool-readiness", self.failed_finding_ids(self.only_failed(tmp)), label)
+
+    def test_switch_readiness_positive_route_among_others_and_any_owner(self):
+        policy = copy.deepcopy(READY_POLICY)
+        policy["tagOwners"]["tag:ai-egress-jp2"] = ["autogroup:someone-else"]
+        policy["autoApprovers"]["routes"]["0.0.0.0/0"] = ["tag:x", "tag:ai-egress-jp2", "tag:y"]
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+
+    # --- tripwire ---
+    def test_switch_tripwire_extra_change_refuses(self):
+        original = tool.mutate_switch
+
+        def leaky(policy, coords, target):
+            m = original(policy, coords, target)
+            i, j = coords
+            m["nodeAttrs"][i]["app"][tool.APP_CONNECTORS_KEY][j]["domains"] = ["evil.example"]
+            return m
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            with mock.patch.object(tool, "mutate_switch", leaky):
+                rc, _ = self.run_cplan(args, current=READY_POLICY)
+            self.assertEqual(rc, 1)
+            self.assertIn("connector-only-diff", self.failed_finding_ids(self.only_failed(tmp)))
+
+    # --- API failure surface split ---
+    def test_missing_credential_raises_no_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", api_key=None)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(tool.PolicyError):
+                    tool.connector_plan(args)
+            self.assertEqual(list((Path(tmp) / "policy-plans").glob("*")), [])
+
+    def test_get_failure_raises_no_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            with mock.patch.object(tool, "tailscale_api", side_effect=[(500, "boom", "bearer", {})]):
+                with self.assertRaises(tool.PolicyError):
+                    tool.connector_plan(args)
+            self.assertEqual(list((Path(tmp) / "policy-plans").glob("*")), [])
+
+    def test_missing_and_empty_etag_raise_no_artifacts(self):
+        for etag in (None, ""):
+            with tempfile.TemporaryDirectory() as tmp:
+                args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+                headers = {} if etag is None else {"ETag": ""}
+                with mock.patch.object(
+                    tool, "tailscale_api",
+                    side_effect=[(200, tool.dumps(READY_POLICY), "bearer", headers)],
+                ):
+                    with self.assertRaises(tool.PolicyError) as ctx:
+                        tool.connector_plan(args)
+                self.assertIn("planning-etag-missing", str(ctx.exception))
+                self.assertEqual(list((Path(tmp) / "policy-plans").glob("*")), [])
+
+    def test_shape_invalid_fetched_policy_writes_failed_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            bad = copy.deepcopy(READY_POLICY)
+            bad["tagOwners"] = ["not", "a", "dict"]
+            rc, _ = self.run_cplan(args, current=bad)
+            self.assertEqual(rc, 1)
+            self.assertTrue(list((Path(tmp) / "policy-plans").glob("failed.*")))
+
+    def test_validate_api_failure_writes_failed_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            with mock.patch.object(
+                tool, "tailscale_api",
+                side_effect=[
+                    (200, tool.dumps(READY_POLICY), "bearer", {"ETag": "e"}),
+                    (400, "invalid", "bearer", {}),
+                ],
+            ):
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 1)
+            self.assertIn("tailscale-api-validate", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_preview_failure_is_warn_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            with mock.patch.object(
+                tool, "tailscale_api",
+                side_effect=[
+                    (200, tool.dumps(READY_POLICY), "bearer", {"ETag": "e"}),
+                    (200, "ok", "bearer", {}),
+                    (500, "no preview", "bearer", {}),
+                ],
+            ):
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 0)
+            self.assertFalse((self.only_plan(tmp) / "api-preview.json").exists())
+
+    # --- CONFIG-stage refusals ---
+    def test_bad_target_tag_refuses_before_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:UPPER")
+            with mock.patch.object(tool, "tailscale_api") as api:
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 1)
+            api.assert_not_called()
+            self.assertIn("connector-plan-target", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_bad_connector_name_on_switch_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, switch_to="tag:ai-egress-jp2", connector_name="bad name!")
+            with mock.patch.object(tool, "tailscale_api") as api:
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 1)
+            api.assert_not_called()
+            self.assertIn("connector-name", self.failed_finding_ids(self.only_failed(tmp)))
+
+    # --- declare ---
+    def test_declare_happy_from_all_absent_parents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current={"nodeAttrs": []})
+            self.assertEqual(rc, 0)
+            merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+            self.assertEqual(merged["tagOwners"], {"tag:ai-egress-jp2": ["autogroup:admin"]})
+            self.assertEqual(
+                merged["autoApprovers"]["routes"],
+                {"0.0.0.0/0": ["tag:ai-egress-jp2"], "::/0": ["tag:ai-egress-jp2"]},
+            )
+            self.assertEqual(
+                merged["grants"],
+                [{"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp2"], "ip": ["tcp:53", "udp:53"]}],
+            )
+            man = self.manifest_of(self.only_plan(tmp))
+            self.assertEqual(man["operation"], "declare-pool")
+            self.assertEqual(man["to"], "tag:ai-egress-jp2")
+            self.assertNotIn("from", man)
+            self.assertNotIn("connector_name", man)
+            self.assertNotIn("domains_sha256", man)
+
+    def test_declare_manifest_key_set_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            self.run_cplan(args, current={"nodeAttrs": []})
+            man = self.manifest_of(self.only_plan(tmp))
+            expected = {
+                "schema_version", "tool_version", "plan_id", "status", "created_at", "tailnet",
+                "connector_tag", "current_sha256", "merged_sha256", "etag", "summary", "findings",
+                "operation", "to",
+            }
+            self.assertEqual(set(man.keys()), expected)
+
+    def test_declare_does_not_touch_connectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Declare a NOT-yet-declared pool (jp3) while a managed entry naming
+            # jp exists; the connectors list must stay untouched.
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp3")
+            policy = copy.deepcopy(READY_POLICY)
+            policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"] = ["tag:ai-egress-jp"]
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+            merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                merged["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"], ["tag:ai-egress-jp"]
+            )
+
+    def test_declare_route_preservation_unions_not_replaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            policy = {"autoApprovers": {"routes": {"0.0.0.0/0": ["tag:unrelated"]}}}
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+            merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+            self.assertEqual(merged["autoApprovers"]["routes"]["0.0.0.0/0"], ["tag:unrelated", "tag:ai-egress-jp2"])
+
+    def test_declare_already_ready_refuses(self):
+        # Build a policy already carrying all three surfaces.
+        ready = {
+            "tagOwners": {"tag:ai-egress-jp2": ["autogroup:admin"]},
+            "autoApprovers": {"routes": {"0.0.0.0/0": ["tag:ai-egress-jp2"], "::/0": ["tag:ai-egress-jp2"]}},
+            "grants": [{"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp2"], "ip": ["tcp:53", "udp:53"]}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=ready)
+            self.assertEqual(rc, 1)
+            self.assertIn("declare-already-ready", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_declare_proceeds_when_tagowners_nonempty_but_missing_tag_owner(self):
+        # Switch-readiness would pass, but declare must still add our owner.
+        policy = {
+            "tagOwners": {"tag:ai-egress-jp2": ["autogroup:other"]},
+            "autoApprovers": {"routes": {"0.0.0.0/0": ["tag:ai-egress-jp2"], "::/0": ["tag:ai-egress-jp2"]}},
+            "grants": [{"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp2"], "ip": ["tcp:53", "udp:53"]}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+            merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+            self.assertEqual(merged["tagOwners"]["tag:ai-egress-jp2"], ["autogroup:other", "autogroup:admin"])
+
+    def test_declare_proceeds_when_rich_dns_grant_satisfies_containment_but_canonical_grant_key_absent(self):
+        policy = {
+            "tagOwners": {"tag:ai-egress-jp2": ["autogroup:admin"]},
+            "autoApprovers": {"routes": {"0.0.0.0/0": ["tag:ai-egress-jp2"], "::/0": ["tag:ai-egress-jp2"]}},
+            # Containment-satisfying grant (extra ip) but not the canonical grant_key.
+            "grants": [{"src": ["autogroup:member"], "dst": ["tag:ai-egress-jp2"], "ip": ["tcp:53", "udp:53", "tcp:443"]}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            rc, _ = self.run_cplan(args, current=policy)
+            self.assertEqual(rc, 0)
+            merged = json.loads((self.only_plan(tmp) / "merged.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(merged["grants"]), 2)  # canonical grant appended
+
+    def test_declare_tripwire_extra_change_refuses(self):
+        original = tool.mutate_declare
+
+        def leaky(policy, tag, tag_owner, member_src):
+            m = original(policy, tag, tag_owner, member_src)
+            m["extraKey"] = "leak"
+            return m
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2")
+            with mock.patch.object(tool, "mutate_declare", leaky):
+                rc, _ = self.run_cplan(args, current={"nodeAttrs": []})
+            self.assertEqual(rc, 1)
+            self.assertIn("connector-only-diff", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_declare_with_expected_from_refuses_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2", expected_from='["x"]')
+            with mock.patch.object(tool, "tailscale_api") as api:
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    rc = tool.connector_plan(args)
+            self.assertEqual(rc, 1)
+            api.assert_not_called()
+            self.assertIn("expected-from-misuse", self.failed_finding_ids(self.only_failed(tmp)))
+
+    def test_declare_ignores_malformed_connector_name(self):
+        # A garbage ambient connector-name must NOT block a declaration, and must
+        # not be recorded in the declare manifest.
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.cplan_args(tmp, declare="tag:ai-egress-jp2", connector_name="bad name!")
+            rc, _ = self.run_cplan(args, current={"nodeAttrs": []})
+            self.assertEqual(rc, 0)
+            self.assertNotIn("connector_name", self.manifest_of(self.only_plan(tmp)))
+
+
+class ConnectorPlanListAndCompatTests(unittest.TestCase):
+    def _write_manifest(self, plans_dir, plan_id, manifest):
+        plan_dir = plans_dir / f"plan.{plan_id}"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "manifest.json").write_text(tool.dumps(manifest), encoding="utf-8")
+        return plan_dir
+
+    def _base(self, plan_id, **extra):
+        man = {
+            "schema_version": 1,
+            "tool_version": tool.__version__,
+            "plan_id": plan_id,
+            "status": "valid",
+            "created_at": "2026-09-02T00:00:00Z",
+            "connector_tag": "tag:ai-egress-jp2",
+        }
+        man.update(extra)
+        return man
+
+    def test_list_plans_legacy_row_byte_identical(self):
+        # A record WITHOUT operation must render exactly as before (no annotation).
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base("20260527T143022Z-a1b2c3d4", connector_name="AI-Egress-JP"),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=False)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                tool.list_policy_plans(args)
+            body = out.getvalue().splitlines()[1]
+            self.assertTrue(body.rstrip().endswith("a1b2c3d4"))  # ends at PATH, no annotation
+            self.assertNotIn("[", body)
+
+    def test_list_plans_switch_annotation_text_and_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base(
+                    "20260527T143022Z-a1b2c3d4",
+                    connector_name="AI-Egress-JP",
+                    operation="switch-connectors",
+                    **{"from": ["tag:ai-egress-jp"]},
+                    to="tag:ai-egress-jp2",
+                ),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=False)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                tool.list_policy_plans(args)
+            self.assertIn('[switch-connectors: ["tag:ai-egress-jp"] -> tag:ai-egress-jp2]', out.getvalue())
+            args_json = argparse.Namespace(plans_dir=str(plans_dir), json=True)
+            outj = io.StringIO()
+            with mock.patch.object(sys, "stdout", outj):
+                tool.list_policy_plans(args_json)
+            rec = json.loads(outj.getvalue())["plans"][0]
+            self.assertEqual(rec["operation"], "switch-connectors")
+            self.assertEqual(rec["from"], ["tag:ai-egress-jp"])
+            self.assertEqual(rec["to"], "tag:ai-egress-jp2")
+
+    def test_list_plans_declare_connector_column_falls_back_to_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base("20260527T143022Z-a1b2c3d4", operation="declare-pool", to="tag:ai-egress-jp2"),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=False)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                tool.list_policy_plans(args)
+            body = out.getvalue().splitlines()[1]
+            self.assertIn("tag:ai-egress-jp2", body)  # CONNECTOR column populated from connector_tag
+            self.assertIn("[declare-pool: tag:ai-egress-jp2]", body)
+
+    def test_list_plans_declare_record_has_no_from_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base("20260527T143022Z-a1b2c3d4", operation="declare-pool", to="tag:ai-egress-jp2"),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=True)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                tool.list_policy_plans(args)
+            rec = json.loads(out.getvalue())["plans"][0]
+            self.assertNotIn("from", rec)
+
+    def test_list_plans_switch_absent_connectors_from_is_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base(
+                    "20260527T143022Z-a1b2c3d4",
+                    operation="switch-connectors", **{"from": None}, to="tag:ai-egress-jp2",
+                ),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=True)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                tool.list_policy_plans(args)
+            rec = json.loads(out.getvalue())["plans"][0]
+            self.assertIn("from", rec)
+            self.assertIsNone(rec["from"])
+
+    def test_list_plans_defensive_recognized_operation_missing_companion_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base("20260527T143022Z-a1b2c3d4", operation="switch-connectors"),  # no from/to
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=False)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                rc = tool.list_policy_plans(args)
+            self.assertEqual(rc, 0)  # did not crash
+            self.assertIn("switch-connectors", out.getvalue())
+
+    def test_list_plans_defensive_unknown_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plans_dir = Path(tmp)
+            self._write_manifest(
+                plans_dir, "20260527T143022Z-a1b2c3d4",
+                self._base("20260527T143022Z-a1b2c3d4", operation="teleport-pool", to="tag:x"),
+            )
+            args = argparse.Namespace(plans_dir=str(plans_dir), json=False)
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                rc = tool.list_policy_plans(args)
+            self.assertEqual(rc, 0)
+            self.assertIn("[teleport-pool]", out.getvalue())
+
+    def test_apply_plan_accepts_connector_plan_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = ConnectorPlanTests().cplan_args(tmp, switch_to="tag:ai-egress-jp2")
+            ConnectorPlanTests().run_cplan(args, current=READY_POLICY)
+            plan_dir = list((Path(tmp) / "policy-plans").glob("plan.*"))[0]
+            apply_args = argparse.Namespace(
+                plan_dir=str(plan_dir), tailnet=None, api_key="tskey-api-test",
+                oauth_client_id=None, oauth_client_secret=None, oauth_scopes=None,
+                prompt_token=False, yes=True,
+            )
+            with mock.patch.dict(os.environ, {"POLICY_RISK_ACK": "1"}):
+                with mock.patch.object(
+                    tool, "tailscale_api",
+                    side_effect=[(200, "ok", "bearer", {}), (200, "{}", "bearer", {})],
+                ):
+                    rc = tool.apply_policy_plan(apply_args)
+            self.assertEqual(rc, 0)
+
+
+class ConnectorPlanStabilityTests(unittest.TestCase):
+    def test_merge_policy_golden_unchanged(self):
+        policy = {"grants": []}
+        merged = tool.merge_policy(
+            copy.deepcopy(policy),
+            connector_name="AI-Egress-JP",
+            connector_tag="tag:ai-egress-jp",
+            domains=["chatgpt.com"],
+            tag_owner="autogroup:admin",
+            member_src="autogroup:member",
+        )
+        # The ordinary additive merge still produces all of owners/approvers/grants/nodeAttrs.
+        self.assertEqual(merged["tagOwners"], {"tag:ai-egress-jp": ["autogroup:admin"]})
+        self.assertEqual(
+            merged["autoApprovers"]["routes"],
+            {"0.0.0.0/0": ["tag:ai-egress-jp"], "::/0": ["tag:ai-egress-jp"]},
+        )
+        self.assertEqual(len(merged["grants"]), 2)
+        self.assertEqual(
+            merged["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"], ["tag:ai-egress-jp"]
+        )
+
+    def test_connector_plan_never_calls_merge_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for op in ({"switch_to": "tag:ai-egress-jp2"}, {"declare": "tag:ai-egress-jp2"}):
+                args = ConnectorPlanTests().cplan_args(tmp, **op)
+                current = READY_POLICY if "switch_to" in op else {"nodeAttrs": []}
+                with mock.patch.object(tool, "merge_policy", side_effect=AssertionError("merge_policy called")):
+                    ConnectorPlanTests().run_cplan(args, current=current)
+
+    def test_create_policy_plan_does_not_call_connector_plan_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            domains = Path(tmp) / "domains.txt"
+            domains.write_text("chatgpt.com\n", encoding="utf-8")
+            args = argparse.Namespace(
+                domains_file=str(domains), connector_name="AI-Egress-JP", connector_tag="tag:ai-egress-jp",
+                tag_owner="autogroup:admin", member_src="autogroup:member", allow_broad_wildcard=False,
+                tailnet="-", api_key="tskey-api-test", oauth_client_id=None, oauth_client_secret=None,
+                oauth_scopes=None, prompt_token=False, plans_dir=str(Path(tmp) / "policy-plans"),
+            )
+            with mock.patch.object(tool, "mutate_switch", side_effect=AssertionError("mutate_switch called")):
+                with mock.patch.object(tool, "mutate_declare", side_effect=AssertionError("mutate_declare called")):
+                    with mock.patch.object(
+                        tool, "tailscale_api",
+                        side_effect=[
+                            (200, "{}\n", "bearer", {"ETag": "e"}),
+                            (200, "ok", "bearer", {}),
+                            (200, "{}\n", "bearer", {}),
+                        ],
+                    ):
+                        out = io.StringIO()
+                        with mock.patch.object(sys, "stdout", out):
+                            rc = tool.create_policy_plan(args)
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
