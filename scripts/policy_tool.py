@@ -1536,36 +1536,48 @@ def reference_switch(policy: dict[str, Any], coords: tuple[int, int], target_tag
     return reference
 
 
-def _declare_apply(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> None:
-    """Apply the three declaration surfaces additively, in place. Absent parent
-    containers are created via ensure_dict/ensure_list (no KeyError path)."""
-    tag_owners = ensure_dict(policy, "tagOwners")
+def mutate_declare(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> dict[str, Any]:
+    """Declare mutation (deepcopy in, mutated out): the three declaration
+    surfaces, additively; absent parent containers are created via
+    ensure_dict/ensure_list (no KeyError path). Deliberately does NOT share a
+    transform body with reference_declare — the allowlist guard compares the
+    two as independent witnesses, so a defect here cannot self-certify."""
+    mutated = copy.deepcopy(policy)
+    tag_owners = ensure_dict(mutated, "tagOwners")
     tag_owners[target_tag] = ordered_union(tag_owners.get(target_tag), [tag_owner])
 
-    auto_approvers = ensure_dict(policy, "autoApprovers")
+    auto_approvers = ensure_dict(mutated, "autoApprovers")
     routes = ensure_dict(auto_approvers, "routes")
     for route in _DEFAULT_ROUTE_CIDRS:
         routes[route] = ordered_union(routes.get(route), [target_tag])
 
-    grants = ensure_list(policy, "grants")
+    grants = ensure_list(mutated, "grants")
     dns_grant = {"src": [member_src], "dst": [target_tag], "ip": ["tcp:53", "udp:53"]}
     if grant_key(dns_grant) not in {grant_key(g) for g in grants if isinstance(g, dict)}:
         grants.append(dns_grant)
-
-
-def mutate_declare(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> dict[str, Any]:
-    """Declare mutation (deepcopy in, mutated out). Separate function so the
-    falsification corpus can monkeypatch it independently of the reference."""
-    mutated = copy.deepcopy(policy)
-    _declare_apply(mutated, target_tag, tag_owner, member_src)
     return mutated
 
 
 def reference_declare(policy: dict[str, Any], target_tag: str, tag_owner: str, member_src: str) -> dict[str, Any]:
-    """The minimal allowed declare end-state: current with EXACTLY the three
-    declaration surfaces added. Independent witness for the allowlist guard."""
+    """The minimal allowed declare end-state, built INDEPENDENTLY of
+    mutate_declare (only the low-level ordered_union/grant_key/ensure_* helpers
+    are shared, per the reviewed guard-independence contract): current with
+    exactly tagOwners[tag], both default-route approvers, and the DNS grant
+    added, in that order, and nothing else."""
     reference = copy.deepcopy(policy)
-    _declare_apply(reference, target_tag, tag_owner, member_src)
+    owners_parent = ensure_dict(reference, "tagOwners")
+    owners_parent[target_tag] = ordered_union(owners_parent.get(target_tag), [tag_owner])
+
+    approvers_parent = ensure_dict(reference, "autoApprovers")
+    route_map = ensure_dict(approvers_parent, "routes")
+    route_map["0.0.0.0/0"] = ordered_union(route_map.get("0.0.0.0/0"), [target_tag])
+    route_map["::/0"] = ordered_union(route_map.get("::/0"), [target_tag])
+
+    grant_list = ensure_list(reference, "grants")
+    expected_grant = {"src": [member_src], "dst": [target_tag], "ip": ["tcp:53", "udp:53"]}
+    existing_keys = {grant_key(g) for g in grant_list if isinstance(g, dict)}
+    if grant_key(expected_grant) not in existing_keys:
+        grant_list.append(expected_grant)
     return reference
 
 
@@ -1615,7 +1627,7 @@ def _plan_switch(
 
     mutated = mutate_switch(policy, coords[0], target_tag)
     reference = reference_switch(policy, coords[0], target_tag)
-    if mutated != reference:
+    if not cas_equal(mutated, reference):
         return None, None, finding(
             "fail",
             "connector-only-diff",
@@ -1640,7 +1652,7 @@ def _plan_declare(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Returns (mutated_policy, manifest_extra, fail_finding)."""
     mutated = mutate_declare(policy, target_tag, tag_owner, member_src)
-    if mutated == policy:
+    if cas_equal(mutated, policy):
         return None, None, finding(
             "fail",
             "declare-already-ready",
@@ -1649,7 +1661,7 @@ def _plan_declare(
         )
 
     reference = reference_declare(policy, target_tag, tag_owner, member_src)
-    if mutated != reference:
+    if not cas_equal(mutated, reference):
         return None, None, finding(
             "fail",
             "connector-only-diff",
