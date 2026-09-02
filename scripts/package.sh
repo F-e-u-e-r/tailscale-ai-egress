@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.3.0}"
 PREFIX="tailscale-ai-egress-$VERSION"
 
 OUT_DIR="$ROOT_DIR/dist"
@@ -140,7 +140,7 @@ if [ "$CHECK" = "1" ]; then
   done
   # Ensure ignored/sensitive paths did not leak into the archive.
   leaked=""
-  for bad in generated/policy-plans dist .git; do
+  for bad in generated/policy-plans dist .git skills-staging; do
     [ -e "$verify_dir/$PREFIX/$bad" ] && leaked="$leaked $bad"
   done
   rm -rf "$verify_dir"

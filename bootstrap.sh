@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.3.0}"
 
 REGION="${REGION:-}"
 REGION_UPPER=""

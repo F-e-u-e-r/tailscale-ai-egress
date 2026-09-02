@@ -31,7 +31,7 @@ from typing import Any, NoReturn
 
 
 API_BASE = "https://api.tailscale.com/api/v2"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 # Frozen for the v1.x series. Plan bundles produced by v0.4 use the same major
 # version and remain readable by v1.x tooling; see docs/Stability.md.
 MANIFEST_SCHEMA_VERSION = 1

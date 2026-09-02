@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || true)"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.3.0}"
 
 # Shared internal library (source-only; see docs/design/shared-shell-library.md).
 COMMON_LIB="$SCRIPT_DIR/scripts/lib/common.sh"

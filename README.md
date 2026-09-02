@@ -4,7 +4,7 @@ Languages: English | [繁體中文（香港）](README.zh-HK.md)
 
 [![CI](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml/badge.svg)](https://github.com/F-e-u-e-r/tailscale-ai-egress/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20VPS%20%C2%B7%20POSIX%20shell-lightgrey)
 ![Telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)
 

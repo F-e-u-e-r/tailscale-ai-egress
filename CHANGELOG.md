@@ -13,6 +13,8 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-03
+
 ### Added
 
 - **`policy_tool.py connector-plan` — the connector-scoped planning subcommand (Model B, v1.3
@@ -58,6 +60,14 @@ both Python CLIs report it with `--version`.
   missing policy ETag renders as `null` there — ETag enforcement stays in `connector-plan`).
   The operator docs' "not yet released" banner and per-command markers are removed: the
   documented Model B workflow is now fully available.
+
+### Validation notes
+
+- The Model B switch path is verified end-to-end against a mocked Tailscale API and fake
+  `tailscale` fixtures (plus a 12-mutant falsification corpus and hosted CI on Linux + macOS);
+  a live-tailnet switch — a real policy mutation on a disposable tailnet — was **not** part of
+  this release's validation. The observe-first report and plan-only modes are the safe first
+  steps on a real tailnet.
 
 ## [1.2.0] - 2026-07-17
 
@@ -424,7 +434,8 @@ are summarized from project history.
 - `bootstrap.sh` connector setup, `diagnose.sh`, `check-client-routes.sh`,
   `rollback.sh`, the common domain list, and Manual Guided Mode policy snippets.
 
-[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.3.0
 [1.2.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.2.0
 [1.1.1]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.1
 [1.1.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.0
