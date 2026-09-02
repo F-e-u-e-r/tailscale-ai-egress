@@ -109,10 +109,10 @@ trap 'cleanup; exit 143' TERM
 new_tmp_file() {
   # Observation temps come from the system tempdir, NEVER generated/: a
   # cold-start report must leave the generated/ tree byte-untouched.
-  local path
-  path="$(mktemp "${TMPDIR:-/tmp}/ai-egress-connector.XXXXXX")" || die "mktemp failed"
-  tmp_files+=("$path")
-  printf '%s\n' "$path"
+  # NOTE: callers run this in a command substitution (a subshell), so the
+  # REGISTRATION for the EXIT-trap cleanup must happen in the caller
+  # (tmp_files+=) — an append here would be lost with the subshell.
+  mktemp "${TMPDIR:-/tmp}/ai-egress-connector.XXXXXX" || die "mktemp failed"
 }
 
 read_failover_env() {
@@ -191,6 +191,9 @@ parse_args() {
       --to)
         [ -n "$TARGET_TAG" ] && usage_error "duplicate --to"
         [ "$#" -ge 2 ] || usage_error "--to requires a value (tag:<pool>)"
+        case "$2" in
+          ''|-*) usage_error "--to requires a non-empty value (tag:<pool>); got: '$2'" ;;
+        esac
         TARGET_TAG="$2"
         shift 2
         ;;
@@ -294,7 +297,8 @@ STATUS_FILE=""
 capture_status() {
   # One `tailscale status --json` capture per call site; apply-time re-checks
   # call this again so liveness is never a cached plan-time result.
-  STATUS_FILE="$(new_tmp_file)"
+  STATUS_FILE="$(new_tmp_file)" || return 1
+  tmp_files+=("$STATUS_FILE")
   if ! tailscale status --json >"$STATUS_FILE" 2>/dev/null; then
     return 1
   fi
@@ -353,6 +357,7 @@ ONLINE_FALLBACK=""
 DUAL_TAGGED=""
 load_liveness() {
   BACKEND_STATE=""; ONLINE_PRIMARY=""; ONLINE_FALLBACK=""; DUAL_TAGGED=""
+  have tailscale || return 1
   capture_status || return 1
   local out k v
   out="$(parse_liveness)" || return 1
@@ -444,8 +449,12 @@ READINESS_ERROR_PRIMARY=""
 READINESS_ERROR_FALLBACK=""
 load_connector_state() {
   local out_file parse_out k v
-  out_file="$(new_tmp_file)"
-  tmp_files+=("$out_file.err")
+  if [ ! -f "$POLICY_TOOL" ]; then
+    CONNECTOR_STATE_ERROR="missing policy tool: $POLICY_TOOL"
+    return 1
+  fi
+  out_file="$(new_tmp_file)" || return 1
+  tmp_files+=("$out_file" "$out_file.err")
   if ! run_connector_state "$out_file"; then
     CONNECTOR_STATE_ERROR="$(head -3 "$out_file.err" 2>/dev/null)"
     return 1
@@ -499,7 +508,13 @@ if not isinstance(state, dict) or state.get("schema_version") != 1:
 active = state.get("active_tag")
 switched_at = state.get("last_switch_at")
 plan_id = state.get("last_plan_id")
-if not (isinstance(active, str) and isinstance(switched_at, str) and isinstance(plan_id, str)):
+previous = state.get("previous_connectors")
+if not (
+    isinstance(active, str)
+    and isinstance(switched_at, str)
+    and isinstance(plan_id, str)
+    and isinstance(previous, list)
+):
     print("state=malformed")
     sys.exit(0)
 in_cooldown = 0
@@ -671,7 +686,8 @@ run_switch_plan() {
   # everything against its own snapshot, and --expected-from makes a policy
   # change between our read and its fetch a refusal (TOCTOU, two witnesses).
   local plan_out
-  plan_out="$(new_tmp_file)"
+  plan_out="$(new_tmp_file)" || die "mktemp failed"
+  tmp_files+=("$plan_out")
   if ! python3 "$POLICY_TOOL" connector-plan \
       --switch-to "$TARGET_TAG" \
       ${CONNECTOR_NAME:+--connector-name "$CONNECTOR_NAME"} \
@@ -680,7 +696,8 @@ run_switch_plan() {
     cat "$plan_out" >&2
     die "connector-plan refused the switch (see output above)"
   fi
-  cat "$plan_out"
+  # Validate EVERYTHING before echoing any success output: bundle location,
+  # manifest identity, and a successfully captured diff.
   local dirs
   dirs="$(grep -c '^Plan directory: ' "$plan_out" || true)"
   [ "$dirs" = "1" ] || die "expected exactly one 'Plan directory:' line from connector-plan (got $dirs)"
@@ -717,16 +734,22 @@ PY
   PLAN_ID="$(printf '%s\n' "$manifest_check" | sed -n 1p)"
   MANIFEST_FROM_JSON="$(printf '%s\n' "$manifest_check" | sed -n 2p)"
   [ -n "$MANIFEST_FROM_JSON" ] || die "bundle manifest is missing its verbatim 'from' value"
-  [ -r "$PLAN_DIR/diff.patch" ] || die "bundle diff.patch is missing or unreadable at $PLAN_DIR/diff.patch"
+  # The diff must be a REGULAR file whose content is captured successfully
+  # before any success output — a directory named diff.patch or an I/O error
+  # is a fail-closed refusal, never a silent continue.
+  [ -f "$PLAN_DIR/diff.patch" ] || die "bundle diff.patch is missing or not a regular file at $PLAN_DIR/diff.patch"
+  local diff_content
+  diff_content="$(cat "$PLAN_DIR/diff.patch")" || die "could not read bundle diff.patch at $PLAN_DIR/diff.patch"
+  cat "$plan_out"
   note "--- plan diff ($PLAN_DIR/diff.patch) ---"
-  cat "$PLAN_DIR/diff.patch"
+  printf '%s\n' "$diff_content"
   note "--- end plan diff ---"
 }
 
 readback_matches_target() {
   local out_file
-  out_file="$(new_tmp_file)"
-  tmp_files+=("$out_file.err")
+  out_file="$(new_tmp_file)" || return 1
+  tmp_files+=("$out_file" "$out_file.err")
   run_connector_state "$out_file" || return 1
   python3 - "$out_file" "$TARGET_TAG" <<'PY'
 import json, sys
@@ -798,10 +821,12 @@ switch_mode() {
 
   # apply-plan keeps its interactive exact `APPLY <plan-id>` confirmation; this
   # script never passes --yes, so the scripted apply is interactive by design.
-  if ! python3 "$POLICY_TOOL" apply-plan "$PLAN_DIR"; then
-    release_lock
-    die "apply-plan failed (a 412 means the policy changed after planning — regenerate by re-running this switch); nothing further was written and no state was recorded"
-  fi
+  # A NON-ZERO apply-plan is AMBIGUOUS, not proof of no-write: the frozen tool
+  # can successfully POST the policy and still exit non-zero (its documented
+  # applied-but-manifest-update-failed arm). The READBACK below is therefore
+  # the authority on whether the switch landed, in both arms.
+  local apply_rc=0
+  python3 "$POLICY_TOOL" apply-plan "$PLAN_DIR" || apply_rc=$?
 
   # Readback: read once; on mismatch, settle briefly and read ONCE more.
   local readback_ok=0
@@ -816,6 +841,14 @@ switch_mode() {
 
   if [ "$readback_ok" != "1" ]; then
     release_lock
+    if [ "$apply_rc" -ne 0 ]; then
+      warn "apply-plan exited non-zero AND the readback did not show the target after two reads —"
+      warn "most likely the apply itself failed (a 412 means the policy changed after planning:"
+      warn "regenerate by re-running this switch). If apply-plan reported the plan APPLIED but"
+      warn "could not update its manifest, re-check reality with the no-argument report before acting."
+      warn "No state was recorded and nothing further was written."
+      exit 1
+    fi
     warn "readback did not confirm connectors == [\"$TARGET_TAG\"] after two reads"
     warn "NOTHING further was written automatically and no state was recorded."
     warn "recovery paths:"
@@ -824,6 +857,22 @@ switch_mode() {
     warn "     (CAUTION: restore-plan rewrites the ENTIRE policy from the captured snapshot;"
     warn "      any policy edit made after that snapshot is lost)"
     notify_hook "connector-switch-readback-failed" "$(role_of "$TARGET_TAG")" "$TARGET_TAG" "readback-mismatch" "$PLAN_ID"
+    exit 1
+  fi
+
+  if [ "$apply_rc" -ne 0 ]; then
+    # apply-plan exited non-zero but the readback VERIFIED the switch landed:
+    # the applied-but-manifest-update-failed arm. The switch is real, so state
+    # is recorded and the truthful connector-switch notify fires — but the
+    # exit stays non-zero to surface the apply-plan error (the bundle's
+    # manifest was likely not marked applied; do not re-run apply-plan on it).
+    if write_switch_state "$PLAN_ID"; then
+      warn "switch to $TARGET_TAG VERIFIED by readback, but apply-plan exited $apply_rc (its bundle manifest was likely not updated — do not re-run apply-plan on this bundle)"
+    else
+      warn "switch to $TARGET_TAG VERIFIED by readback, but apply-plan exited $apply_rc AND recording $CONNECTOR_SWITCH_STATE_FILE failed"
+    fi
+    release_lock
+    notify_hook "connector-switch" "$(role_of "$TARGET_TAG")" "$TARGET_TAG" "operator-switch" "$PLAN_ID"
     exit 1
   fi
 
@@ -839,7 +888,14 @@ switch_mode() {
   return 0
 }
 
-preflight() {
+preflight_report() {
+  # Report degrades PER SOURCE: a missing tailscale CLI only makes the
+  # liveness view unavailable, and a missing policy tool only the policy
+  # view; python3 is the one hard requirement (every parser runs on it).
+  have python3 || die "python3 is required."
+}
+
+preflight_switch() {
   have python3 || die "python3 is required."
   have tailscale || die "Tailscale CLI is not installed or not on PATH."
   [ -f "$POLICY_TOOL" ] || die "missing policy tool: $POLICY_TOOL"
@@ -851,10 +907,11 @@ main() {
   apply_defaults
   require_cooldown
   require_nonneg_int LOCK_WAIT "$LOCK_WAIT"
-  preflight
   if [ -n "$TARGET_TAG" ]; then
+    preflight_switch
     switch_mode
   else
+    preflight_report
     report_mode
   fi
 }

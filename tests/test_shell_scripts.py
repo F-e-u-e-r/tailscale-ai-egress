@@ -3060,7 +3060,9 @@ if "bundle_dir" in spec:
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as handle:
         json.dump(spec.get("manifest", {}), handle)
-    if spec.get("write_diff", True):
+    if spec.get("diff_is_dir"):
+        os.makedirs(os.path.join(d, "diff.patch"), exist_ok=True)
+    elif spec.get("write_diff", True):
         with open(os.path.join(d, "diff.patch"), "w", encoding="utf-8") as handle:
             handle.write(spec.get("diff", "-OLD-CONNECTOR-LINE\\n+NEW-CONNECTOR-LINE\\n"))
     sys.stdout.write("Plan status: valid\\n")
@@ -3175,7 +3177,8 @@ sys.exit(spec.get("rc", 0))
             self.assertEqual(self._policy_calls(fx), [])
 
     def test_fc_usage_errors_exit_2(self):
-        for args in (["--apply"], ["--to"], ["--to", "tag:a", "--to", "tag:b"], ["--bogus"]):
+        for args in (["--apply"], ["--to"], ["--to", ""], ["--to", "--apply"],
+                     ["--to", "tag:a", "--to", "tag:b"], ["--bogus"]):
             with tempfile.TemporaryDirectory() as tmp:
                 fx = self._fixture(tmp)
                 result = self._run(fx, *args)
@@ -3661,6 +3664,96 @@ sys.exit(spec.get("rc", 0))
             result = self._run(fx, "--to", "tag:jp2")
             self.assertEqual(result.returncode, 1)
             self.assertIn("could not acquire connector-switch lock", result.stderr)
+
+    def test_fc_apply_nonzero_but_readback_verified_records_state_and_notifies(self):
+        # The frozen apply-plan can POST successfully and still exit non-zero
+        # (applied-but-manifest-update-failed). The readback is the authority:
+        # verified -> state recorded + truthful connector-switch notify, but
+        # the exit stays non-zero to surface the apply-plan error.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback], apply_rc=1)
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = f'printf "%s\\n" "$FAILOVER_EVENT" >> {hook_out}'
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("VERIFIED by readback, but apply-plan exited", result.stderr)
+            state = json.loads((fx["generated"] / "connector-switch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["active_tag"], "tag:jp2")
+            self.assertEqual(hook_out.read_text(encoding="utf-8").strip(), "connector-switch")
+
+    def test_fc_tmpdir_isolation_no_temp_residue(self):
+        # Observe-first cleanup: with an isolated TMPDIR, a report and a
+        # plan-only run must leave it EMPTY afterwards (the EXIT trap removes
+        # every observation temp; registration survives the subshell).
+        for mode_args, cfg_builder in (
+            ((), lambda fx: {"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]}),
+            (("--to", "tag:jp2"), None),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                if cfg_builder is None:
+                    cfg, _bundle = self._switch_cfg(fx)
+                else:
+                    cfg = cfg_builder(fx)
+                Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+                iso = fx["tmp"] / "iso-tmp"
+                iso.mkdir()
+                fx["env"]["TMPDIR"] = str(iso)
+                result = self._run(fx, *mode_args)
+                self.assertEqual(result.returncode, 0, (mode_args, result.stderr))
+                self.assertEqual(list(iso.iterdir()), [], mode_args)
+
+    def test_fc_report_missing_tailscale_degrades_liveness_only(self):
+        # Per-source degradation: no tailscale CLI anywhere on PATH -> the
+        # liveness view is unavailable but the policy view still renders.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            (Path(tmp) / "bin" / "tailscale").unlink()
+            import sys as _sys
+            python_dir = str(Path(_sys.executable).parent)
+            fx["env"]["PATH"] = os.pathsep.join([str(Path(tmp) / "bin"), python_dir, "/usr/bin", "/bin"])
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("liveness: unavailable", result.stdout)
+            self.assertIn("live connectors value", result.stdout)
+
+    def test_fc_report_missing_policy_tool_degrades_policy_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            fx["env"]["POLICY_TOOL"] = str(Path(tmp) / "nope" / "policy_tool.py")
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("missing policy tool", result.stdout)
+            self.assertIn("online nodes", result.stdout)
+
+    def test_fc_plan_only_diff_patch_directory_fails_closed_before_success_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, _bundle = self._switch_cfg(fx)
+            cfg["connector-plan"][0]["diff_is_dir"] = True
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not a regular file", result.stderr)
+            self.assertNotIn("Plan status: valid", result.stdout)  # no success echo before validation
+
+    def test_fc_state_missing_previous_connectors_is_malformed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            state_path = fx["tmp"] / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "active_tag": "tag:jp",
+                "last_switch_at": "2026-01-01T00:00:00Z",
+                "last_plan_id": "20260101T000000Z-aaaaaaaa",
+            }), encoding="utf-8")
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("malformed; ignoring it", result.stderr)
 
     def test_fc_env_file_supplies_pool_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
