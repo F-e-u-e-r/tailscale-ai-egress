@@ -13,6 +13,26 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
+### Added
+
+- **`policy_tool.py connector-plan` — the connector-scoped planning subcommand (Model B, v1.3
+  flagship, part 1 of the implementation).** Two mutually exclusive operations, both emitting
+  ordinary auditable plan bundles that the unchanged `apply-plan` consumes:
+  `--switch-to tag:<pool>` replaces the managed app-connector entry's `connectors` list with
+  exactly one element (never the additive `ordered_union`; any current shape — empty, multi-tag,
+  out-of-pair, string, or absent — is reconciled, which is the documented drift-recovery path),
+  guarded by fail-closed planner preconditions checked against its own fetched snapshot (exactly-one
+  `--connector-name` match, target-pool declaration readiness by containment, a required planning
+  ETag so no bundle can later apply without If-Match protection, an "already active" refusal, and a
+  semantic allowlist that refuses any change beyond that one list) plus an optional
+  `--expected-from <JSON>` type-strict verbatim compare-and-swap; `--declare tag:<pool>` adds only
+  the three pool-readiness surfaces (tagOwners, both default-route auto-approvers, the member→pool
+  DNS grant), refuses when everything is already present, and never touches `connectors`.
+  Bundle manifests additively record `operation`/`from`/`to` (schema_version stays 1) and
+  `list-plans` surfaces them in text and `--json` while legacy bundles render unchanged. The
+  operator workflow ships later with `failover-connectors.sh`; until then `connector-plan` is the
+  documented expert path (docs/Failover.md § Advanced Mode).
+
 ## [1.2.0] - 2026-07-17
 
 ### Added
