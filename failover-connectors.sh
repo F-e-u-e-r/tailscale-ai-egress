@@ -447,7 +447,7 @@ load_connector_state() {
   out_file="$(new_tmp_file)"
   tmp_files+=("$out_file.err")
   if ! run_connector_state "$out_file"; then
-    CONNECTOR_STATE_ERROR="$(cat "$out_file.err" 2>/dev/null | head -3)"
+    CONNECTOR_STATE_ERROR="$(head -3 "$out_file.err" 2>/dev/null)"
     return 1
   fi
   parse_out="$(parse_connector_state "$out_file")" || { CONNECTOR_STATE_ERROR="connector-state output did not parse"; return 1; }
@@ -747,8 +747,10 @@ switch_mode() {
   warn_dual_tagged
   local target_online
   target_online="$(online_count_for "$TARGET_TAG")"
-  [ -n "$target_online" ] && [ "$target_online" -ge 1 ] 2>/dev/null \
-    || { release_lock; die "target pool $TARGET_TAG has no online tagged node — nowhere safe to go"; }
+  if ! { [ -n "$target_online" ] && [ "$target_online" -ge 1 ] 2>/dev/null; }; then
+    release_lock
+    die "target pool $TARGET_TAG has no online tagged node — nowhere safe to go"
+  fi
 
   load_connector_state || { release_lock; die "could not read the live policy (connector-state failed${CONNECTOR_STATE_ERROR:+: $CONNECTOR_STATE_ERROR})"; }
   [ "$ENTRY_COUNT" = "1" ] \
@@ -787,8 +789,10 @@ switch_mode() {
   # apply-plan; never the cached plan-time result.
   load_liveness || { release_lock; die "tailscale status unavailable at apply time — refusing (fail-closed)"; }
   target_online="$(online_count_for "$TARGET_TAG")"
-  [ -n "$target_online" ] && [ "$target_online" -ge 1 ] 2>/dev/null \
-    || { release_lock; die "target pool $TARGET_TAG lost its last online node between planning and apply — refusing"; }
+  if ! { [ -n "$target_online" ] && [ "$target_online" -ge 1 ] 2>/dev/null; }; then
+    release_lock
+    die "target pool $TARGET_TAG lost its last online node between planning and apply — refusing"
+  fi
 
   # apply-plan keeps its interactive exact `APPLY <plan-id>` confirmation; this
   # script never passes --yes, so the scripted apply is interactive by design.
