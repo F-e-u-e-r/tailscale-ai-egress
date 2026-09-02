@@ -3636,16 +3636,27 @@ sys.exit(spec.get("rc", 0))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(hook_out.exists())
 
+    @staticmethod
+    def _proc_start_time(pid):
+        """Mirror the script's proc_start_time: /proc stat field 22 (jiffies)
+        on Linux, `ps -o lstart=` elsewhere — so the seeded lock's identity
+        attestation matches what the script computes on EVERY platform."""
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            rest = stat.read_text(encoding="utf-8").split(") ", 1)[1].split()
+            return rest[19]
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True
+        ).stdout
+        return " ".join(out.split())
+
     def test_fc_lock_contention_dies_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = self._fixture(tmp)
             lock_dir = fx["generated"] / "connector-switch.lock.d"
             lock_dir.mkdir(parents=True)
             (lock_dir / "pid").write_text(str(os.getpid()), encoding="utf-8")
-            start = subprocess.run(
-                ["ps", "-o", "lstart=", "-p", str(os.getpid())], text=True, capture_output=True
-            ).stdout
-            (lock_dir / "start").write_text(" ".join(start.split()), encoding="utf-8")
+            (lock_dir / "start").write_text(self._proc_start_time(os.getpid()), encoding="utf-8")
             fx["env"]["LOCK_WAIT"] = "1"
             result = self._run(fx, "--to", "tag:jp2")
             self.assertEqual(result.returncode, 1)
