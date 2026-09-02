@@ -26,7 +26,7 @@ git clean -ndx           # review what is untracked/ignored
 ```bash
 # Shell syntax
 for f in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
-         enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh \
+         enable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh \
          install.sh restore-connector.sh rollback.sh \
          scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh \
          scripts/maintainer/apply-github-ruleset.sh; do
@@ -34,11 +34,11 @@ for f in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
 done
 
 # Shell lint
-shellcheck bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
-  enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh \
+shellcheck -x bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh \
+  enable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh \
          install.sh restore-connector.sh rollback.sh \
   scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh \
-  scripts/maintainer/apply-github-ruleset.sh
+  scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh
 
 # Python lint/type checks
 ruff check scripts tests

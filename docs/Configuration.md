@@ -66,7 +66,7 @@ hands off to `bootstrap.sh`. Its knobs:
 
 ```bash
 TAILSCALE_AI_EGRESS_REPO=https://github.com/<owner>/<repo> # fork URL (HTTPS GitHub)
-TAILSCALE_AI_EGRESS_VERSION=1.2.0 # pin a release version (defaults to the bundled VERSION)
+TAILSCALE_AI_EGRESS_VERSION=1.3.0 # pin a release version (defaults to the bundled VERSION)
 TAILSCALE_AI_EGRESS_BRANCH=main   # download an UNVERIFIED branch archive instead of a release
 TAILSCALE_AI_EGRESS_SKIP_ATTESTATION=1 # skip gh provenance verification (see below)
 ```

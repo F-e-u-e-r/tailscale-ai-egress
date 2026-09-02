@@ -1,6 +1,6 @@
 # Roadmap
 
-This is a **non-binding** planning document for direction beyond v1.2.0. It does
+This is a **non-binding** planning document for direction beyond v1.3.0. It does
 not promise dates or delivery. The binding contract is [Stability](Stability.md):
 within 1.x nothing under its "Frozen surface" changes incompatibly, and GUI /
 provider provisioning / telemetry / additional proxy protocols stay out of scope.
@@ -68,11 +68,12 @@ kept for the record.
 
 ---
 
-## Next — v1.3 (`1.x additive-safe`)
+## Shipped in v1.3.0 (`1.x additive-safe`)
 
-- **Connector-failover apply mode (flagship).** `1.x additive-safe` (new opt-in
-  script + a connector-scoped `policy_tool.py` planning subcommand). **Design
-  decided** — see
+- **Connector-failover apply mode (flagship).** `1.x additive-safe` — **shipped
+  in v1.3.0** as `failover-connectors.sh` + the connector-scoped
+  `policy_tool.py connector-plan` subcommand (and the read-only
+  `connector-state` observer). Design:
   [design/connector-failover-apply.md](design/connector-failover-apply.md).
   Same-tag native HA stays the default and recommended model, and the monitor
   stays read-only. Apply mode is a separate ADVANCED mode — the **distinct-tag
@@ -83,13 +84,16 @@ kept for the record.
   HA (which keeps operating inside each pool) and does not replace it; there
   is no automatic watcher in v1.3.
   *Acceptance:* observe-only without `--apply` (report + plan bundle only);
-  the switch goes through `plan`/`apply-plan` (auditable, restorable) with
-  readback, honoring the design doc's fail-closed precondition matrix; the
-  same-tag default's behavior is untouched; the design doc's
-  pre-implementation gate is satisfied — its operator docs (deployment
-  models, migration both directions, rollback, warnings) are MERGED before
-  implementation work opens; fake-command tests cover the no-apply, apply,
-  fail-closed, and readback-mismatch paths.
+  the switch goes through the audited bundle pipeline with readback,
+  honoring the design doc's fail-closed precondition matrix; the same-tag
+  default's behavior is untouched; the pre-implementation gate was satisfied
+  (operator docs merged first, PR #27); fake-command tests cover the
+  no-apply, apply, fail-closed, and readback-mismatch paths. **(met — PRs
+  #27/#28/#29.)**
+---
+
+## Next (`1.x additive-safe`)
+
 - **Multi-fallback support.** `1.x additive-safe`.
   `FALLBACK_EXIT_NODE` accepts a comma-separated list tried in order; state
   schema adds `nodes.fallbacks[]` and bumps `schema_version` to 2 while keeping
