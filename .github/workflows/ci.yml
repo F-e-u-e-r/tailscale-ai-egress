@@ -37,13 +37,13 @@ jobs:
 
       - name: Check shell syntax
         run: |
-          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh; do
+          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh; do
             bash -n "$file"
           done
 
       - name: Lint shell scripts
         run: |
-          shellcheck -x bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh
+          shellcheck -x bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh
 
       - name: Lint and type-check Python
         run: |
@@ -103,7 +103,7 @@ jobs:
         run: |
           # /bin/bash is macOS's stock Bash 3.2; the runner also has a newer Homebrew
           # bash on PATH, so invoke the interpreter explicitly to actually test 3.2.
-          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh; do
+          for file in bootstrap.sh check-client-routes.sh diagnose.sh disable-exit-node.sh enable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh install.sh restore-connector.sh rollback.sh scripts/smoke-test.sh scripts/package.sh scripts/validation-e2e.sh scripts/maintainer/apply-github-ruleset.sh scripts/lib/common.sh; do
             /bin/bash -n "$file"
           done
 

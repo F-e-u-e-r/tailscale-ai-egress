@@ -29,9 +29,35 @@ both Python CLIs report it with `--version`.
   the three pool-readiness surfaces (tagOwners, both default-route auto-approvers, the member→pool
   DNS grant), refuses when everything is already present, and never touches `connectors`.
   Bundle manifests additively record `operation`/`from`/`to` (schema_version stays 1) and
-  `list-plans` surfaces them in text and `--json` while legacy bundles render unchanged. The
-  operator workflow ships later with `failover-connectors.sh`; until then `connector-plan` is the
-  documented expert path (docs/Failover.md § Advanced Mode).
+  `list-plans` surfaces them in text and `--json` while legacy bundles render unchanged.
+  `connector-plan` remains the documented expert escape hatch and the drift-recovery path
+  (docs/Failover.md § Advanced Mode); the supported operator workflow is `failover-connectors.sh`
+  below.
+- **`failover-connectors.sh` — the Model B operator workflow (v1.3 flagship, part 2), completing
+  the advanced distinct-tag active connector switch.** One-shot and observe-first: with no
+  arguments it reports both pools' node liveness, the managed entry's live `connectors` value,
+  declaration readiness, and state drift while writing nothing (degrading to status-only without
+  a policy credential); `--to tag:<pool>` runs the fail-closed preconditions (pool-pair
+  configuration, strict one-element-in-pair drift gate, plan-time target liveness,
+  already-active refusal) and generates the auditable bundle via `connector-plan --switch-to`
+  with a compare-and-swap on the value it just read (TOCTOU: the planner independently
+  re-verifies everything against its own snapshot), printing the bundle's actual diff;
+  `--apply` re-checks target liveness immediately before `apply-plan` (which keeps its
+  interactive `APPLY <plan-id>` confirmation — no `--yes` is ever injected), verifies by
+  reading the policy back (one settle re-read; a persistent mismatch writes nothing further,
+  reports both recovery paths, and exits non-zero), and only then atomically records
+  `generated/connector-switch-state.json` (schema 1: `active_tag`, the bundle manifest's
+  verbatim `previous_connectors`, `last_switch_at`, `last_plan_id`). `CONNECTOR_SWITCH_COOLDOWN`
+  (default 600, `[0, 86400]`, `0` disables) is an advisory anti-fat-finger warning, never a
+  lockout, and there is deliberately no `--force` and no `--watch`. Completed switches and
+  persistent readback failures fire the existing `FAILOVER_NOTIFY_CMD` hook
+  (`FAILOVER_EVENT=connector-switch|connector-switch-readback-failed`, plus additive
+  `FAILOVER_PLAN_ID`); hook failures never change the switch outcome. A new read-only
+  `policy_tool.py connector-state` subcommand supplies the zero-write policy view the report,
+  preflight, and readback need (verbatim `connectors`, entry count, per-tag readiness; a
+  missing policy ETag renders as `null` there — ETag enforcement stays in `connector-plan`).
+  The operator docs' "not yet released" banner and per-command markers are removed: the
+  documented Model B workflow is now fully available.
 
 ## [1.2.0] - 2026-07-17
 

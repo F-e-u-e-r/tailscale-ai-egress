@@ -49,6 +49,7 @@ class ShellScriptTests(unittest.TestCase):
             "diagnose.sh",
             "disable-exit-node.sh",
             "enable-exit-node.sh",
+            "failover-connectors.sh",
             "failover-exit-node.sh",
             "monitor-connectors.sh",
             "install.sh",
@@ -2977,6 +2978,798 @@ exit 0
         checks = [check for check in payload["checks"] if check["id"] == "sample-domain-routes"]
         self.assertTrue(any(check["details"].get("wildcards_skipped") == 1 for check in checks))
         self.assertTrue(any(check["status"] == "fail" and "No non-wildcard" in check["message"] for check in checks))
+
+
+FC = ROOT / "failover-connectors.sh"
+
+READY_STATUS = {
+    "BackendState": "Running",
+    "Self": {"Online": True, "Tags": ["tag:jp"], "HostName": "self-jp-01"},
+    "Peer": {
+        "n1": {"Online": True, "Tags": ["tag:jp"], "HostName": "jp-02"},
+        "n2": {"Online": True, "Tags": ["tag:jp2"], "HostName": "jp2-01"},
+    },
+}
+
+CS_ACTIVE_JP = {
+    "etag": "e1",
+    "connector_name": "AI-Egress-JP",
+    "entry_count": 1,
+    "connectors": ["tag:jp"],
+    "readiness": {
+        "tag:jp": {"ready": True, "error": None},
+        "tag:jp2": {"ready": True, "error": None},
+    },
+}
+
+
+class FailoverConnectorsTests(unittest.TestCase):
+    """Script-layer tests for failover-connectors.sh against a fake `tailscale`
+    (status.json sequence) and a fake POLICY_TOOL (argv logged with \\037
+    separators; per-subcommand canned response sequences)."""
+
+    def _fixture(self, tmp, *, status_seq=None, policy_cfg=None, env_file=None):
+        tmp = Path(tmp)
+        fake_bin = tmp / "bin"
+        fake_bin.mkdir()
+        generated = tmp / "generated"  # NOT created: cold-start zero-writes oracle
+        status_dir = tmp / "status"
+        status_dir.mkdir()
+        for index, doc in enumerate(status_seq or [READY_STATUS], start=1):
+            (status_dir / f"status.{index}.json").write_text(
+                doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8"
+            )
+        status_count = tmp / "status.count"
+        tailscale = fake_bin / "tailscale"
+        tailscale.write_text(
+            f"""#!/bin/sh
+if [ "$1" = "status" ] && [ "$2" = "--json" ]; then
+  n=$(cat {status_count} 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > {status_count}
+  f="{status_dir}/status.$n.json"
+  [ -f "$f" ] || f="{status_dir}/status.1.json"
+  cat "$f"
+  exit 0
+fi
+echo "unexpected tailscale args: $*" >&2
+exit 2
+""",
+            encoding="utf-8",
+        )
+        tailscale.chmod(0o755)
+
+        policy_log = tmp / "policy.log"
+        policy_cfg_path = tmp / "policy-config.json"
+        policy_cfg_path.write_text(json.dumps(policy_cfg or {}), encoding="utf-8")
+        fake_policy = tmp / "fake_policy_tool.py"
+        fake_policy.write_text(
+            '''import json, os, sys
+cfg = json.load(open(os.environ["FAKE_POLICY_CONFIG"], encoding="utf-8"))
+log = os.environ["FAKE_POLICY_LOG"]
+with open(log, "a", encoding="utf-8") as handle:
+    handle.write("\\037".join(sys.argv[1:]) + "\\n")
+sub = sys.argv[1]
+count_path = log + "." + sub + ".count"
+n = 0
+if os.path.exists(count_path):
+    n = int(open(count_path, encoding="utf-8").read())
+open(count_path, "w", encoding="utf-8").write(str(n + 1))
+specs = cfg.get(sub, [])
+spec = specs[min(n, len(specs) - 1)] if specs else {}
+if "bundle_dir" in spec:
+    d = spec["bundle_dir"]
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(spec.get("manifest", {}), handle)
+    if spec.get("diff_is_dir"):
+        os.makedirs(os.path.join(d, "diff.patch"), exist_ok=True)
+    elif spec.get("write_diff", True):
+        with open(os.path.join(d, "diff.patch"), "w", encoding="utf-8") as handle:
+            handle.write(spec.get("diff", "-OLD-CONNECTOR-LINE\\n+NEW-CONNECTOR-LINE\\n"))
+    sys.stdout.write("Plan status: valid\\n")
+    for _ in range(spec.get("plan_dir_lines", 1)):
+        sys.stdout.write("Plan directory: " + d + "\\n")
+if "stdout" in spec:
+    sys.stdout.write(spec["stdout"])
+if "stderr" in spec:
+    sys.stderr.write(spec["stderr"])
+sys.exit(spec.get("rc", 0))
+''',
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["GENERATED_DIR"] = str(generated)
+        env["FAILOVER_ENV"] = str(env_file) if env_file else "/dev/null"
+        env["POLICY_TOOL"] = str(fake_policy)
+        env["FAKE_POLICY_CONFIG"] = str(policy_cfg_path)
+        env["FAKE_POLICY_LOG"] = str(policy_log)
+        env["PRIMARY_CONNECTOR_TAG"] = "tag:jp"
+        env["FALLBACK_CONNECTOR_TAG"] = "tag:jp2"
+        env["TAILSCALE_API_KEY"] = "tskey-api-test"
+        for stale in ("TAILSCALE_OAUTH_CLIENT_ID", "TAILSCALE_OAUTH_CLIENT_SECRET",
+                      "FAILOVER_NOTIFY_CMD", "CONNECTOR_NAME", "CONNECTOR_SWITCH_COOLDOWN",
+                      "CONNECTOR_SWITCH_STATE_FILE", "LOCK_WAIT"):
+            env.pop(stale, None)
+        return {
+            "env": env,
+            "generated": generated,
+            "policy_log": policy_log,
+            "status_count": status_count,
+            "tmp": tmp,
+        }
+
+    def _run(self, fx, *args):
+        return subprocess.run(
+            ["bash", str(FC), *args],
+            env=fx["env"],
+            text=True,
+            capture_output=True,
+        )
+
+    def _policy_calls(self, fx):
+        if not fx["policy_log"].exists():
+            return []
+        return [
+            line.split("\037")
+            for line in fx["policy_log"].read_text(encoding="utf-8").splitlines()
+        ]
+
+    def _switch_cfg(self, fx, *, cs_seq=None, plan=None, apply_rc=0):
+        """Standard fake-policy config for a switch: connector-state sequence,
+        one connector-plan bundle, one apply-plan response."""
+        bundle = str(fx["tmp"] / "bundle" / "plan.20260902T000000Z-aabbccdd")
+        manifest = {
+            "operation": "switch-connectors",
+            "from": ["tag:jp"],
+            "to": "tag:jp2",
+            "plan_id": "20260902T000000Z-aabbccdd",
+        }
+        cfg = {
+            "connector-state": [
+                {"stdout": json.dumps(doc), "rc": 0} if not isinstance(doc, dict) or "rc" not in doc
+                else doc
+                for doc in (cs_seq or [CS_ACTIVE_JP])
+            ],
+            "connector-plan": [plan if plan is not None else {"bundle_dir": bundle, "manifest": manifest}],
+            "apply-plan": [{"rc": apply_rc}],
+        }
+        return cfg, bundle
+
+    # ----- config validation (before any probing) -----
+
+    def test_fc_cooldown_invalid_rejected_before_probing(self):
+        for bad in (".", "1e3", "-1", "86401", "nan", "6.5"):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                fx["env"]["CONNECTOR_SWITCH_COOLDOWN"] = bad
+                result = self._run(fx)
+                self.assertEqual(result.returncode, 1, (bad, result.stderr))
+                self.assertIn("CONNECTOR_SWITCH_COOLDOWN", result.stderr)
+                self.assertFalse(fx["status_count"].exists(), bad)  # no probing
+                self.assertEqual(self._policy_calls(fx), [], bad)
+
+    def test_fc_switch_config_refusals(self):
+        cases = [
+            ({"PRIMARY_CONNECTOR_TAG": ""}, "PRIMARY_CONNECTOR_TAG is not set"),
+            ({"FALLBACK_CONNECTOR_TAG": ""}, "FALLBACK_CONNECTOR_TAG is not set"),
+            ({"PRIMARY_CONNECTOR_TAG": "tag:UPPER"}, "not a valid tag"),
+            ({"FALLBACK_CONNECTOR_TAG": "tag:jp"}, "must be distinct"),
+        ]
+        for overrides, needle in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                for key, value in overrides.items():
+                    if value:
+                        fx["env"][key] = value
+                    else:
+                        fx["env"].pop(key, None)
+                result = self._run(fx, "--to", "tag:jp2")
+                self.assertEqual(result.returncode, 1, (overrides, result.stderr))
+                self.assertIn(needle, result.stderr)
+                self.assertEqual(self._policy_calls(fx), [], overrides)
+
+    def test_fc_to_outside_pair_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            result = self._run(fx, "--to", "tag:other")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("must name one of the configured pool pair", result.stderr)
+            self.assertEqual(self._policy_calls(fx), [])
+
+    def test_fc_usage_errors_exit_2(self):
+        for args in (["--apply"], ["--to"], ["--to", ""], ["--to", "--apply"],
+                     ["--to", "tag:a", "--to", "tag:b"], ["--bogus"]):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                result = self._run(fx, *args)
+                self.assertEqual(result.returncode, 2, args)
+                self.assertFalse(fx["status_count"].exists(), args)
+
+    def test_fc_help_and_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            result = self._run(fx, "--help")
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("no --force and no --watch", result.stdout)
+            self.assertIn("held through the interactive APPLY confirmation", result.stdout)
+            version = self._run(fx, "--version")
+            self.assertEqual(version.returncode, 0)
+            self.assertIn("failover-connectors.sh", version.stdout)
+
+    # ----- report mode -----
+
+    def test_fc_report_zero_writes_cold_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # The generated tree must not even be CREATED by a report.
+            self.assertFalse(fx["generated"].exists())
+            self.assertIn("live connectors value", result.stdout)
+            self.assertIn("ready", result.stdout)
+
+    def test_fc_report_without_credential_degrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            fx["env"].pop("TAILSCALE_API_KEY", None)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("no policy credential", result.stdout)
+            self.assertIn("online nodes", result.stdout)
+            self.assertEqual(self._policy_calls(fx), [])  # policy_tool never invoked
+
+    def test_fc_report_connector_state_failure_degrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"rc": 1, "stderr": "error: boom\\n"}]})
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("connector-state failed", result.stdout)
+            self.assertIn("online nodes", result.stdout)
+
+    def test_fc_report_backend_not_running_liveness_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stopped = dict(READY_STATUS)
+            stopped["BackendState"] = "Stopped"
+            fx = self._fixture(tmp, status_seq=[stopped],
+                               policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("liveness: unavailable", result.stdout)
+            self.assertIn("live connectors value", result.stdout)
+
+    def test_fc_report_neither_view_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, status_seq=["not json"])
+            fx["env"].pop("TAILSCALE_API_KEY", None)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("neither the status view nor the policy view", result.stderr)
+
+    def test_fc_report_dual_tag_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dual = json.loads(json.dumps(READY_STATUS))
+            dual["Peer"]["n3"] = {"Online": True, "Tags": ["tag:jp", "tag:jp2"], "HostName": "both-01"}
+            fx = self._fixture(tmp, status_seq=[dual],
+                               policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("BOTH pool tags", result.stderr)
+            self.assertIn("both-01", result.stderr)
+            self.assertIn("not a refusal", result.stderr)
+
+    def test_fc_report_state_drift_advisory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            state_path = fx["tmp"] / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "active_tag": "tag:jp2",
+                "previous_connectors": ["tag:jp"],
+                "last_switch_at": "2026-01-01T00:00:00Z",
+                "last_plan_id": "20260101T000000Z-aaaaaaaa",
+            }), encoding="utf-8")
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("drift: state file says tag:jp2 but live policy says tag:jp", result.stdout)
+            self.assertIn("state is advisory", result.stdout)
+
+    def test_fc_report_drift_not_assessable_when_live_not_single(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = dict(CS_ACTIVE_JP)
+            doc["connectors"] = ["tag:jp", "tag:jp2"]
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(doc)}]})
+            state_path = fx["tmp"] / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "active_tag": "tag:jp2",
+                "previous_connectors": ["tag:jp"],
+                "last_switch_at": "2026-01-01T00:00:00Z",
+                "last_plan_id": "20260101T000000Z-aaaaaaaa",
+            }), encoding="utf-8")
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("drift: not assessable", result.stdout)
+            self.assertNotIn("drift: none", result.stdout)
+
+    def test_fc_report_malformed_state_warns_and_is_ignored(self):
+        for content in ("{not json", json.dumps({"schema_version": 2}), json.dumps({"schema_version": 1})):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+                state_path = fx["tmp"] / "state.json"
+                state_path.write_text(content, encoding="utf-8")
+                fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+                result = self._run(fx)
+                self.assertEqual(result.returncode, 0, content)
+                self.assertIn("malformed; ignoring it", result.stderr)
+
+    def test_fc_report_unset_fallback_key_omits_tag_and_renders_not_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            fx["env"].pop("FALLBACK_CONNECTOR_TAG", None)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not-configured (FALLBACK_CONNECTOR_TAG unset)", result.stdout)
+            calls = self._policy_calls(fx)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].count("--tag"), 1)  # only the set key's --tag
+            self.assertIn("tag:jp", calls[0])
+            self.assertNotIn("", calls[0])  # never an empty argument
+
+    # ----- switch preflight -----
+
+    def test_fc_switch_requires_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            fx["env"].pop("TAILSCALE_API_KEY", None)
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("policy credential is required for a switch", result.stderr)
+            self.assertEqual(self._policy_calls(fx), [])
+
+    def test_fc_switch_zero_online_target_refuses_before_planner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            offline = json.loads(json.dumps(READY_STATUS))
+            offline["Peer"]["n2"]["Online"] = False
+            fx = self._fixture(tmp, status_seq=[offline])
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("no online tagged node", result.stderr)
+            self.assertEqual(self._policy_calls(fx), [])
+
+    def test_fc_switch_entry_count_not_one_refuses(self):
+        for count in (0, 2):
+            with tempfile.TemporaryDirectory() as tmp:
+                doc = dict(CS_ACTIVE_JP)
+                doc["entry_count"] = count
+                doc["connectors"] = None
+                fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(doc)}]})
+                result = self._run(fx, "--to", "tag:jp2")
+                self.assertEqual(result.returncode, 1, count)
+                self.assertIn("exactly one managed app-connector entry", result.stderr)
+                subs = [call[0] for call in self._policy_calls(fx)]
+                self.assertNotIn("connector-plan", subs, count)
+
+    def test_fc_switch_drift_shapes_refuse_with_recovery(self):
+        for connectors in (None, [], ["tag:jp", "tag:jp2"], "tag:jp", ["tag:other"]):
+            with tempfile.TemporaryDirectory() as tmp:
+                doc = dict(CS_ACTIVE_JP)
+                doc["connectors"] = connectors
+                fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(doc)}]})
+                result = self._run(fx, "--to", "tag:jp2")
+                self.assertEqual(result.returncode, 1, connectors)
+                self.assertIn("drift", result.stderr, connectors)
+                self.assertIn("connector-plan --switch-to", result.stderr, connectors)
+                self.assertIn("Admin Console", result.stderr, connectors)
+                subs = [call[0] for call in self._policy_calls(fx)]
+                self.assertNotIn("connector-plan", subs, connectors)
+
+    def test_fc_switch_already_active_refuses_before_planner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = dict(CS_ACTIVE_JP)
+            doc["connectors"] = ["tag:jp2"]
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(doc)}]})
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("already the sole active connector pool", result.stderr)
+            subs = [call[0] for call in self._policy_calls(fx)]
+            self.assertNotIn("connector-plan", subs)
+
+    # ----- plan-only -----
+
+    def test_fc_plan_only_verbatim_expected_from_and_no_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, bundle = self._switch_cfg(fx)
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self._policy_calls(fx)
+            plan_calls = [call for call in calls if call[0] == "connector-plan"]
+            self.assertEqual(len(plan_calls), 1)
+            self.assertEqual(
+                plan_calls[0],
+                [
+                    "connector-plan", "--switch-to", "tag:jp2",
+                    "--plans-dir", f"{fx['env']['GENERATED_DIR']}/policy-plans",
+                    "--expected-from", '["tag:jp"]',
+                ],
+            )
+            self.assertNotIn("apply-plan", [call[0] for call in calls])
+            self.assertIn("NEW-CONNECTOR-LINE", result.stdout)  # actual diff.patch printed
+            self.assertIn(bundle, result.stdout)
+            self.assertFalse((fx["generated"] / "connector-switch-state.json").exists())
+
+    def test_fc_plan_only_missing_diff_patch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, bundle = self._switch_cfg(fx)
+            cfg["connector-plan"][0]["write_diff"] = False
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("diff.patch is missing", result.stderr)
+
+    def test_fc_plan_only_manifest_mismatch_refuses(self):
+        for manifest in (
+            {"operation": "declare-pool", "to": "tag:jp2", "plan_id": "20260902T000000Z-aabbccdd", "from": ["tag:jp"]},
+            {"operation": "switch-connectors", "to": "tag:other", "plan_id": "20260902T000000Z-aabbccdd", "from": ["tag:jp"]},
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                cfg, _bundle = self._switch_cfg(fx)
+                cfg["connector-plan"][0]["manifest"] = manifest
+                Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+                result = self._run(fx, "--to", "tag:jp2")
+                self.assertEqual(result.returncode, 1, manifest)
+                self.assertIn("not a switch-connectors operation targeting", result.stderr)
+
+    def test_fc_planner_refusal_surfaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, _bundle = self._switch_cfg(fx, plan={"rc": 1, "stdout": "Plan status: failed\\nfinding: expected-from-mismatch\\n"})
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("connector-plan refused the switch", result.stderr)
+            self.assertIn("expected-from-mismatch", result.stderr)
+
+    def test_fc_cooldown_active_warns_and_proceeds_zero_disables(self):
+        import datetime as _dt
+        fresh = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        state = {
+            "schema_version": 1, "active_tag": "tag:jp",
+            "previous_connectors": ["tag:jp2"], "last_switch_at": fresh,
+            "last_plan_id": "20260902T000000Z-11223344",
+        }
+        for cooldown, expect_warn in (("600", True), ("0", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                cfg, _bundle = self._switch_cfg(fx)
+                Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+                state_path = fx["tmp"] / "state.json"
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+                fx["env"]["CONNECTOR_SWITCH_COOLDOWN"] = cooldown
+                result = self._run(fx, "--to", "tag:jp2")
+                self.assertEqual(result.returncode, 0, (cooldown, result.stderr))
+                if expect_warn:
+                    self.assertIn("cooldown", result.stderr)
+                    self.assertIn(fresh, result.stderr)
+                    self.assertIn("20260902T000000Z-11223344", result.stderr)
+                    self.assertIn("not a lockout", result.stderr)
+                else:
+                    self.assertNotIn("cooldown:", result.stderr)
+
+    # ----- apply -----
+
+    def _apply_env(self, fx):
+        fx["env"]["POLICY_RISK_ACK"] = "1"  # unused by the script; harmless
+        return fx
+
+    def test_fc_apply_happy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = (
+                f'printf "%s|%s|%s|%s|%s|lock=%s\\n" "$FAILOVER_EVENT" "$FAILOVER_ROLE" '
+                f'"$FAILOVER_LABEL" "$FAILOVER_REASON" "$FAILOVER_PLAN_ID" '
+                f'"$([ -d {fx["env"]["GENERATED_DIR"]}/connector-switch.lock.d ] && echo held || echo released)" >> {hook_out}'
+            )
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Two status invocations: plan-time + apply-time recheck.
+            self.assertEqual(fx["status_count"].read_text().strip(), "2")
+            calls = self._policy_calls(fx)
+            apply_calls = [call for call in calls if call[0] == "apply-plan"]
+            self.assertEqual(len(apply_calls), 1)
+            self.assertNotIn("--yes", apply_calls[0])
+            state_path = fx["generated"] / "connector-switch-state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema_version"], 1)
+            self.assertEqual(state["active_tag"], "tag:jp2")
+            self.assertEqual(state["previous_connectors"], ["tag:jp"])  # manifest's verbatim from
+            self.assertEqual(state["last_plan_id"], "20260902T000000Z-aabbccdd")
+            self.assertIn("last_switch_at", state)
+            leftovers = [p.name for p in (fx["generated"]).iterdir() if p.name.startswith(".connector-switch-state.")]
+            self.assertEqual(leftovers, [])  # atomic: no temp residue
+            hook = hook_out.read_text(encoding="utf-8").strip()
+            self.assertEqual(
+                hook,
+                "connector-switch|fallback|tag:jp2|operator-switch|20260902T000000Z-aabbccdd|lock=released",
+            )
+
+    def test_fc_apply_time_liveness_recheck_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            offline = json.loads(json.dumps(READY_STATUS))
+            offline["Peer"]["n2"]["Online"] = False
+            fx = self._fixture(tmp, status_seq=[READY_STATUS, offline])
+            cfg, _bundle = self._switch_cfg(fx)
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("lost its last online node between planning and apply", result.stderr)
+            self.assertNotIn("apply-plan", [call[0] for call in self._policy_calls(fx)])
+            self.assertFalse((fx["generated"] / "connector-switch-state.json").exists())
+
+    def test_fc_apply_plan_failure_no_state_no_success_notify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, _bundle = self._switch_cfg(fx, apply_rc=1)
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = f'printf "%s\\n" "$FAILOVER_EVENT" >> {hook_out}'
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("regenerate", result.stderr)
+            self.assertFalse((fx["generated"] / "connector-switch-state.json").exists())
+            self.assertFalse(hook_out.exists())  # no notify at all on apply failure
+
+    def test_fc_readback_mismatch_then_match_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            stale = dict(CS_ACTIVE_JP)  # still tag:jp on first readback
+            good = dict(CS_ACTIVE_JP)
+            good["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, stale, good])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((fx["generated"] / "connector-switch-state.json").exists())
+
+    def test_fc_readback_mismatch_twice_full_failure_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            stale = dict(CS_ACTIVE_JP)
+            cfg, bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, stale, stale])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = (
+                f'printf "%s|%s|%s|%s|%s\\n" "$FAILOVER_EVENT" "$FAILOVER_ROLE" "$FAILOVER_LABEL" '
+                f'"$FAILOVER_REASON" "$FAILOVER_PLAN_ID" >> {hook_out}'
+            )
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 1)
+            # apply-plan called EXACTLY once: no auto-rollback, no second write.
+            calls = self._policy_calls(fx)
+            self.assertEqual(len([call for call in calls if call[0] == "apply-plan"]), 1)
+            self.assertEqual(len([call for call in calls if call[0] == "connector-plan"]), 1)
+            self.assertFalse((fx["generated"] / "connector-switch-state.json").exists())
+            self.assertIn("NOTHING further was written automatically", result.stderr)
+            self.assertIn("compensating switch-back", result.stderr)
+            self.assertIn(f"restore-plan {bundle}", result.stderr)
+            self.assertIn("rewrites the ENTIRE policy", result.stderr)
+            hook = hook_out.read_text(encoding="utf-8").strip()
+            self.assertEqual(
+                hook,
+                "connector-switch-readback-failed|fallback|tag:jp2|readback-mismatch|20260902T000000Z-aabbccdd",
+            )
+
+    def test_fc_seeded_state_untouched_on_every_non_success_path(self):
+        seeded = json.dumps({
+            "schema_version": 1, "active_tag": "tag:jp",
+            "previous_connectors": ["tag:jp2"],
+            "last_switch_at": "2026-01-01T00:00:00Z",
+            "last_plan_id": "20260101T000000Z-99999999",
+        })
+        stale = dict(CS_ACTIVE_JP)
+        scenarios = {
+            "plan-only": {"args": ["--to", "tag:jp2"], "cs_seq": [CS_ACTIVE_JP], "plan": None, "apply_rc": 0},
+            "planner-refusal": {"args": ["--to", "tag:jp2"], "cs_seq": [CS_ACTIVE_JP], "plan": {"rc": 1}, "apply_rc": 0},
+            "apply-failure": {"args": ["--to", "tag:jp2", "--apply"], "cs_seq": [CS_ACTIVE_JP], "plan": None, "apply_rc": 1},
+            "readback-failure": {"args": ["--to", "tag:jp2", "--apply"], "cs_seq": [CS_ACTIVE_JP, stale, stale], "plan": None, "apply_rc": 0},
+        }
+        for label, scenario in scenarios.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                cfg, _bundle = self._switch_cfg(fx, cs_seq=scenario["cs_seq"], plan=scenario["plan"], apply_rc=scenario["apply_rc"])
+                Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+                state_path = fx["tmp"] / "state.json"
+                state_path.write_text(seeded, encoding="utf-8")
+                fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+                fx["env"]["CONNECTOR_SWITCH_COOLDOWN"] = "0"
+                self._run(fx, *scenario["args"])
+                self.assertEqual(state_path.read_text(encoding="utf-8"), seeded, label)
+
+    def test_fc_state_write_failure_notifies_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            ro_dir = fx["tmp"] / "ro"
+            ro_dir.mkdir()
+            os.chmod(ro_dir, 0o555)
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(ro_dir / "sub" / "state.json")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = f'printf "%s\\n" "$FAILOVER_EVENT" >> {hook_out}'
+            try:
+                result = self._run(fx, "--to", "tag:jp2", "--apply")
+            finally:
+                os.chmod(ro_dir, 0o755)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("APPLIED AND VERIFIED", result.stderr)
+            self.assertEqual(hook_out.read_text(encoding="utf-8").strip(), "connector-switch")
+
+    def test_fc_notify_failure_cannot_change_outcome_and_env_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = "exit 1"
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 0, result.stderr)  # hook failure isolated
+        with tempfile.TemporaryDirectory() as tmp:
+            # A FAILOVER_NOTIFY_CMD line inside failover.env must be IGNORED.
+            env_file = Path(tmp) / "failover.env"
+            hook_out = Path(tmp) / "hook-from-envfile.txt"
+            env_file.write_text(f'FAILOVER_NOTIFY_CMD=touch {hook_out}\n', encoding="utf-8")
+            fx = self._fixture(tmp, env_file=env_file)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback])
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(hook_out.exists())
+
+    @staticmethod
+    def _proc_start_time(pid):
+        """Mirror the script's proc_start_time: /proc stat field 22 (jiffies)
+        on Linux, `ps -o lstart=` elsewhere — so the seeded lock's identity
+        attestation matches what the script computes on EVERY platform."""
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            rest = stat.read_text(encoding="utf-8").split(") ", 1)[1].split()
+            return rest[19]
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True
+        ).stdout
+        return " ".join(out.split())
+
+    def test_fc_lock_contention_dies_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            lock_dir = fx["generated"] / "connector-switch.lock.d"
+            lock_dir.mkdir(parents=True)
+            (lock_dir / "pid").write_text(str(os.getpid()), encoding="utf-8")
+            (lock_dir / "start").write_text(self._proc_start_time(os.getpid()), encoding="utf-8")
+            fx["env"]["LOCK_WAIT"] = "1"
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("could not acquire connector-switch lock", result.stderr)
+
+    def test_fc_apply_nonzero_but_readback_verified_records_state_and_notifies(self):
+        # The frozen apply-plan can POST successfully and still exit non-zero
+        # (applied-but-manifest-update-failed). The readback is the authority:
+        # verified -> state recorded + truthful connector-switch notify, but
+        # the exit stays non-zero to surface the apply-plan error.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            readback = dict(CS_ACTIVE_JP)
+            readback["connectors"] = ["tag:jp2"]
+            cfg, _bundle = self._switch_cfg(fx, cs_seq=[CS_ACTIVE_JP, readback], apply_rc=1)
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            hook_out = fx["tmp"] / "hook.txt"
+            fx["env"]["FAILOVER_NOTIFY_CMD"] = f'printf "%s\\n" "$FAILOVER_EVENT" >> {hook_out}'
+            result = self._run(fx, "--to", "tag:jp2", "--apply")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("VERIFIED by readback, but apply-plan exited", result.stderr)
+            state = json.loads((fx["generated"] / "connector-switch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["active_tag"], "tag:jp2")
+            self.assertEqual(hook_out.read_text(encoding="utf-8").strip(), "connector-switch")
+
+    def test_fc_tmpdir_isolation_no_temp_residue(self):
+        # Observe-first cleanup: with an isolated TMPDIR, a report and a
+        # plan-only run must leave it EMPTY afterwards (the EXIT trap removes
+        # every observation temp; registration survives the subshell).
+        for mode_args, cfg_builder in (
+            ((), lambda fx: {"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]}),
+            (("--to", "tag:jp2"), None),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                fx = self._fixture(tmp)
+                if cfg_builder is None:
+                    cfg, _bundle = self._switch_cfg(fx)
+                else:
+                    cfg = cfg_builder(fx)
+                Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+                iso = fx["tmp"] / "iso-tmp"
+                iso.mkdir()
+                fx["env"]["TMPDIR"] = str(iso)
+                result = self._run(fx, *mode_args)
+                self.assertEqual(result.returncode, 0, (mode_args, result.stderr))
+                self.assertEqual(list(iso.iterdir()), [], mode_args)
+
+    def test_fc_report_missing_tailscale_degrades_liveness_only(self):
+        # Per-source degradation: no tailscale CLI anywhere on PATH -> the
+        # liveness view is unavailable but the policy view still renders.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            (Path(tmp) / "bin" / "tailscale").unlink()
+            import sys as _sys
+            python_dir = str(Path(_sys.executable).parent)
+            fx["env"]["PATH"] = os.pathsep.join([str(Path(tmp) / "bin"), python_dir, "/usr/bin", "/bin"])
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("liveness: unavailable", result.stdout)
+            self.assertIn("live connectors value", result.stdout)
+
+    def test_fc_report_missing_policy_tool_degrades_policy_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            fx["env"]["POLICY_TOOL"] = str(Path(tmp) / "nope" / "policy_tool.py")
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("missing policy tool", result.stdout)
+            self.assertIn("online nodes", result.stdout)
+
+    def test_fc_plan_only_diff_patch_directory_fails_closed_before_success_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp)
+            cfg, _bundle = self._switch_cfg(fx)
+            cfg["connector-plan"][0]["diff_is_dir"] = True
+            Path(fx["env"]["FAKE_POLICY_CONFIG"]).write_text(json.dumps(cfg), encoding="utf-8")
+            result = self._run(fx, "--to", "tag:jp2")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not a regular file", result.stderr)
+            self.assertNotIn("Plan status: valid", result.stdout)  # no success echo before validation
+
+    def test_fc_state_missing_previous_connectors_is_malformed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            state_path = fx["tmp"] / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "active_tag": "tag:jp",
+                "last_switch_at": "2026-01-01T00:00:00Z",
+                "last_plan_id": "20260101T000000Z-aaaaaaaa",
+            }), encoding="utf-8")
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("malformed; ignoring it", result.stderr)
+
+    def test_fc_env_file_supplies_pool_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "failover.env"
+            env_file.write_text(
+                "PRIMARY_CONNECTOR_TAG=tag:jp\nFALLBACK_CONNECTOR_TAG=tag:jp2\nCONNECTOR_SWITCH_COOLDOWN=0\n",
+                encoding="utf-8",
+            )
+            fx = self._fixture(tmp, env_file=env_file,
+                               policy_cfg={"connector-state": [{"stdout": json.dumps(CS_ACTIVE_JP)}]})
+            fx["env"].pop("PRIMARY_CONNECTOR_TAG", None)
+            fx["env"].pop("FALLBACK_CONNECTOR_TAG", None)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("tag:jp (primary)", result.stdout)
+            self.assertIn("tag:jp2 (fallback)", result.stdout)
 
 
 if __name__ == "__main__":

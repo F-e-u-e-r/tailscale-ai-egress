@@ -1927,6 +1927,100 @@ MERGE_GOLDEN = (
 )
 
 
+class ConnectorStateTests(unittest.TestCase):
+    """Direct tests for the read-only connector-state subcommand."""
+
+    def cs_args(self, *, tags=None, connector_name="AI-Egress-JP"):
+        return argparse.Namespace(
+            connector_name=connector_name,
+            tag=tags,
+            member_src="autogroup:member",
+            tailnet="-",
+            api_key="tskey-api-test",
+            oauth_client_id=None,
+            oauth_client_secret=None,
+            oauth_scopes=None,
+            prompt_token=False,
+        )
+
+    def run_cs(self, args, *, policy, headers):
+        with mock.patch.object(
+            tool, "tailscale_api",
+            side_effect=[(200, tool.dumps(policy), "bearer", headers)],
+        ):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdout", out):
+                rc = tool.connector_state(args)
+        return rc, json.loads(out.getvalue())
+
+    def test_connector_state_renders_facts_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                rc, doc = self.run_cs(
+                    self.cs_args(tags=["tag:ai-egress-jp2", "tag:nope"]),
+                    policy=READY_POLICY, headers={"ETag": "e9"},
+                )
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0)
+            self.assertEqual(doc["etag"], "e9")
+            self.assertEqual(doc["entry_count"], 1)
+            self.assertEqual(doc["connectors"], ["tag:ai-egress-jp"])
+            self.assertTrue(doc["readiness"]["tag:ai-egress-jp2"]["ready"])
+            self.assertFalse(doc["readiness"]["tag:nope"]["ready"])
+            self.assertIsNotNone(doc["readiness"]["tag:nope"]["error"])
+            # Read-only by construction: nothing written anywhere.
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_connector_state_missing_etag_is_null_not_error(self):
+        rc, doc = self.run_cs(self.cs_args(tags=None), policy=READY_POLICY, headers={})
+        self.assertEqual(rc, 0)
+        self.assertIsNone(doc["etag"])
+        self.assertEqual(doc["readiness"], {})
+
+    def test_connector_state_entry_count_zero_and_many_are_facts(self):
+        none_policy = {"nodeAttrs": []}
+        rc, doc = self.run_cs(self.cs_args(tags=None), policy=none_policy, headers={"ETag": "e"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(doc["entry_count"], 0)
+        self.assertIsNone(doc["connectors"])
+        many = copy.deepcopy(READY_POLICY)
+        many["nodeAttrs"].append(
+            {"target": ["*"], "app": {tool.APP_CONNECTORS_KEY: [{"name": "AI-Egress-JP", "connectors": ["tag:x"]}]}}
+        )
+        rc2, doc2 = self.run_cs(self.cs_args(tags=None), policy=many, headers={"ETag": "e"})
+        self.assertEqual(rc2, 0)
+        self.assertEqual(doc2["entry_count"], 2)
+        self.assertIsNone(doc2["connectors"])  # not unique -> no value claimed
+
+    def test_connector_state_absent_connectors_key_is_null(self):
+        policy = copy.deepcopy(READY_POLICY)
+        del policy["nodeAttrs"][0]["app"][tool.APP_CONNECTORS_KEY][0]["connectors"]
+        rc, doc = self.run_cs(self.cs_args(tags=None), policy=policy, headers={"ETag": "e"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(doc["entry_count"], 1)
+        self.assertIsNone(doc["connectors"])
+
+    def test_connector_state_shape_invalid_policy_raises(self):
+        bad = {"tagOwners": ["not", "a", "dict"]}
+        with mock.patch.object(
+            tool, "tailscale_api",
+            side_effect=[(200, tool.dumps(bad), "bearer", {"ETag": "e"})],
+        ):
+            with self.assertRaises(tool.PolicyError):
+                tool.connector_state(self.cs_args(tags=None))
+
+    def test_connector_state_fetch_failure_raises(self):
+        with mock.patch.object(
+            tool, "tailscale_api",
+            side_effect=[(500, "boom", "bearer", {})],
+        ):
+            with self.assertRaises(tool.PolicyError):
+                tool.connector_state(self.cs_args(tags=None))
+
+
 class ConnectorPlanStabilityTests(unittest.TestCase):
     def test_merge_policy_golden_byte_identical(self):
         merged = tool.merge_policy(
