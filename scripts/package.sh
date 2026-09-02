@@ -122,7 +122,7 @@ if [ "$CHECK" = "1" ]; then
   tar -xzf "$OUT_DIR/$PREFIX.tar.gz" -C "$verify_dir"
   required=(VERSION LICENSE README.md SECURITY.md PRIVACY.md CHANGELOG.md
     bootstrap.sh check-client-routes.sh diagnose.sh enable-exit-node.sh
-    disable-exit-node.sh failover-exit-node.sh monitor-connectors.sh
+    disable-exit-node.sh failover-connectors.sh failover-exit-node.sh monitor-connectors.sh
     restore-connector.sh rollback.sh install.sh
     policy/default-ai-domains.json scripts/policy_tool.py
     scripts/health_check.py examples/failover.env.example

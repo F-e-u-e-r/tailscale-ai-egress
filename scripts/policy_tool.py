@@ -1848,6 +1848,59 @@ def connector_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def connector_state(args: argparse.Namespace) -> int:
+    """Read-only Model B observer: print the managed entry's live connectors
+    value and per-tag pool readiness as one JSON object.
+
+    Writes NOTHING — no bundles, no failed-artifact dirs, no state. A missing
+    response ETag is NOT an error here (rendered as null): report and readback
+    need only the policy body; ETag enforcement stays where the
+    compare-and-swap lives, in connector-plan. Entry-count ambiguity (0 or
+    many managed entries) and readiness misses are FACTS rendered at exit 0,
+    not refusals. Only credential/fetch/parse/shape problems raise PolicyError.
+    """
+    token, token_mode = get_api_token(args)
+    acl_path = tailnet_path(args.tailnet, "/acl")
+    status, current_text, _used_mode, get_headers = tailscale_api(
+        "GET", acl_path, token=token, token_mode=token_mode
+    )
+    if status < 200 or status >= 300:
+        raise PolicyError(f"Could not fetch current policy ({status}): {safe_response_text(current_text)}")
+    etag = case_insensitive_header(get_headers, "ETag") or None
+
+    policy, policy_findings = validate_policy_text(current_text, connector_tag=None)
+    failure = first_failure(policy_findings)
+    if policy is None or failure is not None:
+        message = failure["message"] if failure is not None else "policy did not parse"
+        raise PolicyError(f"Fetched policy failed shape validation: {message}")
+
+    coords = find_managed_connector_coords(policy, args.connector_name)
+    connectors_value: Any = None
+    if len(coords) == 1:
+        attr_index, connector_index = coords[0]
+        entry = policy["nodeAttrs"][attr_index]["app"][APP_CONNECTORS_KEY][connector_index]
+        connectors_value = entry.get("connectors") if "connectors" in entry else None
+
+    readiness: dict[str, Any] = {}
+    for tag in args.tag or []:
+        error = pool_readiness_error(policy, tag, args.member_src)
+        readiness[tag] = {"ready": error is None, "error": error}
+
+    print(
+        dumps(
+            {
+                "etag": etag,
+                "connector_name": args.connector_name,
+                "entry_count": len(coords),
+                "connectors": connectors_value,
+                "readiness": readiness,
+            }
+        ),
+        end="",
+    )
+    return 0
+
+
 def confirm_exact_action(*, action: str, plan_id: str, yes: bool) -> None:
     expected = f"{action} {plan_id}"
     if yes:
@@ -2393,6 +2446,25 @@ def main(argv: list[str] | None = None) -> int:
     connector_plan_cmd.add_argument("--prompt-token", action="store_true")
     connector_plan_cmd.add_argument("--plans-dir", default="generated/policy-plans")
 
+    connector_state_cmd = subparsers.add_parser(
+        "connector-state",
+        help="Read-only: print the managed entry's live connectors value and per-tag pool readiness as JSON.",
+    )
+    connector_state_cmd.add_argument("--connector-name", default=default_connector_name())
+    connector_state_cmd.add_argument(
+        "--tag",
+        action="append",
+        metavar="tag:<pool>",
+        help="Pool tag to evaluate readiness for (repeatable).",
+    )
+    connector_state_cmd.add_argument("--member-src", default=DEFAULT_MEMBER_SRC)
+    connector_state_cmd.add_argument("--tailnet", default=os.environ.get("TAILSCALE_TAILNET", "-"))
+    connector_state_cmd.add_argument("--api-key")
+    connector_state_cmd.add_argument("--oauth-client-id")
+    connector_state_cmd.add_argument("--oauth-client-secret")
+    connector_state_cmd.add_argument("--oauth-scopes")
+    connector_state_cmd.add_argument("--prompt-token", action="store_true")
+
     apply_plan = subparsers.add_parser("apply-plan", help="Apply an existing valid policy plan bundle.")
     apply_plan.add_argument("plan_dir")
     apply_plan.add_argument("--tailnet")
@@ -2494,6 +2566,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "connector-plan":
             return connector_plan(args)
+
+        if args.command == "connector-state":
+            return connector_state(args)
 
         if args.command == "apply-plan":
             return apply_policy_plan(args)

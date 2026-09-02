@@ -24,6 +24,14 @@ class ReadmeParityTests(unittest.TestCase):
         self.assertEqual(parity.check_parity(ROOT), [])
         self.assertEqual(parity.main(["check_readme_parity.py", str(ROOT)]), 0)
 
+    def test_readmes_actually_mention_failover_connectors(self):
+        # Completeness, not just parity: the parity checker passes when a script
+        # is omitted from BOTH READMEs, so pin the operator-facing mention of
+        # the Model B switch entrypoint in each language explicitly.
+        for name in ("README.md", "README.zh-HK.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("failover-connectors.sh", text, name)
+
     def test_symmetric_mention_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, en="Run `fixture.sh`.", zh="執行 `fixture.sh`。")

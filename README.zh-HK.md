@@ -31,6 +31,7 @@ cd tailscale-ai-egress
 - **🎯 Domain-selective AI egress** — 只把你選的 AI domains 經 VPS 出口 IP，其他流量繼續走本地網絡或你慣用的 exit node。
 - **🔁 同區 connector failover** — 多台 App Connector 共用同一 tag，其中一台離線時，新的 AI-domain 連線會轉去仍在線的 connector。
 - **🛟 Exit-node failover controller** — `failover-exit-node.sh --watch --apply` 在主 exit node 健康檢查失敗時切換到備援，具備 hysteresis、cooldown 和可選的 post-switch notify hook。
+- **🔀 Distinct-tag connector switch（Model B，進階）** — `failover-connectors.sh --to tag:<pool> --apply` 透過 audited plan pipeline 強制指定哪個 connector pool 服務 AI domain set，處理 native HA 看不到的 online-but-bad 情況（egress IP 錯誤、路徑劣化、quota、撤離）。Observe-first 且 fail-closed；見 [docs/Failover.md](docs/Failover.md)。
 - **📊 Connector HA 監察 + metrics** — `monitor-connectors.sh` 報告每台 connector 的 online／可達性／route 狀態，以及 per-connector metrics（Tx/Rx counters、liveness、`tailscale ping` latency、connection path）。用 `--prometheus-textfile` 輸出 node_exporter／Prometheus textfile，或用 `health_check.py peer-metrics` 讀單一 connector。
 - **🧭 引導式設定，automation 需 opt in** — 預設只產生手動 policy snippet；只有你選擇時才 opt in 可審核的 API policy（`plan` → `apply-plan`），永不自動執行。
 - **🩺 診斷，支援 JSON** — `diagnose.sh`（VPS）和 `check-client-routes.sh`（client）端到端驗證 routing，兩者都支援 `--json` 供 scripting 使用。

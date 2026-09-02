@@ -24,8 +24,8 @@ reading on:
   [Taking One Machine Out](#taking-one-machine-out) sections apply to both
   models. If you do not have a reason to force which pool egresses your AI
   traffic, use Model A and skip the Advanced Mode section.
-- **Model B — distinct-tag pools with forced selection (advanced, opt-in,
-  planned for v1.3).** Primary and fallback connector pools live under
+- **Model B — distinct-tag pools with forced selection (advanced,
+  opt-in).** Primary and fallback connector pools live under
   distinct tags, and an operator-invoked, auditable switch forces which pool
   serves the AI domain set. It composes with — and does not replace — native
   HA. See
@@ -140,14 +140,6 @@ Exit status is `0` when both connectors are online and reachable and `1` when de
 
 ## Advanced Mode: Distinct-Tag Active Connector Switch (Model B)
 
-> **Status: planned for v1.3 — not yet released.** The design is merged
-> ([design/connector-failover-apply.md](design/connector-failover-apply.md)),
-> and these docs are the operator contract the implementation must satisfy
-> (they merge first, by the design's pre-implementation gate). The commands in
-> this section are **not available in any released version yet**; every
-> command block below is marked accordingly. The implementation PR that ships
-> them removes this banner and the per-block markers.
-
 ### The two models, precisely
 
 Model A (everything above this section) keeps all connectors of a pair under
@@ -184,7 +176,6 @@ one-shot, operator-invoked action.
 The operator entry point is `failover-connectors.sh`, with three forms:
 
 ```bash
-# v1.3 — not yet released
 ./failover-connectors.sh
 ```
 
@@ -196,7 +187,6 @@ credential the policy-derived fields (active pool, declarations, drift) show
 `unavailable`; the status-derived liveness fields still work.
 
 ```bash
-# v1.3 — not yet released
 ./failover-connectors.sh --to tag:<pool>
 ```
 
@@ -206,7 +196,6 @@ plan bundle via the connector-scoped planner (`policy_tool.py connector-plan
 the bundle sits under `generated/policy-plans/` for review.
 
 ```bash
-# v1.3 — not yet released
 ./failover-connectors.sh --to tag:<pool> --apply
 ```
 
@@ -278,7 +267,6 @@ one exception, flagged below.
 1. **Declare the fallback pool in policy first:**
 
    ```bash
-   # connector-plan: v1.3 — not yet released (apply-plan already ships today)
    python3 scripts/policy_tool.py connector-plan --declare tag:<fallback>
    python3 scripts/policy_tool.py apply-plan generated/policy-plans/plan.<plan-id>
    ```
@@ -343,8 +331,7 @@ Three layers, preferred first:
    safe under concurrent policy edits):
 
    ```bash
-   # v1.3 — not yet released
-   ./failover-connectors.sh --to tag:<previous> --apply
+      ./failover-connectors.sh --to tag:<previous> --apply
    ```
 
    Or the two-step variant: plan first (`--to tag:<previous>`), review the

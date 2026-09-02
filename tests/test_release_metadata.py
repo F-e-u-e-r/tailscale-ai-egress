@@ -19,6 +19,7 @@ ENTRYPOINTS = [
     "diagnose.sh",
     "disable-exit-node.sh",
     "enable-exit-node.sh",
+    "failover-connectors.sh",
     "failover-exit-node.sh",
     "monitor-connectors.sh",
     "install.sh",

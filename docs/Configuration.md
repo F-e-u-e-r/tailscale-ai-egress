@@ -161,11 +161,9 @@ without failing. See [Failover](Failover.md) for the full workflow and the
 
 ## Connector Switch (Model B, v1.3)
 
-> **Status: planned for v1.3 — not yet released.** These settings belong to
-> the advanced distinct-tag connector switch
-> ([Failover — Advanced Mode](Failover.md#advanced-mode-distinct-tag-active-connector-switch-model-b));
-> the tool that reads them ships with v1.3. They are documented ahead of
-> implementation by the design's pre-implementation gate.
+> These settings belong to the advanced distinct-tag connector switch — see
+> [Failover — Advanced Mode](Failover.md#advanced-mode-distinct-tag-active-connector-switch-model-b)
+> for the full workflow.
 
 **Not to be confused with the v1.1 settings above.** These keys are for the
 v1.3 connector-*switch* tool and are distinct from similarly-named settings:
@@ -177,7 +175,6 @@ the switch keeps its own `generated/connector-switch-state.json`, separate
 from the exit-node controller's `generated/failover-state.json`.
 
 ```bash
-# v1.3 — not yet released
 PRIMARY_CONNECTOR_TAG=tag:ai-egress-jp    # the primary pool's connector tag
 FALLBACK_CONNECTOR_TAG=tag:ai-egress-jp2  # the fallback pool's connector tag
 CONNECTOR_SWITCH_COOLDOWN=600             # advisory warning window after a switch, seconds
