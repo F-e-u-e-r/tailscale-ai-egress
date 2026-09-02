@@ -638,7 +638,9 @@ report_mode() {
       absent) note "state file: absent (cold start — active pool derived from live policy)" ;;
       ok)
         note "state file: last switch to $STATE_ACTIVE_TAG at $STATE_LAST_SWITCH_AT (plan $STATE_LAST_PLAN_ID)"
-        if [ "$CONNECTORS_IS_SINGLE" = "1" ] && [ "$STATE_ACTIVE_TAG" != "$SINGLE_VALUE" ]; then
+        if [ "$CONNECTORS_IS_SINGLE" != "1" ]; then
+          note "drift: not assessable — the live connectors value above is not a single pool tag (state comparison does not apply; live policy wins)"
+        elif [ "$STATE_ACTIVE_TAG" != "$SINGLE_VALUE" ]; then
           note "drift: state file says $STATE_ACTIVE_TAG but live policy says $SINGLE_VALUE (state is advisory; live policy wins)"
         else
           note "drift: none"
@@ -698,7 +700,7 @@ if manifest.get("operation") != "switch-connectors" or manifest.get("to") != tar
     print("mismatch")
     sys.exit(0)
 plan_id = manifest.get("plan_id")
-if not isinstance(plan_id, str) or "from" not in manifest:
+if not isinstance(plan_id, str) or not plan_id or "from" not in manifest:
     print("unreadable")
     sys.exit(0)
 print(plan_id)

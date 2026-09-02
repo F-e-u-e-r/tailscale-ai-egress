@@ -3270,6 +3270,24 @@ sys.exit(spec.get("rc", 0))
             self.assertIn("drift: state file says tag:jp2 but live policy says tag:jp", result.stdout)
             self.assertIn("state is advisory", result.stdout)
 
+    def test_fc_report_drift_not_assessable_when_live_not_single(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = dict(CS_ACTIVE_JP)
+            doc["connectors"] = ["tag:jp", "tag:jp2"]
+            fx = self._fixture(tmp, policy_cfg={"connector-state": [{"stdout": json.dumps(doc)}]})
+            state_path = fx["tmp"] / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 1, "active_tag": "tag:jp2",
+                "previous_connectors": ["tag:jp"],
+                "last_switch_at": "2026-01-01T00:00:00Z",
+                "last_plan_id": "20260101T000000Z-aaaaaaaa",
+            }), encoding="utf-8")
+            fx["env"]["CONNECTOR_SWITCH_STATE_FILE"] = str(state_path)
+            result = self._run(fx)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("drift: not assessable", result.stdout)
+            self.assertNotIn("drift: none", result.stdout)
+
     def test_fc_report_malformed_state_warns_and_is_ignored(self):
         for content in ("{not json", json.dumps({"schema_version": 2}), json.dumps({"schema_version": 1})):
             with tempfile.TemporaryDirectory() as tmp:
