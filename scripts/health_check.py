@@ -1063,6 +1063,15 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                 [state["nodes"]["primary"], *state["nodes"]["fallbacks"]],
                 [primary_identity, *fallback_identities],
             ):
+                if resolved_id is None and not resolved_ips:
+                    # Unresolved this round (multi-only: a non-active bench
+                    # candidate — every other unresolved case failed the cycle
+                    # earlier). KEEP the last-known identity as the comparison
+                    # baseline: overwriting it with (None, []) would blind the
+                    # identity-change reset below, letting a DIFFERENT node
+                    # that later takes this label inherit stale history (e.g.
+                    # a DOWN state that could trigger an unwarranted switch).
+                    continue
                 stored_id = node.get("node_id")
                 # Canonicalize the persisted set (an older build stored it as raw text)
                 # the same way resolved IPs are canonicalized, so an expanded-vs-compressed

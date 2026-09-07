@@ -1549,12 +1549,13 @@ class MultiVerdictCliTests(unittest.TestCase):
     def _write_status(self, **kwargs):
         self.status_file.write_text(json.dumps(multi_status(**kwargs)), encoding="utf-8")
 
-    def _verdict(self, extra=None, fallbacks=None):
+    def _verdict(self, extra=None, fallbacks=None, thresholds="1"):
         argv = [
             "verdict", "--state-file", str(self.state_file),
             "--primary", "primary-vps", "--fallback", fallbacks or self.FALLBACKS,
             "--status-json-file", str(self.status_file),
-            "--fail-threshold", "1", "--ok-threshold", "1", "--cooldown", "0", "--json",
+            "--fail-threshold", thresholds, "--ok-threshold", thresholds,
+            "--cooldown", "0", "--json",
         ]
         return run_cli(argv + (extra or []))
 
@@ -1681,6 +1682,35 @@ class MultiVerdictCliTests(unittest.TestCase):
                          ("switch-to-fallback", "delisted_next_fallback"))
         self.assertEqual(decision["target_index"], 0)
         self.assertEqual(decision["target_label"], "fb-a")
+
+    def test_l16_unresolved_cycle_keeps_identity_baseline_for_reset(self):
+        # GPT plan-confirm finding: an unresolved cycle must NOT blank the
+        # slot's stored identity — it is the comparison baseline that lets the
+        # identity-change reset fire when a DIFFERENT node later takes the
+        # label. Sequence: (1) fb-b resolved and failing (accrues DOWN);
+        # (2) fb-b unresolved — identity retained; (3) fb-b re-points to a NEW
+        # node — history must RESET, not be inherited by the new node.
+        # Thresholds of 3 make reset-vs-inherit observable: an inherited DOWN
+        # would survive one fresh pass (ok 1 < 3), a reset lands on UNKNOWN.
+        self._set_env("FAKE_UNREACHABLE", "fb-b")
+        self._write_status(active="fb-a")
+        for _cycle in range(3):
+            self._verdict(thresholds="3")  # fb-b accrues DOWN, identity nodeB
+        state = self.read_state()
+        self.assertEqual(state["nodes"]["fallbacks"][1]["node_id"], "nodeB")
+        self.assertEqual(state["nodes"]["fallbacks"][1]["last_state"], hc.STATE_DOWN)
+        self._write_status(active="fb-a", drop_peers=("fb-b",))
+        self._verdict(thresholds="3")  # unresolved cycle — identity baseline retained
+        state = self.read_state()
+        self.assertEqual(state["nodes"]["fallbacks"][1]["node_id"], "nodeB")
+        os.environ.pop("FAKE_UNREACHABLE", None)
+        self._write_status(active="fb-a", repoint={"fb-b": "nodeNEW"})
+        self._verdict(thresholds="3")  # a different node holds the label now
+        state = self.read_state()
+        self.assertEqual(state["nodes"]["fallbacks"][1]["node_id"], "nodeNEW")
+        self.assertEqual(state["nodes"]["fallbacks"][1]["fail_count"], 0)  # history reset
+        self.assertEqual(state["nodes"]["fallbacks"][1]["ok_count"], 1)  # one fresh pass
+        self.assertEqual(state["nodes"]["fallbacks"][1]["last_state"], hc.STATE_UNKNOWN)
 
     def test_l15_unresolved_primary_fails_closed_in_multi(self):
         self._write_status(active="fb-a", drop_peers=("primary-vps",))
