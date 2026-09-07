@@ -1,0 +1,1015 @@
+{
+  "fallback_label": "node-b",
+  "primary_label": "node-a",
+  "recorded_from": "v1.3.0",
+  "scenarios": [
+    {
+      "initial": {},
+      "name": "healthy_steady",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1000.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1030.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 2
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "UP",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1060.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 3
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 3
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {},
+      "name": "hysteresis_to_switch",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1000.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1030.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 1,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "UNKNOWN",
+            "reason": "healthy",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1060.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 3
+          },
+          "post_primary": {
+            "fail_count": 2,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "switch-to-fallback",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "primary_down",
+            "target_label": "node-b",
+            "target_role": "fallback"
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1090.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 4
+          },
+          "post_primary": {
+            "fail_count": 3,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {
+        "p_fail": 3,
+        "p_state": "DOWN"
+      },
+      "name": "fallback_unverified_then_both_down",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "DOWN",
+            "reason": "fallback_unverified",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": false,
+            "now": 1000.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 1,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 4,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "DOWN",
+            "reason": "fallback_unverified",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": false,
+            "now": 1030.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 2,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 5,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "DOWN",
+            "primary_state": "DOWN",
+            "reason": "both_down",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": false,
+            "now": 1060.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 3,
+            "last_state": "DOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 6,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {
+        "f_fail": 3,
+        "f_state": "DOWN"
+      },
+      "name": "fallback_down_while_primary_unknown",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "DOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "fallback_down",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 1000.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 4,
+            "last_state": "DOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 1,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "DOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "fallback_down",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 1030.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 5,
+            "last_state": "DOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {
+        "f_state": "UP",
+        "last_switch": 1080.0,
+        "p_fail": 3,
+        "p_state": "DOWN"
+      },
+      "name": "cooldown_blocks_switch",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "cooldown",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1100.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 4,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "switch-to-fallback",
+            "active_role": "primary",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "primary_down",
+            "target_label": "node-b",
+            "target_role": "fallback"
+          },
+          "input": {
+            "active_role": "primary",
+            "f_reach": true,
+            "now": 1150.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 5,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {
+        "f_state": "UP",
+        "last_switch": 1000.0,
+        "p_fail": 3,
+        "p_state": "DOWN"
+      },
+      "name": "restore_primary",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "staying_on_fallback",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 1100.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "DOWN",
+            "ok_count": 1
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "staying_on_fallback",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 1130.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "DOWN",
+            "ok_count": 2
+          }
+        },
+        {
+          "decision": {
+            "action": "switch-to-primary",
+            "active_role": "fallback",
+            "event": "primary_recovered",
+            "fallback_state": "UP",
+            "primary_state": "UP",
+            "reason": "primary_recovered",
+            "target_label": "node-a",
+            "target_role": "primary"
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 1160.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 3
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 3
+          }
+        },
+        {
+          "decision": {
+            "action": "switch-to-primary",
+            "active_role": "fallback",
+            "event": "primary_recovered",
+            "fallback_state": "UP",
+            "primary_state": "UP",
+            "reason": "primary_recovered",
+            "target_label": "node-a",
+            "target_role": "primary"
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 1190.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 4
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 4
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {
+        "f_state": "UP",
+        "last_switch": 1000.0,
+        "p_state": "UP"
+      },
+      "name": "restore_disabled",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "primary_recovered",
+            "fallback_state": "UP",
+            "primary_state": "UP",
+            "reason": "restore_primary_disabled",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 2000.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 1
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "primary_recovered",
+            "fallback_state": "UP",
+            "primary_state": "UP",
+            "reason": "restore_primary_disabled",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 2030.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 1,
+            "last_state": "UP",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 2
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": false
+      }
+    },
+    {
+      "initial": {
+        "f_state": "UP",
+        "last_switch": 1000.0,
+        "p_fail": 3,
+        "p_state": "DOWN"
+      },
+      "name": "staying_on_fallback_and_fallback_down",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "staying_on_fallback",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": true,
+            "now": 2000.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UP",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 4,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "staying_on_fallback",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 2030.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 1,
+            "last_state": "UP",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 5,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "UP",
+            "primary_state": "DOWN",
+            "reason": "staying_on_fallback",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 2060.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 2,
+            "last_state": "UP",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 6,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "DOWN",
+            "primary_state": "DOWN",
+            "reason": "both_down",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 2090.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 3,
+            "last_state": "DOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 7,
+            "last_state": "DOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "fallback",
+            "event": "",
+            "fallback_state": "DOWN",
+            "primary_state": "DOWN",
+            "reason": "both_down",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "fallback",
+            "f_reach": false,
+            "now": 2120.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 4,
+            "last_state": "DOWN",
+            "ok_count": 0
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "DOWN",
+            "ok_count": 1
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {},
+      "name": "ensure_primary_from_none",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "none",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "no_active_exit_node",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "none",
+            "f_reach": true,
+            "now": 1000.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 1,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          }
+        },
+        {
+          "decision": {
+            "action": "switch-to-primary",
+            "active_role": "none",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "ensure_primary",
+            "target_label": "node-a",
+            "target_role": "primary"
+          },
+          "input": {
+            "active_role": "none",
+            "f_reach": true,
+            "now": 1030.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": true,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {},
+      "name": "none_without_ensure",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "none",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "no_active_exit_node",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "none",
+            "f_reach": true,
+            "now": 1000.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    },
+    {
+      "initial": {},
+      "name": "unknown_active_never_overridden",
+      "steps": [
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "unknown",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "unknown_active",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "unknown",
+            "f_reach": true,
+            "now": 1000.0,
+            "p_reach": true
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          },
+          "post_primary": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 1
+          }
+        },
+        {
+          "decision": {
+            "action": "none",
+            "active_role": "unknown",
+            "event": "",
+            "fallback_state": "UNKNOWN",
+            "primary_state": "UNKNOWN",
+            "reason": "unknown_active",
+            "target_label": "",
+            "target_role": ""
+          },
+          "input": {
+            "active_role": "unknown",
+            "f_reach": true,
+            "now": 1030.0,
+            "p_reach": false
+          },
+          "post_fallback": {
+            "fail_count": 0,
+            "last_state": "UNKNOWN",
+            "ok_count": 2
+          },
+          "post_primary": {
+            "fail_count": 1,
+            "last_state": "UNKNOWN",
+            "ok_count": 0
+          }
+        }
+      ],
+      "thresholds": {
+        "cooldown": 60.0,
+        "ensure_primary": false,
+        "fail_threshold": 3,
+        "ok_threshold": 3,
+        "restore_primary": true
+      }
+    }
+  ]
+}

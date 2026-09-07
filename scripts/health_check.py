@@ -7,10 +7,12 @@ Subcommands:
   probe          One-shot health probe of a single node (tailnet ping plus an
                  optional short-timeout HTTP egress check). This is the
                  on-demand "ping" function.
-  verdict        Stateful failover decision for a primary/fallback exit-node
-                 pair: reconcile live Tailscale state, probe both nodes, apply
-                 hysteresis / cooldown via a pure evaluator, persist state under
-                 an advisory lock, and print a machine-readable decision.
+  verdict        Stateful failover decision for a primary plus an ORDERED list
+                 of fallback exit nodes (comma-separated; order is priority):
+                 reconcile live Tailscale state, probe every configured node,
+                 apply hysteresis / cooldown via a pure evaluator, persist
+                 state under an advisory lock, and print a machine-readable
+                 decision.
   record-switch  Record that the controller switched the active exit node (sets
                  the active role + switch timestamp used for cooldown).
 
@@ -37,14 +39,20 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 # Kept in lock-step with the VERSION file (checked by tests/test_release_metadata.py).
 __version__ = "1.3.0"
 
-STATE_SCHEMA_VERSION = 1
+# Two DELIBERATELY separate constants (see docs/design/multi-fallback.md):
+# STATE_SCHEMA_VERSION governs ONLY the exit-node controller's state file
+# (failover-state.json load/normalize/save); REPORT_SCHEMA_VERSION governs the
+# probe/verdict/connectors JSON payloads, which stay at 1 with additive fields
+# only. Bumping one must never leak into the other.
+STATE_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 1
 
 DEFAULT_PING_TIMEOUT = 5.0
 DEFAULT_HTTP_TIMEOUT = 5.0
@@ -225,6 +233,35 @@ def probe_node(
 
 
 # --------------------------------------------------------------------------- #
+# Fallback list (ordered; order IS priority)
+# --------------------------------------------------------------------------- #
+def parse_fallback_list(raw: str) -> list[str]:
+    """Split FALLBACK_EXIT_NODE on commas and trim each entry. Pure parse; the
+    result (including any empty entries) is judged by validate_candidate_labels."""
+    return [entry.strip() for entry in (raw or "").split(",")]
+
+
+def validate_candidate_labels(primary: str, fallbacks: list[str]) -> Optional[str]:
+    """Fail-closed configuration validation, run BEFORE any probing, state I/O,
+    or locking. Returns an error message, or None when the list is usable.
+
+    Comparisons use _labels_equivalent semantics as they are: exact text for
+    hostnames/MagicDNS labels (NOT case-insensitive), canonical-address
+    equality for IP-valued labels — so two spellings of one IP refuse here,
+    while case-different hostnames are (correctly) distinct nodes."""
+    for i, label in enumerate(fallbacks):
+        if not label:
+            return f"fallback entry {i + 1} is empty (check FALLBACK_EXIT_NODE for stray commas)"
+    for i, label in enumerate(fallbacks):
+        if _labels_equivalent(label, primary):
+            return f"fallback '{label}' equals PRIMARY_EXIT_NODE (a node cannot be its own fallback)"
+        for j in range(i + 1, len(fallbacks)):
+            if _labels_equivalent(label, fallbacks[j]):
+                return f"duplicate fallback entries '{label}' and '{fallbacks[j]}'"
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
 def default_node_state(label: str) -> dict[str, Any]:
@@ -239,7 +276,7 @@ def default_node_state(label: str) -> dict[str, Any]:
     }
 
 
-def default_state(primary_label: str, fallback_label: str) -> dict[str, Any]:
+def default_state(primary_label: str, fallback_labels: list[str]) -> dict[str, Any]:
     return {
         "schema_version": STATE_SCHEMA_VERSION,
         "active": {
@@ -247,12 +284,13 @@ def default_state(primary_label: str, fallback_label: str) -> dict[str, Any]:
             "configured_label": None,
             "node_id": None,
             "tailscale_ips": [],
+            "fallback_index": None,
             "last_switch_epoch": 0.0,
             "last_switch_at": None,
         },
         "nodes": {
             "primary": default_node_state(primary_label),
-            "fallback": default_node_state(fallback_label),
+            "fallbacks": [default_node_state(label) for label in fallback_labels],
         },
     }
 
@@ -275,35 +313,61 @@ def _as_str_list(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
-def normalize_state(raw: Any, primary_label: str, fallback_label: str) -> dict[str, Any]:
-    """Return a well-formed, type-validated state dict. Corrupt input (wrong
-    shape, bad field types, or old schema) is defensively discarded. Configured
-    labels always win; if a role's stored label differs from the configured one,
-    that role's health history is reset (it is a different node)."""
-    base = default_state(primary_label, fallback_label)
-    if not isinstance(raw, dict) or raw.get("schema_version") != STATE_SCHEMA_VERSION:
+def _copy_node_history(stored: dict[str, Any], target: dict[str, Any]) -> None:
+    """Copy ONLY the six history/identity fields from a stored node record.
+
+    ``configured_label`` is deliberately NOT copied: the normalized record must
+    always carry the THIS-CYCLE parsed spelling (the base's), so every
+    downstream label emission (a Decision's target_label, record-switch's
+    copy, the notify hook) equals the current raw configured string even
+    across a canonical-equivalent respell of the same node — that is what
+    keeps the controller's exact-text target_label cross-check sound."""
+    last_state = stored.get("last_state")
+    target["last_state"] = last_state if last_state in (STATE_UP, STATE_DOWN, STATE_UNKNOWN) else STATE_UNKNOWN
+    target["fail_count"] = _as_int(stored.get("fail_count"))
+    target["ok_count"] = _as_int(stored.get("ok_count"))
+    target["last_checked_at"] = _as_str_or_none(stored.get("last_checked_at"))
+    target["node_id"] = _as_str_or_none(stored.get("node_id"))
+    target["tailscale_ips"] = _as_str_list(stored.get("tailscale_ips"))
+
+
+def normalize_state(raw: Any, primary_label: str, fallback_labels: list[str]) -> dict[str, Any]:
+    """Return a well-formed, type-validated schema-2 state dict.
+
+    Corrupt input (wrong shape, bad field types, unknown schema) is defensively
+    discarded. A well-formed v1 file is READ-COMPATIBLE (one-way): its
+    ``nodes.fallback`` seeds ``fallbacks[0]`` and then the same per-slot rules
+    apply, so v1 plus a simultaneous config edit converges through one path.
+
+    Per-slot history is POSITIONAL: slot i keeps its stored history only when
+    stored ``fallbacks[i]`` exists and its label is ``_labels_equivalent`` to
+    the configured slot-i label (the existing label-change-resets rule, per
+    slot) — so REORDERING the list resets per-node history. The active
+    record's ``fallback_index`` is NEVER trusted from disk; it is re-derived
+    from the stored active label: label matches a configured slot → rebind to
+    that ordinal (reorders converge); label matches no slot → retained label +
+    identity with a null index (the delisted evidence — erasing it was the
+    design-review Blocker); type-invalid values → per-field defensive
+    defaults. ``last_switch_epoch``/``last_switch_at`` are retained in every
+    readable case: the cooldown clock must survive config edits."""
+    base = default_state(primary_label, fallback_labels)
+    if not isinstance(raw, dict) or raw.get("schema_version") not in (1, STATE_SCHEMA_VERSION):
         return base
 
     raw_nodes = raw.get("nodes")
-    if isinstance(raw_nodes, dict):
-        for role, label in (("primary", primary_label), ("fallback", fallback_label)):
-            stored = raw_nodes.get(role)
-            if not isinstance(stored, dict):
-                continue
-            # Reset health history when the configured label changed (new node). IP-valued
-            # labels are compared by canonical address, so re-spelling the same IP (expanded
-            # vs compressed IPv6, case) across runs is not mistaken for a node change (which
-            # would drop history and suppress a due failover across an upgrade).
-            if not _labels_equivalent(stored.get("configured_label"), label):
-                continue
-            target = base["nodes"][role]
-            last_state = stored.get("last_state")
-            target["last_state"] = last_state if last_state in (STATE_UP, STATE_DOWN, STATE_UNKNOWN) else STATE_UNKNOWN
-            target["fail_count"] = _as_int(stored.get("fail_count"))
-            target["ok_count"] = _as_int(stored.get("ok_count"))
-            target["last_checked_at"] = _as_str_or_none(stored.get("last_checked_at"))
-            target["node_id"] = _as_str_or_none(stored.get("node_id"))
-            target["tailscale_ips"] = _as_str_list(stored.get("tailscale_ips"))
+    stored_primary: Any = raw_nodes.get("primary") if isinstance(raw_nodes, dict) else None
+    if raw.get("schema_version") == 1:
+        stored_fallbacks: list[Any] = [raw_nodes.get("fallback")] if isinstance(raw_nodes, dict) else []
+    else:
+        raw_list = raw_nodes.get("fallbacks") if isinstance(raw_nodes, dict) else None
+        stored_fallbacks = raw_list if isinstance(raw_list, list) else []
+
+    if isinstance(stored_primary, dict) and _labels_equivalent(stored_primary.get("configured_label"), primary_label):
+        _copy_node_history(stored_primary, base["nodes"]["primary"])
+    for i, label in enumerate(fallback_labels):
+        stored = stored_fallbacks[i] if i < len(stored_fallbacks) else None
+        if isinstance(stored, dict) and _labels_equivalent(stored.get("configured_label"), label):
+            _copy_node_history(stored, base["nodes"]["fallbacks"][i])
 
     raw_active = raw.get("active")
     if isinstance(raw_active, dict):
@@ -315,15 +379,24 @@ def normalize_state(raw: Any, primary_label: str, fallback_label: str) -> dict[s
         active["tailscale_ips"] = _as_str_list(raw_active.get("tailscale_ips"))
         active["last_switch_epoch"] = _as_float(raw_active.get("last_switch_epoch"))
         active["last_switch_at"] = _as_str_or_none(raw_active.get("last_switch_at"))
+        # Index consistency (never trust a stored index): re-derive from the
+        # stored label. A v1 file's active fallback lands on slot 0 via the
+        # same rebind when its label still sits there.
+        active["fallback_index"] = None
+        if active["role"] == "fallback":
+            for i, label in enumerate(fallback_labels):
+                if _labels_equivalent(active["configured_label"], label):
+                    active["fallback_index"] = i
+                    break
     return base
 
 
-def load_state(path: Path, primary_label: str, fallback_label: str) -> dict[str, Any]:
+def load_state(path: Path, primary_label: str, fallback_labels: list[str]) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         raw = None
-    return normalize_state(raw, primary_label, fallback_label)
+    return normalize_state(raw, primary_label, fallback_labels)
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -487,44 +560,82 @@ def resolve_identity(status: dict[str, Any], label: str) -> tuple[Optional[str],
     return matches[0] if matches else (None, [])
 
 
-def live_active_role(
+def derive_active(
     status: dict[str, Any],
-    primary_id: Optional[str],
-    primary_ips: list[str],
-    fallback_id: Optional[str],
-    fallback_ips: list[str],
-) -> str:
-    """Map the live ExitNodeStatus to one of primary / fallback / none / unknown.
+    primary_identity: tuple[Optional[str], list[str]],
+    fallback_identities: list[tuple[Optional[str], list[str]]],
+    primary_label: str,
+    fallback_labels: list[str],
+    active_record: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[int], Optional[str]]:
+    """Map the live ExitNodeStatus to ``(role, fallback_index, problem)``.
 
-    "none" means no exit node is selected; "unknown" means some *other* exit
-    node is selected (the controller must not override the user's choice).
-    """
+    ``role`` is primary / fallback / none / unknown, plus the RUNTIME-ONLY
+    ``delisted`` overlay (never persisted): the live exit node matches NO
+    configured candidate but IS provably ours by the state's retained active
+    record. "none" means no exit node is selected; "unknown" means some
+    *other* node is selected (the controller must not override the user's
+    choice). ``fallback_index`` is set only for role fallback.
+
+    Delisted evidence is accepted ONLY from a coherent previously-managed
+    record: role primary/fallback, a non-empty label, and non-empty identity
+    — a type-valid record with role unknown/none (or without label/identity)
+    never authorizes anything, so a forged/corrupt file cannot turn a foreign
+    node into "ours". When the retained label is STILL configured, the live
+    node is not delisted: if that candidate failed to resolve this round the
+    ACTIVE node is unverifiable → ``problem="live_status_incomplete"`` (fail
+    closed, every configuration); if it resolved to a DIFFERENT node the
+    label was re-pointed and the live node is foreign → unknown."""
     exit_status = status.get("ExitNodeStatus")
     if exit_status is None:
-        return "none"  # field absent/null -> genuinely no exit node selected
+        return "none", None, None  # field absent/null -> genuinely no exit node selected
     if not isinstance(exit_status, dict) or not exit_status:
         # present but malformed (scalar/list) or empty -> untrustworthy. "none" is
         # actionable (it authorizes switch-to-primary under --ensure-primary), so a
         # status we cannot trust must fail closed to "unknown", never "none".
-        return "unknown"
+        return "unknown", None, None
     exit_id = exit_status.get("ID")
     exit_id = str(exit_id) if exit_id else None
     # Validated IPs only: a malformed element (e.g. "100.64.0.1/not-a-prefix") must
     # not normalize into a false address match on this gating path.
     exit_ips = _valid_ip_set(exit_status.get("TailscaleIPs")) or set()
     if exit_id is None and not exit_ips:
-        return "unknown"  # a present dict with no trustworthy identity -> fail closed
+        return "unknown", None, None  # a present dict with no trustworthy identity -> fail closed
 
     def matches(node_id: Optional[str], ips: list[str]) -> bool:
         if node_id and exit_id and node_id == exit_id:
             return True
         return bool(ips) and bool(exit_ips) and bool(set(ips) & exit_ips)
 
-    if matches(primary_id, primary_ips):
-        return "primary"
-    if matches(fallback_id, fallback_ips):
-        return "fallback"
-    return "unknown"
+    if matches(*primary_identity):
+        return "primary", None, None
+    for i, identity in enumerate(fallback_identities):
+        if matches(*identity):
+            return "fallback", i, None
+
+    record = active_record if isinstance(active_record, dict) else {}
+    record_role = record.get("role")
+    record_label = record.get("configured_label")
+    record_id = _as_str_or_none(record.get("node_id"))
+    # Canonicalize the persisted set like every other IP comparator; a
+    # malformed persisted set degrades to empty (then only the ID can match).
+    record_ips = sorted(_valid_ip_set(record.get("tailscale_ips")) or set())
+    coherent = (
+        record_role in ("primary", "fallback")
+        and isinstance(record_label, str)
+        and bool(record_label)
+        and (record_id is not None or bool(record_ips))
+    )
+    if coherent and matches(record_id, record_ips):
+        configured = [(primary_label, primary_identity)] + list(zip(fallback_labels, fallback_identities))
+        still_configured = [identity for label, identity in configured if _labels_equivalent(record_label, label)]
+        if not still_configured:
+            return "delisted", None, None
+        for identity in still_configured:
+            if not identity[0] and not identity[1]:
+                return "unknown", None, "live_status_incomplete"
+        return "unknown", None, None
+    return "unknown", None, None
 
 
 def get_status(status_file: Optional[str]) -> tuple[dict[str, Any], bool]:
@@ -591,10 +702,12 @@ class Decision:
     reason: str
     active_role: str
     primary_state: str
-    fallback_state: str
+    fallback_state: str  # legacy scalar: ALWAYS fallbacks[0]'s state, never the active slot's
     target_role: Optional[str] = None
     target_label: Optional[str] = None
     event: Optional[str] = None
+    target_index: Optional[int] = None  # additive; set only for fallback targets
+    fallback_states: list[str] = field(default_factory=list)  # additive; all slots, in order
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -606,10 +719,22 @@ class Decision:
             "target_role": self.target_role or "",
             "target_label": self.target_label or "",
             "event": self.event or "",
+            "target_index": self.target_index,
+            "fallback_states": list(self.fallback_states),
         }
 
     def to_lines(self) -> str:
-        return "\n".join(f"{key}={value}" for key, value in self.to_dict().items())
+        # The k=v text protocol the shell controller parses. The legacy eight
+        # lines stay verbatim; `target_index=` is appended ONLY for fallback
+        # targets (the shell's pre-switch gate consumes it); fallback_states
+        # stays JSON-only (a Python-list repr has no place in k=v text).
+        data = self.to_dict()
+        keys = ("action", "reason", "active_role", "primary_state", "fallback_state",
+                "target_role", "target_label", "event")
+        lines = [f"{key}={data[key]}" for key in keys]
+        if self.target_role == "fallback" and self.target_index is not None:
+            lines.append(f"target_index={self.target_index}")
+        return "\n".join(lines)
 
 
 def _apply_hysteresis(node: dict[str, Any], reachable: bool, th: Thresholds) -> None:
@@ -629,66 +754,145 @@ def _apply_hysteresis(node: dict[str, Any], reachable: bool, th: Thresholds) -> 
 def evaluate(
     state: dict[str, Any],
     active_role: str,
+    active_index: Optional[int],
     primary_probe: ProbeResult,
-    fallback_probe: ProbeResult,
+    fallback_probes: list[ProbeResult],
     th: Thresholds,
     now: float,
+    unresolved_slots: frozenset[int] = frozenset(),
 ) -> Decision:
     """Pure decision function (mutates only the hysteresis counters in ``state``).
 
     A switch is only ever proposed when the *target* node passed its tailnet
-    ping THIS round, so we never fail over to an unverified node.
-    """
+    ping THIS round, so we never fail over to an unverified node. Every walk
+    runs in configuration order (order IS priority — no round-robin memory)
+    and additionally skips ``unresolved_slots``: an unresolved candidate's
+    real ping still fed hysteresis, but an identity that cannot be verified
+    cannot be selected. Mode flags come ONLY from ``th`` (purity).
+    ``active_index`` is the active bench ordinal when ``active_role`` is
+    "fallback" (derive_active guarantees it is in range)."""
     nodes = state["nodes"]
     _apply_hysteresis(nodes["primary"], primary_probe.reachable, th)
-    _apply_hysteresis(nodes["fallback"], fallback_probe.reachable, th)
+    for slot, slot_probe in zip(nodes["fallbacks"], fallback_probes):
+        _apply_hysteresis(slot, slot_probe.reachable, th)
     p_state = str(nodes["primary"]["last_state"])
-    f_state = str(nodes["fallback"]["last_state"])
+    f_states = [str(slot["last_state"]) for slot in nodes["fallbacks"]]
+    n = len(f_states)
     last_switch = float(state["active"].get("last_switch_epoch") or 0.0)
     in_cooldown = (now - last_switch) < th.cooldown
 
-    def make(action: str, reason: str, target_role: Optional[str] = None, event: Optional[str] = None) -> Decision:
-        label = str(nodes[target_role]["configured_label"]) if target_role else None
+    def make(
+        action: str,
+        reason: str,
+        target_role: Optional[str] = None,
+        target_index: Optional[int] = None,
+        event: Optional[str] = None,
+    ) -> Decision:
+        # target_label is ALWAYS the raw configured slot/primary string (the
+        # normalized node record carries the this-cycle spelling; see
+        # _copy_node_history) — the shell's exact-text cross-check depends on it.
+        if target_role == "primary":
+            label: Optional[str] = str(nodes["primary"]["configured_label"])
+        elif target_role == "fallback" and target_index is not None:
+            label = str(nodes["fallbacks"][target_index]["configured_label"])
+        else:
+            label = None
         return Decision(
             action=action,
             reason=reason,
             active_role=active_role,
             primary_state=p_state,
-            fallback_state=f_state,
+            fallback_state=f_states[0],
             target_role=target_role,
             target_label=label,
             event=event,
+            target_index=target_index,
+            fallback_states=list(f_states),
         )
+
+    def walk(exclude: Optional[int] = None) -> Optional[int]:
+        # First candidate in configuration order whose ping passed THIS round
+        # (probe.reachable — exactly v1.3.0's bar: the target's last_state is
+        # NOT consulted, so a mid-hysteresis UNKNOWN or even DOWN-state node
+        # with a passing ping is selectable). Declared priority bends only
+        # toward safety: an unverified earlier candidate is walked past.
+        for j in range(n):
+            if j == exclude or j in unresolved_slots:
+                continue
+            if fallback_probes[j].reachable:
+                return j
+        return None
 
     if active_role == "primary":
         if p_state != STATE_DOWN:
             return make("none", "healthy")
-        if not fallback_probe.reachable:
-            return make("none", "both_down" if f_state == STATE_DOWN else "fallback_unverified")
-        if in_cooldown:
-            return make("none", "cooldown")
-        return make("switch-to-fallback", "primary_down", target_role="fallback")
+        j = walk()
+        if j is not None:
+            if in_cooldown:
+                return make("none", "cooldown")
+            return make("switch-to-fallback", "primary_down", target_role="fallback", target_index=j)
+        if n == 1:
+            return make("none", "both_down" if f_states[0] == STATE_DOWN else "fallback_unverified")
+        if all(s == STATE_DOWN for s in f_states):
+            return make("none", "all_fallbacks_down")
+        return make("none", "no_fallback_verified")
 
     if active_role == "fallback":
+        i = active_index if active_index is not None else 0
         if primary_probe.reachable and p_state == STATE_UP:
-            if not th.restore_primary:
+            if th.restore_primary:
+                # Restore outranks a fallback-to-fallback move by construction:
+                # this return means the walk below is not evaluated this cycle.
+                if in_cooldown:
+                    return make("none", "cooldown", event="primary_recovered")
+                return make("switch-to-primary", "primary_recovered", target_role="primary", event="primary_recovered")
+            if n == 1 or f_states[i] != STATE_DOWN:
+                # v1.3.0 ordering verbatim for the single-element pin: with
+                # restore disabled, a healthy primary reports before the
+                # fallback state is consulted. Multi with the ACTIVE slot DOWN
+                # falls through: restore is disabled, surviving is not.
                 return make("none", "restore_primary_disabled", event="primary_recovered")
-            if in_cooldown:
-                return make("none", "cooldown", event="primary_recovered")
-            return make("switch-to-primary", "primary_recovered", target_role="primary", event="primary_recovered")
-        if f_state == STATE_DOWN:
-            return make("none", "both_down" if p_state == STATE_DOWN else "fallback_down")
+        if f_states[i] == STATE_DOWN:
+            if n == 1:
+                return make("none", "both_down" if p_state == STATE_DOWN else "fallback_down")
+            j = walk(exclude=i)
+            if j is not None:
+                if in_cooldown:
+                    return make("none", "cooldown")
+                return make(
+                    "switch-to-fallback", "fallback_down_next_fallback", target_role="fallback", target_index=j
+                )
+            if p_state == STATE_DOWN and all(s == STATE_DOWN for s in f_states):
+                return make("none", "all_down")
+            return make("none", "no_fallback_verified")
         return make("none", "staying_on_fallback")
 
     if active_role == "none":
         # No exit node selected. By default do not impose one (observe-first /
         # least surprise); with ensure_primary, select the primary once it is
-        # reachable this round.
+        # reachable this round. ensure-primary NEVER selects a fallback.
         if th.ensure_primary and primary_probe.reachable:
             if in_cooldown:
                 return make("none", "cooldown")
             return make("switch-to-primary", "ensure_primary", target_role="primary")
         return make("none", "no_active_exit_node")
+
+    if active_role == "delisted":
+        # The live exit node is ours by the state's own record but no longer
+        # configured. Restore demands the SAME strict bar as primary_recovered
+        # (reachable this round AND state UP — never the walk's weaker bar);
+        # otherwise walk the configured bench from the top. Cooldown blocks
+        # every switch; --ensure-primary is NOT involved (none-only contract).
+        if th.restore_primary and primary_probe.reachable and p_state == STATE_UP:
+            if in_cooldown:
+                return make("none", "cooldown")
+            return make("switch-to-primary", "delisted_restore_primary", target_role="primary")
+        j = walk()
+        if j is not None:
+            if in_cooldown:
+                return make("none", "cooldown")
+            return make("switch-to-fallback", "delisted_next_fallback", target_role="fallback", target_index=j)
+        return make("none", "delisted_no_target")
 
     # A different exit node is selected; never override the user's choice.
     return make("none", "unknown_active")
@@ -706,7 +910,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         http_timeout=args.http_timeout,
     )
     if args.json:
-        print(json.dumps({"schema_version": STATE_SCHEMA_VERSION, "probe": result.to_dict()}, sort_keys=True))
+        print(json.dumps({"schema_version": REPORT_SCHEMA_VERSION, "probe": result.to_dict()}, sort_keys=True))
     else:
         print(f"node={result.label} reachable={int(result.reachable)} rtt_ms={result.rtt_ms}")
         if args.egress:
@@ -716,72 +920,104 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0 if result.reachable else 1
 
 
-def _candidates_distinct(p_id: Optional[str], p_ips: list[str], f_id: Optional[str], f_ips: list[str]) -> bool:
-    if p_id and f_id and p_id == f_id:
-        return False
-    return not (set(p_ips) & set(f_ips))
+def _all_pairs_distinct(identities: list[tuple[Optional[str], list[str]]]) -> bool:
+    """Every unordered pair of resolved candidates must be a distinct physical
+    node: same node ID, or any Tailscale-IP intersection, means two configured
+    labels alias one node (a "switch" between them would be a lie). Unresolved
+    ``(None, [])`` entries trivially pass — resolution posture handles them."""
+    for i, (id_a, ips_a) in enumerate(identities):
+        for id_b, ips_b in identities[i + 1:]:
+            if id_a and id_b and id_a == id_b:
+                return False
+            if set(ips_a) & set(ips_b):
+                return False
+    return True
 
 
 def _live_state_problem(
-    status: dict[str, Any], available: bool, primary_label: str, fallback_label: str
-) -> tuple[Optional[str], Optional[str], list[str], Optional[str], list[str]]:
-    """Return ``(problem, primary_id, primary_ips, fallback_id, fallback_ips)``.
+    status: dict[str, Any], available: bool, primary_label: str, fallback_labels: list[str]
+) -> tuple[Optional[str], tuple[Optional[str], list[str]], list[tuple[Optional[str], list[str]]]]:
+    """Return ``(problem, primary_identity, fallback_identities)``.
 
     ``problem`` is non-None when the live state cannot support a failover
-    decision: status unreadable (``live_status_unavailable``); readable but with
-    no usable Self or unresolvable candidates (``live_status_incomplete``); or
-    both candidates resolving to the same node (``candidates_not_distinct``).
-    Callers MUST fail closed in these cases -- including under --ensure-primary."""
+    decision: status unreadable (``live_status_unavailable``); backend not
+    Running; readable but with no usable Self, an unresolvable PRIMARY, or —
+    with exactly ONE configured fallback — an unresolvable fallback
+    (``live_status_incomplete``, the v1.3.0 posture verbatim); or any two
+    candidates resolving to the same node (``candidates_not_distinct``).
+    With MORE THAN ONE fallback, an unresolved non-active bench candidate is
+    NOT a problem here — it is excluded from the walk per-slot (the active
+    node's own resolution is judged by derive_active). Callers MUST fail
+    closed on a problem -- including under --ensure-primary."""
+    empty: list[tuple[Optional[str], list[str]]] = [(None, []) for _ in fallback_labels]
     if not available:
-        return "live_status_unavailable", None, [], None, []
+        return "live_status_unavailable", (None, []), empty
     # `tailscale status --json` returns 0 and valid JSON even when the backend is
     # Stopped / NeedsLogin / Starting, so the exit code is not enough: require an
     # explicit Running backend. ipnstate.Status.BackendState is always a string in
     # a well-formed status, so a missing / null / non-string value is malformed --
     # fail closed rather than assume the backend is up.
     if status.get("BackendState") != "Running":
-        return "backend_not_running", None, [], None, []
+        return "backend_not_running", (None, []), empty
     self_node = status.get("Self")
     if not isinstance(self_node, dict) or not self_node:
-        return "live_status_incomplete", None, [], None, []
-    p_id, p_ips = resolve_identity(status, primary_label)
-    f_id, f_ips = resolve_identity(status, fallback_label)
-    if (not p_id and not p_ips) or (not f_id and not f_ips):
-        return "live_status_incomplete", p_id, p_ips, f_id, f_ips
-    if not _candidates_distinct(p_id, p_ips, f_id, f_ips):
-        return "candidates_not_distinct", p_id, p_ips, f_id, f_ips
-    return None, p_id, p_ips, f_id, f_ips
+        return "live_status_incomplete", (None, []), empty
+    primary_identity = resolve_identity(status, primary_label)
+    fallback_identities = [resolve_identity(status, label) for label in fallback_labels]
+    if not primary_identity[0] and not primary_identity[1]:
+        return "live_status_incomplete", primary_identity, fallback_identities
+    if len(fallback_labels) == 1 and not fallback_identities[0][0] and not fallback_identities[0][1]:
+        return "live_status_incomplete", primary_identity, fallback_identities
+    if not _all_pairs_distinct([primary_identity, *fallback_identities]):
+        return "candidates_not_distinct", primary_identity, fallback_identities
+    return None, primary_identity, fallback_identities
 
 
 def _set_active_identity(
     state: dict[str, Any],
     active_role: str,
-    primary_id: Optional[str],
-    primary_ips: list[str],
-    fallback_id: Optional[str],
-    fallback_ips: list[str],
+    active_index: Optional[int],
+    primary_identity: tuple[Optional[str], list[str]],
+    fallback_identities: list[tuple[Optional[str], list[str]]],
     primary_label: str,
-    fallback_label: str,
+    fallback_labels: list[str],
 ) -> None:
     """Keep active.* canonical identity fresh on every reconcile (not only on a
-    controller switch), so the persisted state never shows stale identity."""
+    controller switch), so the persisted state never shows stale identity.
+
+    SOLE EXCEPTION (persistence transition matrix in the design): a runtime
+    ``delisted`` cycle writes NOTHING here — the normalize-produced record
+    (retained role + retained now-unconfigured label + null index + retained
+    identity) is preserved unchanged; that stored combination IS the durable
+    delisted encoding the next cycle re-derives from. ``delisted`` itself is
+    never written as a role value."""
+    if active_role == "delisted":
+        return
     active = state["active"]
     active["role"] = active_role
     if active_role == "primary":
         active["configured_label"] = primary_label
-        active["node_id"] = primary_id
-        active["tailscale_ips"] = primary_ips
-    elif active_role == "fallback":
-        active["configured_label"] = fallback_label
-        active["node_id"] = fallback_id
-        active["tailscale_ips"] = fallback_ips
+        active["node_id"] = primary_identity[0]
+        active["tailscale_ips"] = list(primary_identity[1])
+        active["fallback_index"] = None
+    elif active_role == "fallback" and active_index is not None:
+        active["configured_label"] = fallback_labels[active_index]
+        active["node_id"] = fallback_identities[active_index][0]
+        active["tailscale_ips"] = list(fallback_identities[active_index][1])
+        active["fallback_index"] = active_index
     else:
         active["configured_label"] = None
         active["node_id"] = None
         active["tailscale_ips"] = []
+        active["fallback_index"] = None
 
 
 def cmd_verdict(args: argparse.Namespace) -> int:
+    fallback_labels = parse_fallback_list(args.fallback)
+    config_error = validate_candidate_labels(args.primary, fallback_labels)
+    if config_error is not None:
+        eprint(f"error: invalid FALLBACK_EXIT_NODE configuration: {config_error}")
+        return 2
     state_path = Path(args.state_file)
     th = Thresholds(
         fail_threshold=args.fail_threshold,
@@ -791,11 +1027,21 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         ensure_primary=bool(args.ensure_primary),
     )
     with state_lock(state_path):
-        state = load_state(state_path, args.primary, args.fallback)
+        state = load_state(state_path, args.primary, fallback_labels)
         status, available = get_status(args.status_json_file)
-        problem, primary_id, primary_ips, fallback_id, fallback_ips = _live_state_problem(
-            status, available, args.primary, args.fallback
+        problem, primary_identity, fallback_identities = _live_state_problem(
+            status, available, args.primary, fallback_labels
         )
+        active_role: str = "unknown"
+        active_index: Optional[int] = None
+        if problem is None:
+            role, index, derive_problem = derive_active(
+                status, primary_identity, fallback_identities, args.primary, fallback_labels, state["active"]
+            )
+            if derive_problem is not None:
+                problem = derive_problem  # unresolved ACTIVE node: same fail-closed arm
+            else:
+                active_role, active_index = role, index
 
         if problem is not None:
             # Fail closed: do not infer the active node from the (possibly stale)
@@ -805,16 +1051,18 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                 reason=problem,
                 active_role="unknown",
                 primary_state=str(state["nodes"]["primary"]["last_state"]),
-                fallback_state=str(state["nodes"]["fallback"]["last_state"]),
+                fallback_state=str(state["nodes"]["fallbacks"][0]["last_state"]),
+                fallback_states=[str(slot["last_state"]) for slot in state["nodes"]["fallbacks"]],
             )
             primary_probe = ProbeResult(label=args.primary, reachable=False, error=problem)
-            fallback_probe = ProbeResult(label=args.fallback, reachable=False, error=problem)
+            fallback_probes = [
+                ProbeResult(label=label, reachable=False, error=problem) for label in fallback_labels
+            ]
         else:
-            for role, resolved_id, resolved_ips in (
-                ("primary", primary_id, primary_ips),
-                ("fallback", fallback_id, fallback_ips),
+            for node, (resolved_id, resolved_ips) in zip(
+                [state["nodes"]["primary"], *state["nodes"]["fallbacks"]],
+                [primary_identity, *fallback_identities],
             ):
-                node = state["nodes"][role]
                 stored_id = node.get("node_id")
                 # Canonicalize the persisted set (an older build stored it as raw text)
                 # the same way resolved IPs are canonicalized, so an expanded-vs-compressed
@@ -838,14 +1086,20 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                 node["node_id"] = resolved_id
                 node["tailscale_ips"] = resolved_ips
 
-            active_role = live_active_role(status, primary_id, primary_ips, fallback_id, fallback_ips)
             prev_role = state["active"].get("role")
-            if prev_role != active_role:
+            if active_role != "delisted" and prev_role != active_role:
                 eprint(f"warning: live active exit-node role '{active_role}' overrides stale state '{prev_role}'")
             _set_active_identity(
-                state, active_role, primary_id, primary_ips, fallback_id, fallback_ips, args.primary, args.fallback
+                state, active_role, active_index, primary_identity, fallback_identities, args.primary, fallback_labels
             )
 
+            # Every configured node is probed every cycle — resolved or not —
+            # with one REAL ping each; resolution feeds selectability, not the
+            # probe. --egress stays active-node-only (a delisted active node is
+            # not a configured candidate, so no candidate gets egress then).
+            unresolved_slots = frozenset(
+                i for i, identity in enumerate(fallback_identities) if not identity[0] and not identity[1]
+            )
             primary_probe = probe_node(
                 args.primary,
                 ping_timeout=args.ping_timeout,
@@ -853,23 +1107,32 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                 egress_url=args.egress_url,
                 http_timeout=args.http_timeout,
             )
-            fallback_probe = probe_node(
-                args.fallback,
-                ping_timeout=args.ping_timeout,
-                egress=args.egress and active_role == "fallback",
-                egress_url=args.egress_url,
-                http_timeout=args.http_timeout,
-            )
+            fallback_probes = []
+            for i, label in enumerate(fallback_labels):
+                fallback_probes.append(
+                    probe_node(
+                        label,
+                        ping_timeout=args.ping_timeout,
+                        egress=args.egress and active_role == "fallback" and active_index == i,
+                        egress_url=args.egress_url,
+                        http_timeout=args.http_timeout,
+                    )
+                )
 
-            decision = evaluate(state, active_role, primary_probe, fallback_probe, th, now_epoch())
+            decision = evaluate(
+                state, active_role, active_index, primary_probe, fallback_probes, th, now_epoch(), unresolved_slots
+            )
             save_state(state_path, state)
 
     if args.json:
         payload = {
-            "schema_version": STATE_SCHEMA_VERSION,
+            "schema_version": REPORT_SCHEMA_VERSION,
             "decision": decision.to_dict(),
             "primary": primary_probe.to_dict(),
-            "fallback": fallback_probe.to_dict(),
+            # Legacy key pinned to fallbacks[0] for consumer continuity; the
+            # additive `fallbacks` array carries every bench probe in order.
+            "fallback": fallback_probes[0].to_dict(),
+            "fallbacks": [probe.to_dict() for probe in fallback_probes],
         }
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -878,43 +1141,118 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
 
 def cmd_record_switch(args: argparse.Namespace) -> int:
+    fallback_labels = parse_fallback_list(args.fallback)
+    config_error = validate_candidate_labels(args.primary, fallback_labels)
+    if config_error is not None:
+        eprint(f"error: invalid FALLBACK_EXIT_NODE configuration: {config_error}")
+        return 2
+    role = args.role
+    index: Optional[int] = args.fallback_index
+    label: Optional[str] = args.label
+    # Fail-closed pairing validation BEFORE any state I/O: a refusal writes
+    # nothing. The index/label pair exists so the shell's view of the bench
+    # can never silently diverge from the engine's (the design's round-3 gap).
+    if role != "fallback":
+        if index is not None or label is not None:
+            eprint("error: --fallback-index/--label are only valid with --role fallback")
+            return 2
+    else:
+        n = len(fallback_labels)
+        if index is None:
+            if n > 1:
+                eprint("error: --fallback-index is required for a fallback record when more than one fallback is configured")
+                return 2
+            index = 0
+        if not 0 <= index < n:
+            eprint(f"error: --fallback-index {index} is out of range for {n} configured fallback(s)")
+            return 2
+        if label is None:
+            if n > 1:
+                eprint("error: --label is required (alongside --fallback-index) for a fallback record when more than one fallback is configured")
+                return 2
+        elif not _labels_equivalent(fallback_labels[index], label):
+            eprint(
+                f"error: --label '{label}' does not match configured fallback slot {index} "
+                f"('{fallback_labels[index]}'); nothing recorded"
+            )
+            return 2
     state_path = Path(args.state_file)
     with state_lock(state_path):
-        state = load_state(state_path, args.primary, args.fallback)
-        role = args.role
+        state = load_state(state_path, args.primary, fallback_labels)
         active = state["active"]
         active["role"] = role
         active["last_switch_epoch"] = now_epoch()
         active["last_switch_at"] = iso_now()
-        if role in ("primary", "fallback"):
-            node = state["nodes"][role]
+        if role == "primary":
+            node = state["nodes"]["primary"]
             active["configured_label"] = node.get("configured_label")
             active["node_id"] = node.get("node_id")
             active["tailscale_ips"] = node.get("tailscale_ips")
+            active["fallback_index"] = None
+        elif role == "fallback":
+            node = state["nodes"]["fallbacks"][index]
+            active["configured_label"] = node.get("configured_label")
+            active["node_id"] = node.get("node_id")
+            active["tailscale_ips"] = node.get("tailscale_ips")
+            active["fallback_index"] = index
         else:
             active["configured_label"] = None
             active["node_id"] = None
             active["tailscale_ips"] = []
+            active["fallback_index"] = None
         save_state(state_path, state)
     print(f"recorded active role={role}")
     return 0
 
 
 def cmd_active_role(args: argparse.Namespace) -> int:
-    """Print the live active exit-node role. Used by the controller for the
-    post-switch readback (and handy for diagnostics)."""
+    """Print the live active exit-node role (role-printing mode, unchanged), or
+    with ``--expect-label`` verify the live exit node IS that concrete node.
+
+    ``--expect-label`` is the controller's identity-verified readback: exit 0
+    ONLY when the status is readable, the backend is Running, and the live
+    ExitNodeStatus identity matches the label's resolved identity (canonical-
+    IP-aware, ID-then-IP-set rule). Everything else — no exit node selected, a
+    different node, an unresolved or ambiguous label, a malformed status —
+    fails (exit 1), so a switch that did not take can never read back as
+    success against the ROLE CLASS alone."""
+    fallback_labels = parse_fallback_list(args.fallback)
+    config_error = validate_candidate_labels(args.primary, fallback_labels)
+    if config_error is not None:
+        eprint(f"error: invalid FALLBACK_EXIT_NODE configuration: {config_error}")
+        return 2
     status, available = get_status(args.status_json_file)
-    # Fail closed for the controller's post-switch readback: an unreadable status,
-    # or a backend that is not Running, must not be reported as a concrete active
-    # role. The JSON can still carry stale ExitNodeStatus after the backend stops,
-    # which would otherwise let the controller record a "successful" switch and
-    # start its cooldown against a node whose egress is actually down.
+    expect_label: Optional[str] = getattr(args, "expect_label", None)
+    if expect_label is not None:
+        if not available or status.get("BackendState") != "Running":
+            print("match=0")
+            return 1
+        expected_id, expected_ips = resolve_identity(status, expect_label)
+        exit_status = status.get("ExitNodeStatus")
+        if (expected_id is None and not expected_ips) or not isinstance(exit_status, dict) or not exit_status:
+            print("match=0")
+            return 1
+        exit_id = exit_status.get("ID")
+        exit_id = str(exit_id) if exit_id else None
+        exit_ips = _valid_ip_set(exit_status.get("TailscaleIPs")) or set()
+        if exit_id is None and not exit_ips:
+            print("match=0")
+            return 1
+        matched = bool(expected_id and exit_id and expected_id == exit_id) or bool(set(expected_ips) & exit_ips)
+        print(f"match={int(matched)}")
+        return 0 if matched else 1
+    # Fail closed for diagnostics too: an unreadable status, or a backend that
+    # is not Running, must not be reported as a concrete active role. The JSON
+    # can still carry stale ExitNodeStatus after the backend stops.
     if not available or status.get("BackendState") != "Running":
         print("unknown")
         return 0
-    primary_id, primary_ips = resolve_identity(status, args.primary)
-    fallback_id, fallback_ips = resolve_identity(status, args.fallback)
-    print(live_active_role(status, primary_id, primary_ips, fallback_id, fallback_ips))
+    primary_identity = resolve_identity(status, args.primary)
+    fallback_identities = [resolve_identity(status, label) for label in fallback_labels]
+    role, _index, _problem = derive_active(
+        status, primary_identity, fallback_identities, args.primary, fallback_labels, active_record=None
+    )
+    print(role)
     return 0
 
 
@@ -1188,6 +1526,25 @@ def _safe_peer_metrics(
     except Exception as exc:
         eprint(f"warning: peer metrics unavailable for '{label}': {exc}")
         return _null_metrics()
+
+
+def connectors_fallback_default() -> str:
+    """Default for the DIRECT `connectors` invocation's --fallback.
+
+    `monitor-connectors.sh` requires FALLBACK_CONNECTOR itself and always
+    passes --fallback, so it never reaches this. Here, when FALLBACK_CONNECTOR
+    is unset AND FALLBACK_EXIT_NODE holds a comma LIST, the nested default
+    resolves to UNSET — silently adopting one element would misreport what the
+    operator monitors. Multi-fallback exit-node setups that also want
+    connector monitoring set FALLBACK_CONNECTOR explicitly. A set-but-empty
+    FALLBACK_CONNECTOR stays empty (unset-vs-empty distinguished, as today)."""
+    configured = os.environ.get("FALLBACK_CONNECTOR")
+    if configured is not None:
+        return configured
+    exit_fallback = os.environ.get("FALLBACK_EXIT_NODE", "")
+    if "," in exit_fallback:
+        return ""
+    return exit_fallback
 
 
 def fetch_devices_via_api() -> Optional[list[Any]]:  # pragma: no cover - network path
@@ -1488,7 +1845,7 @@ def cmd_connectors(args: argparse.Namespace) -> int:
         return 0 if overall_healthy else 1
     if args.json:
         print(json.dumps({
-            "schema_version": STATE_SCHEMA_VERSION,
+            "schema_version": REPORT_SCHEMA_VERSION,
             "connectors": rows,
             "ordering": order,
             "ordering_reason": order_reason,
@@ -1644,17 +2001,36 @@ def build_parser() -> argparse.ArgumentParser:
     record = sub.add_parser("record-switch", help="Record a verified exit-node switch (sets active role + cooldown clock).")
     _add_pair_args(record)
     record.add_argument("--role", required=True, choices=("primary", "fallback", "none"))
+    record.add_argument(
+        "--fallback-index",
+        type=int,
+        default=None,
+        help="Bench ordinal of the fallback switched to (required with --label for fallback records "
+        "when more than one fallback is configured; defaults to 0 for a single-element list).",
+    )
+    record.add_argument(
+        "--label",
+        default=None,
+        help="The concrete node label the controller switched to and readback-verified; must match "
+        "the configured fallback slot at --fallback-index or nothing is recorded.",
+    )
     record.set_defaults(func=cmd_record_switch)
 
     active = sub.add_parser("active-role", help="Print the live active exit-node role (primary/fallback/none/unknown).")
     active.add_argument("--primary", default=os.environ.get("PRIMARY_EXIT_NODE", ""))
     active.add_argument("--fallback", default=os.environ.get("FALLBACK_EXIT_NODE", ""))
     active.add_argument("--status-json-file")
+    active.add_argument(
+        "--expect-label",
+        default=None,
+        help="Exit 0 only when the live exit node IS this concrete node (identity-verified readback; "
+        "prints match=1/match=0 instead of the role).",
+    )
     active.set_defaults(func=cmd_active_role)
 
     connectors = sub.add_parser("connectors", help="Report health/ordering of the primary+fallback App Connector pair (read-only).")
     connectors.add_argument("--primary", default=os.environ.get("PRIMARY_CONNECTOR", os.environ.get("PRIMARY_EXIT_NODE", "")))
-    connectors.add_argument("--fallback", default=os.environ.get("FALLBACK_CONNECTOR", os.environ.get("FALLBACK_EXIT_NODE", "")))
+    connectors.add_argument("--fallback", default=connectors_fallback_default())
     connectors.add_argument("--status-json-file")
     connectors.add_argument("--devices-json-file")
     connectors.add_argument("--ping-timeout", type=_pos_float, default=os.environ.get("PING_TIMEOUT", str(DEFAULT_PING_TIMEOUT)))

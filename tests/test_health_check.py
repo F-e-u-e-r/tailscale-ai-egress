@@ -81,6 +81,22 @@ def probe(label, reachable):
     return hc.ProbeResult(label=label, reachable=reachable)
 
 
+def ev1(state, active_role, primary_probe, fallback_probe, th, now):
+    """Single-element evaluate shim: the v1.3.0-shaped call sites drive the
+    generalized evaluator with a one-slot bench (active fallback ⇒ index 0)."""
+    index = 0 if active_role == "fallback" else None
+    return hc.evaluate(state, active_role, index, primary_probe, [fallback_probe], th, now)
+
+
+def live_role(status, p_id, p_ips, f_id, f_ips):
+    """Single-pair derive_active shim returning just the role (the v1.3.0
+    live_active_role surface these tests were written against)."""
+    role, _index, _problem = hc.derive_active(
+        status, (p_id, p_ips), [(f_id, f_ips)], "primary-vps", ["fallback-vps"], active_record=None
+    )
+    return role
+
+
 def run_cli(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -95,21 +111,21 @@ class EvaluatorTests(unittest.TestCase):
         self.th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=True)
 
     def _state(self, primary_state, fallback_state, last_switch=0.0):
-        state = hc.default_state("primary-vps", "fallback-vps")
+        state = hc.default_state("primary-vps", ["fallback-vps"])
         state["nodes"]["primary"]["last_state"] = primary_state
-        state["nodes"]["fallback"]["last_state"] = fallback_state
+        state["nodes"]["fallbacks"][0]["last_state"] = fallback_state
         state["active"]["last_switch_epoch"] = last_switch
         return state
 
     def test_primary_healthy_no_action(self):
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "primary", probe("p", True), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", True), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "healthy")
 
     def test_primary_down_switches_to_verified_fallback(self):
         state = self._state(hc.STATE_DOWN, hc.STATE_UP)
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "switch-to-fallback")
         self.assertEqual(d.target_role, "fallback")
         self.assertEqual(d.target_label, "fallback-vps")
@@ -117,58 +133,58 @@ class EvaluatorTests(unittest.TestCase):
     def test_primary_down_but_fallback_unverified_does_not_switch(self):
         # Fallback state is still UP, but it failed its ping THIS round.
         state = self._state(hc.STATE_DOWN, hc.STATE_UP)
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", False), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", False), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "fallback_unverified")
 
     def test_both_down(self):
         state = self._state(hc.STATE_DOWN, hc.STATE_DOWN)
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", False), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", False), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "both_down")
 
     def test_cooldown_blocks_switch(self):
         state = self._state(hc.STATE_DOWN, hc.STATE_UP, last_switch=10_000.0)
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "cooldown")
 
     def test_restore_primary_enabled_switches_back(self):
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "fallback", probe("p", True), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "fallback", probe("p", True), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "switch-to-primary")
         self.assertEqual(d.event, "primary_recovered")
 
     def test_restore_primary_disabled_never_switches_back(self):
         th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "fallback", probe("p", True), probe("f", True), th, now=10_000.0)
+        d = ev1(state, "fallback", probe("p", True), probe("f", True), th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "restore_primary_disabled")
         self.assertEqual(d.event, "primary_recovered")
 
     def test_staying_on_fallback_while_primary_down(self):
         state = self._state(hc.STATE_DOWN, hc.STATE_UP)
-        d = hc.evaluate(state, "fallback", probe("p", False), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "fallback", probe("p", False), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "staying_on_fallback")
 
     def test_active_none_does_not_impose_exit_node(self):
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "none", probe("p", True), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "none", probe("p", True), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "no_active_exit_node")
 
     def test_active_unknown_does_not_override_user_choice(self):
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "unknown", probe("p", True), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "unknown", probe("p", True), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "unknown_active")
 
     def test_hysteresis_requires_threshold_failures(self):
         # One failure must NOT trip a DOWN/switch with fail_threshold=3.
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "healthy")
         self.assertEqual(state["nodes"]["primary"]["fail_count"], 1)
@@ -176,14 +192,14 @@ class EvaluatorTests(unittest.TestCase):
     def test_hysteresis_flips_exactly_at_threshold(self):
         state = self._state(hc.STATE_UP, hc.STATE_UP)
         state["nodes"]["primary"]["fail_count"] = 2  # one more failure reaches threshold 3
-        d = hc.evaluate(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
+        d = ev1(state, "primary", probe("p", False), probe("f", True), self.th, now=10_000.0)
         self.assertEqual(state["nodes"]["primary"]["last_state"], hc.STATE_DOWN)
         self.assertEqual(d.action, "switch-to-fallback")
 
     def test_ensure_primary_selects_primary_when_none(self):
         th = hc.Thresholds(fail_threshold=1, ok_threshold=1, cooldown=0.0, ensure_primary=True)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "none", probe("p", True), probe("f", True), th, now=10_000.0)
+        d = ev1(state, "none", probe("p", True), probe("f", True), th, now=10_000.0)
         self.assertEqual(d.action, "switch-to-primary")
         self.assertEqual(d.reason, "ensure_primary")
 
@@ -194,23 +210,259 @@ class EvaluatorTests(unittest.TestCase):
         # "none" does. Together they close the malformed-status fail-open (Blocker 1a).
         th = hc.Thresholds(fail_threshold=1, ok_threshold=1, cooldown=0.0, ensure_primary=True)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "unknown", probe("p", True), probe("f", True), th, now=10_000.0)
+        d = ev1(state, "unknown", probe("p", True), probe("f", True), th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "unknown_active")
 
     def test_none_without_ensure_primary_does_nothing(self):
         th = hc.Thresholds(ensure_primary=False)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "none", probe("p", True), probe("f", True), th, now=10_000.0)
+        d = ev1(state, "none", probe("p", True), probe("f", True), th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "no_active_exit_node")
 
     def test_ensure_primary_skips_when_primary_unreachable(self):
         th = hc.Thresholds(ensure_primary=True)
         state = self._state(hc.STATE_UP, hc.STATE_UP)
-        d = hc.evaluate(state, "none", probe("p", False), probe("f", True), th, now=10_000.0)
+        d = ev1(state, "none", probe("p", False), probe("f", True), th, now=10_000.0)
         self.assertEqual(d.action, "none")
         self.assertEqual(d.reason, "no_active_exit_node")
+
+
+class MultiFallbackEvaluatorTests(unittest.TestCase):
+    """Pure decision-matrix coverage for the ORDERED multi-fallback bench
+    (docs/design/multi-fallback.md). Slot labels are fb0/fb1/fb2; every walk
+    must honor configuration order (order IS priority, no round-robin)."""
+
+    LABELS = ["fb0", "fb1", "fb2"]
+
+    def setUp(self):
+        self.th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=True)
+
+    def _state(self, primary_state, fallback_states, last_switch=0.0):
+        state = hc.default_state("primary-vps", list(self.LABELS))
+        state["nodes"]["primary"]["last_state"] = primary_state
+        for slot, value in zip(state["nodes"]["fallbacks"], fallback_states):
+            slot["last_state"] = value
+        state["active"]["last_switch_epoch"] = last_switch
+        return state
+
+    def _eval(self, state, role, index, p_reach, f_reach, th=None, now=10_000.0, unresolved=frozenset()):
+        return hc.evaluate(
+            state, role, index, probe("p", p_reach),
+            [probe(label, reach) for label, reach in zip(self.LABELS, f_reach)],
+            th or self.th, now, unresolved,
+        )
+
+    def test_e1_walk_order_first_reachable_wins(self):
+        # slot0 unreachable, slot1+slot2 reachable -> the walk picks slot1, never slot2.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP] * 3)
+        d = self._eval(state, "primary", None, False, [False, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "primary_down"))
+        self.assertEqual(d.target_index, 1)
+        self.assertEqual(d.target_label, "fb1")
+
+    def test_e2_walk_continues_past_unverified(self):
+        # Declared priority bends only toward safety: unreachable fb0 is walked past.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP, hc.STATE_UNKNOWN, hc.STATE_UP])
+        d = self._eval(state, "primary", None, False, [False, True, False])
+        self.assertEqual(d.target_index, 1)
+
+    def test_e3_all_fallbacks_down_only_when_every_slot_down(self):
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN] * 3)
+        for slot in state["nodes"]["fallbacks"]:
+            slot["fail_count"] = 3
+        d = self._eval(state, "primary", None, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "all_fallbacks_down"))
+        # E3 twin: ONE slot still UNKNOWN blocks the all-down classification.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UNKNOWN, hc.STATE_DOWN])
+        d = self._eval(state, "primary", None, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "no_fallback_verified"))
+
+    def test_e4_no_fallback_verified_mixed_states(self):
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UNKNOWN, hc.STATE_UP, hc.STATE_UNKNOWN])
+        d = self._eval(state, "primary", None, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "no_fallback_verified"))
+
+    def test_e5_unknown_state_but_reachable_is_selectable(self):
+        # The walk bar is reachability-this-round; a mid-hysteresis UNKNOWN (or
+        # even DOWN-state) candidate with a passing ping is selectable — v1.3.0's
+        # exact bar, generalized.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UNKNOWN, hc.STATE_UP, hc.STATE_UP])
+        d = self._eval(state, "primary", None, False, [True, True, True])
+        self.assertEqual(d.target_index, 0)
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "primary", None, False, [True, False, False])
+        self.assertEqual(d.target_index, 0)  # DOWN-state + passing ping: selectable, as today
+
+    def test_e6_fallback_down_next_fallback(self):
+        # THE new capability: active fallback DOWN, primary not restorable ->
+        # first verified other slot wins.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "fallback", 0, False, [False, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "fallback_down_next_fallback"))
+        self.assertEqual(d.target_index, 1)
+        self.assertEqual(d.target_label, "fb1")
+
+    def test_e7_restore_outranks_walk_same_cycle(self):
+        # Primary restorable + active slot DOWN + a verified bench slot: the
+        # restore row fires and the walk is NOT evaluated that cycle.
+        state = self._state(hc.STATE_UP, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        d = self._eval(state, "fallback", 0, True, [False, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-primary", "primary_recovered"))
+        self.assertEqual(d.event, "primary_recovered")
+        self.assertIsNone(d.target_index)
+
+    def test_e8_restore_disabled_walk_still_runs(self):
+        # RESTORE_PRIMARY=0 with a healthy primary and the ACTIVE slot DOWN:
+        # restore is disabled, surviving is not — the walk runs.
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
+        state = self._state(hc.STATE_UP, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        d = self._eval(state, "fallback", 0, True, [False, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "fallback_down_next_fallback"))
+        self.assertEqual(d.target_index, 1)
+
+    def test_e9_restore_disabled_healthy_fallback_unchanged(self):
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
+        state = self._state(hc.STATE_UP, [hc.STATE_UP, hc.STATE_UP, hc.STATE_UP])
+        d = self._eval(state, "fallback", 0, True, [True, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("none", "restore_primary_disabled"))
+        self.assertEqual(d.event, "primary_recovered")
+
+    def test_e10_all_down_only_when_primary_and_every_slot_down(self):
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN] * 3)
+        d = self._eval(state, "fallback", 0, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "all_down"))
+
+    def test_e11_active_fallback_nothing_selectable_primary_up(self):
+        # Primary UP but restore disabled: reason classifies the bench, not the primary.
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
+        state = self._state(hc.STATE_UP, [hc.STATE_DOWN, hc.STATE_UNKNOWN, hc.STATE_UNKNOWN])
+        d = self._eval(state, "fallback", 0, True, [False, False, False], th=th)
+        self.assertEqual((d.action, d.reason), ("none", "no_fallback_verified"))
+
+    def test_e12_cooldown_blocks_every_switch_kind(self):
+        # walk from primary
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP] * 3, last_switch=9_990.0)
+        d = self._eval(state, "primary", None, False, [True, True, True])
+        self.assertEqual((d.action, d.reason), ("none", "cooldown"))
+        # f2f walk
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP], last_switch=9_990.0)
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "fallback", 0, False, [False, True, True])
+        self.assertEqual((d.action, d.reason), ("none", "cooldown"))
+        # restore
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3, last_switch=9_990.0)
+        d = self._eval(state, "fallback", 0, True, [True, True, True])
+        self.assertEqual((d.action, d.reason, d.event), ("none", "cooldown", "primary_recovered"))
+        # delisted restore + delisted walk
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3, last_switch=9_990.0)
+        d = self._eval(state, "delisted", None, True, [True, True, True])
+        self.assertEqual((d.action, d.reason), ("none", "cooldown"))
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3, last_switch=9_990.0)
+        d = self._eval(state, "delisted", None, True, [True, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("none", "cooldown"))
+
+    def test_e13_ensure_primary_never_selects_fallback(self):
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=0.0, ensure_primary=True)
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3)
+        d = self._eval(state, "none", None, False, [True, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("none", "no_active_exit_node"))
+
+    def test_e14_delisted_restore_demands_strict_bar(self):
+        # Restore needs reachable AND state UP (the primary_recovered bar).
+        # A reachable mid-hysteresis UNKNOWN primary walks instead.
+        state = self._state(hc.STATE_UNKNOWN, [hc.STATE_UP] * 3)
+        d = self._eval(state, "delisted", None, True, [True, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "delisted_next_fallback"))
+        self.assertEqual(d.target_index, 0)
+        # With the strict bar met, restore wins.
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3)
+        d = self._eval(state, "delisted", None, True, [True, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-primary", "delisted_restore_primary"))
+
+    def test_e15_delisted_walk_from_the_top(self):
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0, restore_primary=False)
+        state = self._state(hc.STATE_UP, [hc.STATE_UP] * 3)
+        d = self._eval(state, "delisted", None, True, [False, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "delisted_next_fallback"))
+        self.assertEqual(d.target_index, 1)
+
+    def test_e16_delisted_no_target(self):
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN] * 3)
+        d = self._eval(state, "delisted", None, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "delisted_no_target"))
+
+    def test_e18_walk_priority_pin_kills_round_robin(self):
+        # Active slot 1 DOWN; slots 0 AND 2 both reachable. A j>i-only walk and
+        # a round-robin-from-i+1 walk BOTH pick slot 2; configuration priority
+        # demands slot 0.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP, hc.STATE_DOWN, hc.STATE_UP])
+        state["nodes"]["fallbacks"][1]["fail_count"] = 3
+        d = self._eval(state, "fallback", 1, False, [True, False, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "fallback_down_next_fallback"))
+        self.assertEqual(d.target_index, 0)
+        self.assertEqual(d.target_label, "fb0")
+
+    def test_e19_delisted_ignores_ensure_primary(self):
+        # ensure-primary stays none-only: it neither selects a fallback nor
+        # suppresses the delisted reasons.
+        th = hc.Thresholds(fail_threshold=3, ok_threshold=3, cooldown=60.0,
+                           restore_primary=True, ensure_primary=True)
+        state = self._state(hc.STATE_UNKNOWN, [hc.STATE_UP] * 3)
+        d = self._eval(state, "delisted", None, True, [True, True, True], th=th)
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "delisted_next_fallback"))
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN] * 3)
+        d = self._eval(state, "delisted", None, False, [False, False, False], th=th)
+        self.assertEqual((d.action, d.reason), ("none", "delisted_no_target"))
+
+    def test_e20_one_unknown_slot_blocks_all_down(self):
+        # `all_down` fires ONLY when primary AND every bench slot are DOWN.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UNKNOWN, hc.STATE_DOWN])
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "fallback", 0, False, [False, False, False])
+        self.assertEqual((d.action, d.reason), ("none", "no_fallback_verified"))
+
+    def test_e21_unresolved_slot_excluded_despite_passing_ping(self):
+        # An unresolved candidate cannot be selected even when its ping passes:
+        # identity unverifiable => unswitchable. The next candidate wins.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP] * 3)
+        d = self._eval(state, "primary", None, False, [True, True, True], unresolved=frozenset({0}))
+        self.assertEqual(d.target_index, 1)
+        # ...in the f2f walk too.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "fallback", 0, False, [False, True, True], unresolved=frozenset({1}))
+        self.assertEqual(d.target_index, 2)
+
+    def test_e22_walk_excludes_the_active_slot_itself(self):
+        # Active slot 0 is DOWN-state but ping-reachable this round: the walk
+        # must not re-select it (a no-op switch readback would accept).
+        state = self._state(hc.STATE_DOWN, [hc.STATE_DOWN, hc.STATE_UP, hc.STATE_UP])
+        state["nodes"]["fallbacks"][0]["fail_count"] = 3
+        d = self._eval(state, "fallback", 0, False, [True, True, True])
+        self.assertEqual((d.action, d.reason), ("switch-to-fallback", "fallback_down_next_fallback"))
+        self.assertEqual(d.target_index, 1)
+
+    def test_decision_reports_fallback_states_and_scalar_slot0(self):
+        # The legacy scalar pins slot 0 even when the ACTIVE fallback is slot 1.
+        state = self._state(hc.STATE_DOWN, [hc.STATE_UP, hc.STATE_DOWN, hc.STATE_UNKNOWN])
+        state["nodes"]["fallbacks"][1]["fail_count"] = 3
+        d = self._eval(state, "fallback", 1, False, [True, False, True])
+        self.assertEqual(d.fallback_state, hc.STATE_UP)  # slot0, not the active slot's DOWN
+        self.assertEqual(d.fallback_states, [hc.STATE_UP, hc.STATE_DOWN, hc.STATE_UNKNOWN])
+        self.assertEqual(d.to_dict()["fallback_state"], d.to_dict()["fallback_states"][0])
+
+    def test_single_element_delisted_rows_still_fire(self):
+        # The config-edit carve-out applies to single-element lists too.
+        state = hc.default_state("primary-vps", ["only-fb"])
+        state["nodes"]["primary"]["last_state"] = hc.STATE_UP
+        d = hc.evaluate(state, "delisted", None, probe("p", True), [probe("only-fb", True)],
+                        self.th, 10_000.0)
+        self.assertEqual((d.action, d.reason), ("switch-to-primary", "delisted_restore_primary"))
 
 
 class HysteresisUnitTests(unittest.TestCase):
@@ -291,22 +543,22 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(ips, ["100.64.0.1"])
 
     def test_live_active_role_primary(self):
-        role = hc.live_active_role(SAMPLE_STATUS, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(SAMPLE_STATUS, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "primary")
 
     def test_live_active_role_none(self):
         status = dict(SAMPLE_STATUS, ExitNodeStatus=None)
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "none")
 
     def test_live_active_role_unknown(self):
         status = dict(SAMPLE_STATUS, ExitNodeStatus={"ID": "someoneelse", "TailscaleIPs": ["100.99.0.9/32"]})
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "unknown")
 
     def test_live_active_role_matches_by_ip_only(self):
         status = dict(SAMPLE_STATUS, ExitNodeStatus={"TailscaleIPs": ["100.64.0.2/32"]})
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "fallback")
 
     def test_live_active_role_survives_malformed_exit_ips(self):
@@ -319,7 +571,7 @@ class IdentityTests(unittest.TestCase):
         for bad in (7, "100.64.0.1", {"100.64.0.1": True}, ["100.64.0.1", 5]):
             with self.subTest(bad=bad):
                 status = dict(SAMPLE_STATUS, ExitNodeStatus={"ID": "nodeX", "TailscaleIPs": bad})
-                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
                 self.assertEqual(role, "unknown")
 
     def test_live_active_role_invalid_prefix_ip_no_false_match(self):
@@ -327,7 +579,7 @@ class IdentityTests(unittest.TestCase):
         # must be rejected wholesale, not `_norm_ip`-stripped into a false address
         # match on this gating path (GPT-5.6-sol Blocker 1b; pre-fix returned "primary").
         status = dict(SAMPLE_STATUS, ExitNodeStatus={"TailscaleIPs": ["100.64.0.1/not-a-prefix"]})
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "unknown")
 
     def test_live_active_role_malformed_status_is_unknown_not_none(self):
@@ -338,7 +590,7 @@ class IdentityTests(unittest.TestCase):
         for bad in (7, "exit", ["100.64.0.1"], {}):
             with self.subTest(bad=bad):
                 status = dict(SAMPLE_STATUS, ExitNodeStatus=bad)
-                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
                 self.assertEqual(role, "unknown")
 
     def test_live_active_role_no_false_match_from_malformed_candidate_ip(self):
@@ -350,14 +602,14 @@ class IdentityTests(unittest.TestCase):
                   "ExitNodeStatus": {"ID": "nodeX", "TailscaleIPs": ["100.64.0.1"]}}
         pid, pips = hc.resolve_identity(status, "primary-vps")
         self.assertEqual((pid, pips), ("nodeP", []))    # resolves by name; contributes NO ip identity
-        role = hc.live_active_role(status, pid, pips, "nodeF", ["100.64.0.2"])
+        role = live_role(status, pid, pips, "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "unknown")               # pre-fix: "primary" (100.64.0.1 stripped in)
 
     def test_live_active_role_rejects_dotted_netmask_ip(self):
         # GPT-5.6-sol Blocker B: ipaddress accepts addr/dotted-mask, which Tailscale
         # never emits; it must not forge an address match on this gating path.
         status = dict(SAMPLE_STATUS, ExitNodeStatus={"TailscaleIPs": ["100.64.0.1/255.255.255.255"]})
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
         self.assertEqual(role, "unknown")               # pre-fix: "primary"
 
     def test_live_active_role_rejects_noncanonical_host_prefix(self):
@@ -366,7 +618,7 @@ class IdentityTests(unittest.TestCase):
         for bad_ip in ("100.64.0.1/032", "100.64.0.1/24"):
             with self.subTest(bad_ip=bad_ip):
                 status = dict(SAMPLE_STATUS, ExitNodeStatus={"ID": "other", "TailscaleIPs": [bad_ip]})
-                role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
+                role = live_role(status, "nodeP", ["100.64.0.1"], "nodeF", ["100.64.0.2"])
                 self.assertEqual(role, "unknown")       # pre-fix: "primary"
 
     def test_live_active_role_matches_equivalent_ipv6_spelling(self):
@@ -374,7 +626,7 @@ class IdentityTests(unittest.TestCase):
         # still matches a peer configured with the compressed form (spelling-agnostic).
         status = dict(SAMPLE_STATUS,
                       ExitNodeStatus={"ID": "nodeQ", "TailscaleIPs": ["fd7a:115c:a1e0:0:0:0:0:9"]})
-        role = hc.live_active_role(status, "nodeP", ["100.64.0.1"], "nodeQ", ["fd7a:115c:a1e0::9"])
+        role = live_role(status, "nodeP", ["100.64.0.1"], "nodeQ", ["fd7a:115c:a1e0::9"])
         self.assertEqual(role, "fallback")             # canonical match despite differing spelling
 
 
@@ -391,27 +643,27 @@ class StateTests(unittest.TestCase):
     def test_corrupt_state_falls_back_to_default(self):
         path = self.tmp / "failover-state.json"
         path.write_text("{not json", encoding="utf-8")
-        state = hc.load_state(path, "p", "f")
+        state = hc.load_state(path, "p", ["f"])
         self.assertEqual(state["schema_version"], hc.STATE_SCHEMA_VERSION)
         self.assertEqual(state["nodes"]["primary"]["configured_label"], "p")
 
     def test_same_label_preserves_counters(self):
         path = self.tmp / "failover-state.json"
-        state = hc.default_state("p", "f")
+        state = hc.default_state("p", ["f"])
         state["nodes"]["primary"]["fail_count"] = 2
         state["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
         hc.save_state(path, state)
-        reloaded = hc.load_state(path, "p", "f")
+        reloaded = hc.load_state(path, "p", ["f"])
         self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 2)
         self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_DOWN)
 
     def test_changed_label_resets_state(self):
         path = self.tmp / "failover-state.json"
-        state = hc.default_state("old-primary", "f")
+        state = hc.default_state("old-primary", ["f"])
         state["nodes"]["primary"]["fail_count"] = 2
         state["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
         hc.save_state(path, state)
-        reloaded = hc.load_state(path, "new-primary", "f")
+        reloaded = hc.load_state(path, "new-primary", ["f"])
         self.assertEqual(reloaded["nodes"]["primary"]["configured_label"], "new-primary")
         self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 0)
         self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_UNKNOWN)
@@ -422,28 +674,28 @@ class StateTests(unittest.TestCase):
         # an older run vs the compressed form now) must NOT reset health history and suppress
         # a due failover. A native IPv4 vs its v6-mapped form remain distinct (still resets).
         path = self.tmp / "failover-state.json"
-        state = hc.default_state("FD7A:115C:A1E0:0:0:0:0:9", "f")
+        state = hc.default_state("FD7A:115C:A1E0:0:0:0:0:9", ["f"])
         state["nodes"]["primary"]["fail_count"] = 2
         state["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
         hc.save_state(path, state)
-        reloaded = hc.load_state(path, "fd7a:115c:a1e0::9", "f")
+        reloaded = hc.load_state(path, "fd7a:115c:a1e0::9", ["f"])
         self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 2)          # preserved
         self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_DOWN)
         # a different address (native IPv4 vs v6-mapped) is still treated as a new node
-        state2 = hc.default_state("100.64.0.1", "f")
+        state2 = hc.default_state("100.64.0.1", ["f"])
         state2["nodes"]["primary"]["fail_count"] = 2
         hc.save_state(path, state2)
-        reloaded2 = hc.load_state(path, "::ffff:100.64.0.1", "f")
+        reloaded2 = hc.load_state(path, "::ffff:100.64.0.1", ["f"])
         self.assertEqual(reloaded2["nodes"]["primary"]["fail_count"], 0)         # reset
 
     def test_corrupt_field_types_are_discarded(self):
         path = self.tmp / "failover-state.json"
-        bad = hc.default_state("p", "f")
+        bad = hc.default_state("p", ["f"])
         bad["nodes"]["primary"]["fail_count"] = "x"
         bad["nodes"]["primary"]["last_state"] = "weird"
         bad["active"]["last_switch_epoch"] = "bad"
         path.write_text(json.dumps(bad), encoding="utf-8")
-        reloaded = hc.load_state(path, "p", "f")
+        reloaded = hc.load_state(path, "p", ["f"])
         self.assertEqual(reloaded["nodes"]["primary"]["fail_count"], 0)
         self.assertEqual(reloaded["nodes"]["primary"]["last_state"], hc.STATE_UNKNOWN)
         self.assertEqual(reloaded["active"]["last_switch_epoch"], 0.0)
@@ -451,10 +703,409 @@ class StateTests(unittest.TestCase):
     def test_state_lock_is_reentrant_across_calls(self):
         path = self.tmp / "failover-state.json"
         with hc.state_lock(path):
-            hc.save_state(path, hc.default_state("p", "f"))
+            hc.save_state(path, hc.default_state("p", ["f"]))
         with hc.state_lock(path):
             self.assertTrue(path.exists())
         self.assertTrue((self.tmp / "failover-state.lock").exists())
+
+
+class V130GoldenEquivalenceTests(unittest.TestCase):
+    """G1 — the single-element compatibility pin, executably.
+
+    tests/fixtures/v130_golden.json was recorded from the REAL v1.3.0 evaluator
+    (tests/fixtures/record_v130_golden.py extracts it from the git tag; the
+    committed JSON is the fixture so CI needs no tags). Every step's COMPLETE
+    eight-key legacy decision dict AND the post-step hysteresis counters must
+    be equal under the new evaluator with a one-slot bench; the additive keys
+    are asserted for consistency rather than excluded from scrutiny."""
+
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "v130_golden.json"
+    LEGACY_KEYS = ("action", "reason", "active_role", "primary_state", "fallback_state",
+                   "target_role", "target_label", "event")
+
+    def test_g1_every_recorded_step_equivalent(self):
+        data = json.loads(self.FIXTURE.read_text(encoding="utf-8"))
+        primary, fallback = data["primary_label"], data["fallback_label"]
+        self.assertEqual(data["recorded_from"], "v1.3.0")
+        self.assertGreaterEqual(sum(len(s["steps"]) for s in data["scenarios"]), 30)
+        for scen in data["scenarios"]:
+            state = hc.default_state(primary, [fallback])
+            init = scen["initial"]
+            if "p_state" in init:
+                state["nodes"]["primary"]["last_state"] = init["p_state"]
+            if "f_state" in init:
+                state["nodes"]["fallbacks"][0]["last_state"] = init["f_state"]
+            if "p_fail" in init:
+                state["nodes"]["primary"]["fail_count"] = init["p_fail"]
+            if "f_fail" in init:
+                state["nodes"]["fallbacks"][0]["fail_count"] = init["f_fail"]
+            if "last_switch" in init:
+                state["active"]["last_switch_epoch"] = init["last_switch"]
+            th = hc.Thresholds(**scen["thresholds"])
+            for step_number, step in enumerate(scen["steps"]):
+                inp = step["input"]
+                if "set_last_switch" in inp:
+                    state["active"]["last_switch_epoch"] = inp["set_last_switch"]
+                decision = ev1(state, inp["active_role"], probe(primary, inp["p_reach"]),
+                               probe(fallback, inp["f_reach"]), th, inp["now"])
+                got = decision.to_dict()
+                with self.subTest(scenario=scen["name"], step=step_number):
+                    for key in self.LEGACY_KEYS:
+                        self.assertEqual(got[key], step["decision"][key],
+                                         f"{key} diverged from the v1.3.0 recording")
+                    for node_key, snap_key in (("primary", "post_primary"),):
+                        for field_name, expected in step[snap_key].items():
+                            self.assertEqual(state["nodes"][node_key][field_name], expected)
+                    for field_name, expected in step["post_fallback"].items():
+                        self.assertEqual(state["nodes"]["fallbacks"][0][field_name], expected)
+                    # Additive keys stay consistent with the legacy ones.
+                    self.assertEqual(got["fallback_states"], [got["fallback_state"]])
+                    if got["target_role"] == "fallback":
+                        self.assertEqual(got["target_index"], 0)
+                    else:
+                        self.assertIsNone(got["target_index"])
+
+
+class FallbackListValidationTests(unittest.TestCase):
+    def test_parse_splits_and_trims(self):
+        self.assertEqual(hc.parse_fallback_list("a, b ,c"), ["a", "b", "c"])
+        self.assertEqual(hc.parse_fallback_list("solo"), ["solo"])
+        self.assertEqual(hc.parse_fallback_list(""), [""])
+
+    def test_v1_empty_entries_refused(self):
+        for raw in ("", "a,,b", " , ", "a,"):
+            with self.subTest(raw=raw):
+                error = hc.validate_candidate_labels("p", hc.parse_fallback_list(raw))
+                self.assertIsNotNone(error)
+                self.assertIn("empty", error)
+
+    def test_v2_duplicates_refused_exact_and_canonical(self):
+        self.assertIn("duplicate", hc.validate_candidate_labels("p", ["a", "b", "a"]) or "")
+        # Canonical-IPv6: two spellings of ONE node refuse at config validation.
+        error = hc.validate_candidate_labels("p", ["fd7a:115c:a1e0::9", "fd7a:115c:a1e0:0:0:0:0:9"])
+        self.assertIsNotNone(error)
+        self.assertIn("duplicate", error)
+
+    def test_v3_fallback_equal_to_primary_refused(self):
+        self.assertIn("PRIMARY", hc.validate_candidate_labels("node-a", ["node-a"]) or "")
+        error = hc.validate_candidate_labels("fd7a:115c:a1e0::9", ["FD7A:115C:A1E0:0:0:0:0:9"])
+        self.assertIsNotNone(error)
+
+    def test_v4_case_different_hostnames_are_distinct(self):
+        # Hostname/MagicDNS equivalence is exact-text, NOT case-insensitive.
+        self.assertIsNone(hc.validate_candidate_labels("p", ["Node-B", "node-b"]))
+        self.assertIsNone(hc.validate_candidate_labels("Node-A", ["node-a"]))
+
+    def test_valid_lists_accepted(self):
+        self.assertIsNone(hc.validate_candidate_labels("p", ["a"]))
+        self.assertIsNone(hc.validate_candidate_labels("p", ["a", "b", "c"]))
+
+    def test_v5_refusal_happens_before_any_probe_or_state_io(self):
+        # Configuration refusal exits 2 with NO ping run and NO state file created.
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: [p.unlink() for p in tmp.glob("*")] and None or tmp.rmdir())
+        calls = tmp / "calls.log"
+        fake = tmp / "tailscale"
+        fake.write_text(f"#!/usr/bin/env bash\necho \"$@\" >> {calls}\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o755)
+        old = os.environ.get("TAILSCALE_BIN")
+        os.environ["TAILSCALE_BIN"] = str(fake)
+        self.addCleanup(lambda: os.environ.__setitem__("TAILSCALE_BIN", old) if old else os.environ.pop("TAILSCALE_BIN", None))
+        state_file = tmp / "state.json"
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc, _out = run_cli([
+                "verdict", "--state-file", str(state_file),
+                "--primary", "p", "--fallback", "a,,b",
+                "--fail-threshold", "1", "--ok-threshold", "1", "--cooldown", "0",
+            ])
+        self.assertEqual(rc, 2)
+        self.assertIn("empty", buf.getvalue())
+        self.assertFalse(calls.exists(), "no tailscale invocation may happen on a config refusal")
+        self.assertFalse(state_file.exists(), "no state may be written on a config refusal")
+        self.assertFalse((tmp / "state.lock").exists(), "no lock may be taken on a config refusal")
+
+
+class MultiStateMigrationTests(unittest.TestCase):
+    """State schema 2: v1 read-compat, positional history, index re-derivation,
+    delisted retention, and the label-spelling invariant (S1-S9)."""
+
+    LABELS = ["fb0", "fb1", "fb2"]
+
+    def _v1_state(self, fallback_label="fb0", active_role="fallback"):
+        return {
+            "schema_version": 1,
+            "active": {
+                "role": active_role,
+                "configured_label": fallback_label if active_role == "fallback" else None,
+                "node_id": "nodeF",
+                "tailscale_ips": ["100.64.0.2"],
+                "last_switch_epoch": 111.0,
+                "last_switch_at": "2026-01-01T00:00:00Z",
+            },
+            "nodes": {
+                "primary": {"configured_label": "p", "node_id": "nodeP", "tailscale_ips": ["100.64.0.1"],
+                            "last_state": hc.STATE_UP, "fail_count": 0, "ok_count": 3,
+                            "last_checked_at": "2026-01-01T00:00:00Z"},
+                "fallback": {"configured_label": fallback_label, "node_id": "nodeF", "tailscale_ips": ["100.64.0.2"],
+                             "last_state": hc.STATE_DOWN, "fail_count": 5, "ok_count": 0,
+                             "last_checked_at": "2026-01-01T00:00:00Z"},
+            },
+        }
+
+    def test_s1_v1_read_compat_seeds_slot0_and_index(self):
+        state = hc.normalize_state(self._v1_state(), "p", ["fb0", "fb1"])
+        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 5)  # history kept
+        self.assertEqual(state["nodes"]["fallbacks"][0]["last_state"], hc.STATE_DOWN)
+        self.assertEqual(state["nodes"]["fallbacks"][1]["last_state"], hc.STATE_UNKNOWN)  # fresh
+        self.assertEqual(state["active"]["fallback_index"], 0)  # v1 fallback -> slot 0
+        self.assertEqual(state["active"]["last_switch_epoch"], 111.0)  # cooldown clock kept
+
+    def test_s2_v1_label_mismatch_resets_history(self):
+        state = hc.normalize_state(self._v1_state(fallback_label="other"), "p", ["fb0"])
+        self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 0)
+        self.assertEqual(state["nodes"]["fallbacks"][0]["last_state"], hc.STATE_UNKNOWN)
+        # active label "other" matches no slot -> delisted retention (index null, label kept)
+        self.assertIsNone(state["active"]["fallback_index"])
+        self.assertEqual(state["active"]["configured_label"], "other")
+        self.assertEqual(state["active"]["last_switch_epoch"], 111.0)
+
+    def _v2_state(self):
+        state = hc.default_state("p", list(self.LABELS))
+        for i, slot in enumerate(state["nodes"]["fallbacks"]):
+            slot["fail_count"] = i + 1
+            slot["last_state"] = hc.STATE_DOWN
+            slot["node_id"] = f"node{i}"
+        state["active"].update({
+            "role": "fallback", "configured_label": "fb1", "node_id": "node1",
+            "tailscale_ips": ["100.64.0.11"], "fallback_index": 1,
+            "last_switch_epoch": 222.0, "last_switch_at": "2026-02-02T00:00:00Z",
+        })
+        return json.loads(json.dumps(state))
+
+    def test_s3_reorder_rebinds_active_index_and_resets_positional_history(self):
+        stored = self._v2_state()
+        # Reorder fb1 to the front: active label fb1 must REBIND to index 0;
+        # per-slot history is positional, so every moved slot resets.
+        state = hc.normalize_state(stored, "p", ["fb1", "fb0", "fb2"])
+        self.assertEqual(state["active"]["fallback_index"], 0)
+        self.assertEqual(state["active"]["configured_label"], "fb1")
+        self.assertEqual(state["active"]["last_switch_epoch"], 222.0)  # clock survives the edit
+        self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 0)  # fb1's slot: stored[0] was fb0 -> reset
+        self.assertEqual(state["nodes"]["fallbacks"][2]["fail_count"], 3)  # fb2 stayed at slot 2 -> kept
+
+    def test_s4_delisted_retains_label_identity_null_index(self):
+        stored = self._v2_state()
+        state = hc.normalize_state(stored, "p", ["fb0", "fb2"])  # fb1 delisted
+        active = state["active"]
+        self.assertEqual(active["role"], "fallback")
+        self.assertEqual(active["configured_label"], "fb1")  # retained evidence
+        self.assertEqual(active["node_id"], "node1")
+        self.assertEqual(active["tailscale_ips"], ["100.64.0.11"])
+        self.assertIsNone(active["fallback_index"])  # index nulled ONLY
+        self.assertEqual(active["last_switch_epoch"], 222.0)  # cooldown survives
+
+    def test_s5_unknown_schema_resets(self):
+        for version in (0, 3, "2", None):
+            stored = self._v2_state()
+            stored["schema_version"] = version
+            state = hc.normalize_state(stored, "p", list(self.LABELS))
+            self.assertEqual(state["active"]["role"], "unknown")
+            self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 0)
+
+    def test_s6_stored_index_never_trusted(self):
+        stored = self._v2_state()
+        stored["active"]["fallback_index"] = 999  # garbage on disk
+        state = hc.normalize_state(stored, "p", list(self.LABELS))
+        self.assertEqual(state["active"]["fallback_index"], 1)  # re-derived from the label
+        stored["active"]["fallback_index"] = "one"
+        state = hc.normalize_state(stored, "p", list(self.LABELS))
+        self.assertEqual(state["active"]["fallback_index"], 1)
+        # role != fallback -> index is always null whatever the file says
+        stored2 = self._v2_state()
+        stored2["active"]["role"] = "primary"
+        stored2["active"]["fallback_index"] = 2
+        state2 = hc.normalize_state(stored2, "p", list(self.LABELS))
+        self.assertIsNone(state2["active"]["fallback_index"])
+
+    def test_s7_v1_in_schema2_out(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: [p.unlink() for p in tmp.glob("*")] and None or tmp.rmdir())
+        path = tmp / "state.json"
+        path.write_text(json.dumps(self._v1_state()), encoding="utf-8")
+        state = hc.load_state(path, "p", ["fb0"])
+        hc.save_state(path, state)
+        written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["schema_version"], 2)
+        self.assertIn("fallbacks", written["nodes"])
+        self.assertNotIn("fallback", written["nodes"])
+        self.assertEqual(written["nodes"]["fallbacks"][0]["fail_count"], 5)
+
+    def test_s9_respell_keeps_history_and_refreshes_label(self):
+        # Canonical-equivalent respell of a slot label: history is KEPT, but the
+        # normalized record's configured_label — hence any later target_label —
+        # is the NEW this-cycle spelling, never the stored one (the exact-text
+        # cross-check soundness pin; mutant M18 copies the stored label instead).
+        expanded, compressed = "fd7a:115c:a1e0:0:0:0:0:9", "fd7a:115c:a1e0::9"
+        stored = hc.default_state("p", [expanded, "fb1"])
+        stored["nodes"]["fallbacks"][0]["fail_count"] = 2
+        stored["nodes"]["fallbacks"][0]["last_state"] = hc.STATE_DOWN
+        stored = json.loads(json.dumps(stored))
+        state = hc.normalize_state(stored, "p", [compressed, "fb1"])
+        self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 2)  # history kept
+        self.assertEqual(state["nodes"]["fallbacks"][0]["configured_label"], compressed)  # NEW spelling
+        # ...and the evaluator's target_label carries the current spelling.
+        state["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
+        d = hc.evaluate(state, "primary", None, probe("p", False),
+                        [probe(compressed, True), probe("fb1", True)],
+                        hc.Thresholds(cooldown=0.0), 10_000.0)
+        self.assertEqual(d.target_label, compressed)
+
+
+class DeriveActiveTests(unittest.TestCase):
+    """derive_active: live matching, index derivation, delisted overlay with
+    the coherence gate, unresolved-active fail-closed (L-series pure part)."""
+
+    LABELS = ["fb0", "fb1", "fb2"]
+
+    def _status(self, exit_id=None, exit_ips=None, exit_absent=False):
+        status = {"BackendState": "Running", "Self": {"ID": "self"}}
+        if not exit_absent:
+            entry = {}
+            if exit_id is not None:
+                entry["ID"] = exit_id
+            if exit_ips is not None:
+                entry["TailscaleIPs"] = exit_ips
+            status["ExitNodeStatus"] = entry or {"ID": exit_id}
+        return status
+
+    def _identities(self):
+        primary = ("nodeP", ["100.64.0.1"])
+        fallbacks = [("node0", ["100.64.0.10"]), ("node1", ["100.64.0.11"]), ("node2", ["100.64.0.12"])]
+        return primary, fallbacks
+
+    def _record(self, role="fallback", label="gone-fb", node_id="nodeGone", ips=None):
+        return {
+            "role": role, "configured_label": label, "node_id": node_id,
+            "tailscale_ips": ips if ips is not None else ["100.64.0.99"],
+        }
+
+    def test_matches_fallback_slot_with_index(self):
+        primary, fallbacks = self._identities()
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="node2"), primary, fallbacks, "p", self.LABELS, None)
+        self.assertEqual((role, index, problem), ("fallback", 2, None))
+
+    def test_matches_primary_and_none(self):
+        primary, fallbacks = self._identities()
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="nodeP"), primary, fallbacks, "p", self.LABELS, None)
+        self.assertEqual((role, index, problem), ("primary", None, None))
+        status = {"BackendState": "Running", "ExitNodeStatus": None}
+        self.assertEqual(hc.derive_active(status, primary, fallbacks, "p", self.LABELS, None),
+                         ("none", None, None))
+
+    def test_delisted_from_coherent_record(self):
+        primary, fallbacks = self._identities()
+        record = self._record()
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="nodeGone"), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual((role, index, problem), ("delisted", None, None))
+        # IP-set match works too (ID missing from the record).
+        record = self._record(node_id=None, ips=["100.64.0.99"])
+        role, _i, _p = hc.derive_active(
+            self._status(exit_ips=["100.64.0.99/32"]), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual(role, "delisted")
+
+    def test_l13_primary_role_record_can_be_delisted(self):
+        # A PRIMARY-label swap while live sits on the old primary node: the
+        # retained record (role=primary) is coherent evidence; preserve-as-is
+        # semantics (D4) — no forced role rewrite.
+        primary, fallbacks = self._identities()
+        record = self._record(role="primary", label="old-primary", node_id="nodeOldP", ips=["100.64.0.98"])
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="nodeOldP"), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual((role, index, problem), ("delisted", None, None))
+
+    def test_l14_incoherent_records_are_not_delisted_evidence(self):
+        # GPT finding 2: a type-valid state with role unknown/none (or missing
+        # label/identity) must NOT turn a foreign node into "ours".
+        primary, fallbacks = self._identities()
+        for record in (
+            self._record(role="unknown"),
+            self._record(role="none"),
+            self._record(label=None),
+            self._record(label=""),
+            self._record(node_id=None, ips=[]),
+            None,
+        ):
+            with self.subTest(record=record):
+                role, index, problem = hc.derive_active(
+                    self._status(exit_id="nodeGone"), primary, fallbacks, "p", self.LABELS, record)
+                self.assertEqual((role, index, problem), ("unknown", None, None))
+
+    def test_l6_unresolved_active_fails_closed(self):
+        # The retained label is STILL configured but that candidate did not
+        # resolve this round: the ACTIVE node is unverifiable -> problem.
+        primary, fallbacks = self._identities()
+        fallbacks[1] = (None, [])  # fb1 unresolved this round
+        record = self._record(label="fb1", node_id="node1", ips=["100.64.0.11"])
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="node1"), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual(problem, "live_status_incomplete")
+
+    def test_l7_label_repointed_is_foreign(self):
+        # fb1 now resolves to a DIFFERENT node while live sits on the old one:
+        # the label was re-pointed; the old node is foreign -> unknown, no override.
+        primary, fallbacks = self._identities()
+        fallbacks[1] = ("nodeNEW", ["100.64.0.21"])
+        record = self._record(label="fb1", node_id="node1", ips=["100.64.0.11"])
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="node1"), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual((role, index, problem), ("unknown", None, None))
+
+    def test_l5_foreign_node_never_overridden(self):
+        primary, fallbacks = self._identities()
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="totally-foreign"), primary, fallbacks, "p", self.LABELS,
+            self._record())
+        self.assertEqual((role, index, problem), ("unknown", None, None))
+
+    def test_malformed_exit_status_fails_closed(self):
+        primary, fallbacks = self._identities()
+        for exit_value in ({}, [], "nodeP", {"TailscaleIPs": ["not-an-ip"]}):
+            with self.subTest(exit_value=exit_value):
+                status = {"BackendState": "Running", "ExitNodeStatus": exit_value}
+                role, _i, _p = hc.derive_active(status, primary, fallbacks, "p", self.LABELS, None)
+                self.assertEqual(role, "unknown")
+
+
+class AllPairsDistinctTests(unittest.TestCase):
+    def test_l10_same_id_disjoint_ips_refused(self):
+        # ID half of the mechanism alone must catch the alias.
+        self.assertFalse(hc._all_pairs_distinct([
+            ("nodeA", ["100.64.0.1"]), ("nodeA", ["100.64.0.2"]),
+        ]))
+
+    def test_l10_different_id_shared_ip_refused(self):
+        # IP half of the mechanism alone must catch the alias.
+        self.assertFalse(hc._all_pairs_distinct([
+            ("nodeA", ["100.64.0.1"]), ("nodeB", ["100.64.0.1"]),
+        ]))
+
+    def test_l10_position_variants(self):
+        distinct = [("a", ["1.1.1.1"]), ("b", ["2.2.2.2"]), ("c", ["3.3.3.3"]), ("d", ["4.4.4.4"])]
+        self.assertTrue(hc._all_pairs_distinct(distinct))
+        primary_vs_slot2 = list(distinct)
+        primary_vs_slot2[2] = ("a", ["9.9.9.9"])  # aliases the primary by ID
+        self.assertFalse(hc._all_pairs_distinct(primary_vs_slot2))
+        slot1_vs_slot3 = list(distinct)
+        slot1_vs_slot3[3] = ("z", ["2.2.2.2"])  # aliases slot 1 by IP
+        self.assertFalse(hc._all_pairs_distinct(slot1_vs_slot3))
+
+    def test_unresolved_entries_pass_trivially(self):
+        self.assertTrue(hc._all_pairs_distinct([("a", ["1.1.1.1"]), (None, []), (None, [])]))
 
 
 class ProbeSubprocessTests(unittest.TestCase):
@@ -656,7 +1307,7 @@ class VerdictCliTests(unittest.TestCase):
         self.assertEqual(decision["reason"], "candidates_not_distinct")
 
     def test_verdict_resets_state_on_node_id_change(self):
-        stale = hc.default_state("primary-vps", "fallback-vps")
+        stale = hc.default_state("primary-vps", ["fallback-vps"])
         stale["nodes"]["primary"]["node_id"] = "OLD-ID"
         stale["nodes"]["primary"]["fail_count"] = 5
         stale["nodes"]["primary"]["last_state"] = hc.STATE_DOWN
@@ -680,7 +1331,7 @@ class VerdictCliTests(unittest.TestCase):
             },
             "ExitNodeStatus": None,
         }), encoding="utf-8")
-        stale = hc.default_state("primary-vps", "fallback-vps")
+        stale = hc.default_state("primary-vps", ["fallback-vps"])
         stale["nodes"]["primary"]["node_id"] = None
         stale["nodes"]["primary"]["tailscale_ips"] = ["100.64.0.99"]  # old IP, now gone
         stale["nodes"]["primary"]["fail_count"] = 5
@@ -715,7 +1366,7 @@ class VerdictCliTests(unittest.TestCase):
             },
             "ExitNodeStatus": None,
         }), encoding="utf-8")
-        stale = hc.default_state("primary-vps", "fallback-vps")
+        stale = hc.default_state("primary-vps", ["fallback-vps"])
         stale["nodes"]["primary"]["node_id"] = None
         stale["nodes"]["primary"]["tailscale_ips"] = ["fd7a:115c:a1e0:0:0:0:0:9"]  # SAME node, expanded (old build)
         stale["nodes"]["primary"]["fail_count"] = 2
@@ -829,6 +1480,467 @@ DEVICES_PRIMARY_OLDER = {"devices": [
     {"hostname": "primary-vps", "created": "2026-01-01T00:00:00Z"},
     {"hostname": "fallback-vps", "created": "2026-03-01T00:00:00Z"},
 ]}
+
+
+def multi_status(active=None, drop_peers=(), repoint=None):
+    """Status fixture with primary-vps + three bench peers fb-a/fb-b/fb-c.
+
+    ``active``: label (or raw id) whose node is the live exit node; None -> no
+    exit node. ``drop_peers``: labels removed from the Peer map (unresolved this
+    round). ``repoint``: {label: new_id} to simulate a label re-pointed at a
+    recreated node."""
+    nodes = {
+        "primary-vps": ("nodeP", "100.64.0.1"),
+        "fb-a": ("nodeA", "100.64.0.10"),
+        "fb-b": ("nodeB", "100.64.0.11"),
+        "fb-c": ("nodeC", "100.64.0.12"),
+    }
+    peers = {}
+    for label, (node_id, ip) in nodes.items():
+        if label in drop_peers:
+            continue
+        if repoint and label in repoint:
+            node_id = repoint[label]
+        # Keyed by label (not node id) so a repointed entry can ALIAS another
+        # node's id without clobbering that node's own peer entry.
+        peers[f"key-{label}"] = {
+            "ID": node_id, "HostName": label, "DNSName": f"{label}.example.ts.net.",
+            "TailscaleIPs": [ip], "Online": True,
+        }
+    status = {
+        "BackendState": "Running",
+        "Self": {"ID": "selfID", "HostName": "client", "TailscaleIPs": ["100.64.0.5"]},
+        "Peer": peers,
+        "ExitNodeStatus": None,
+    }
+    if active is not None:
+        node_id, ip = nodes.get(active, (active, "100.64.0.99"))
+        if repoint and active in (repoint or {}):
+            pass  # the OLD node stays live; callers pass raw ids for that case
+        status["ExitNodeStatus"] = {"ID": node_id, "TailscaleIPs": [f"{ip}/32"], "Online": True}
+    return status
+
+
+class MultiVerdictCliTests(unittest.TestCase):
+    """verdict/record-switch/active-role CLI over an ordered 3-slot bench."""
+
+    FALLBACKS = "fb-a,fb-b,fb-c"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(self._cleanup)
+        fake = self.tmp / "tailscale"
+        fake.write_text(FAKE_TAILSCALE, encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        self._set_env("TAILSCALE_BIN", str(fake))
+        self.status_file = self.tmp / "status.json"
+        self.state_file = self.tmp / "failover-state.json"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _set_env(self, key, value):
+        old = os.environ.get(key)
+        os.environ[key] = value
+        self.addCleanup(lambda: os.environ.__setitem__(key, old) if old is not None else os.environ.pop(key, None))
+
+    def _write_status(self, **kwargs):
+        self.status_file.write_text(json.dumps(multi_status(**kwargs)), encoding="utf-8")
+
+    def _verdict(self, extra=None, fallbacks=None):
+        argv = [
+            "verdict", "--state-file", str(self.state_file),
+            "--primary", "primary-vps", "--fallback", fallbacks or self.FALLBACKS,
+            "--status-json-file", str(self.status_file),
+            "--fail-threshold", "1", "--ok-threshold", "1", "--cooldown", "0", "--json",
+        ]
+        return run_cli(argv + (extra or []))
+
+    def read_state(self):
+        return json.loads(self.state_file.read_text(encoding="utf-8"))
+
+    def test_c1_verdict_json_shape_and_legacy_pins(self):
+        # Active is slot 1 (fb-b); slot 0 must still own the legacy keys.
+        self._write_status(active="fb-b")
+        self._set_env("FAKE_UNREACHABLE", "fb-a")
+        rc, out = self._verdict()
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["schema_version"], 1)  # REPORT schema, not state's 2
+        self.assertEqual([p["label"] for p in payload["fallbacks"]], ["fb-a", "fb-b", "fb-c"])
+        self.assertEqual(payload["fallback"], payload["fallbacks"][0])  # pinned to slot 0
+        self.assertFalse(payload["fallbacks"][0]["reachable"])
+        decision = payload["decision"]
+        self.assertEqual(decision["active_role"], "fallback")
+        self.assertEqual(decision["fallback_state"], decision["fallback_states"][0])
+        self.assertEqual(len(decision["fallback_states"]), 3)
+        self.assertIn("target_index", decision)
+
+    def test_c1_f2f_target_fields_consistent(self):
+        # Active fb-a goes DOWN; the verdict must emit a slot-1 target whose
+        # label equals the configured slot text at that index.
+        self._write_status(active="fb-a")
+        self._set_env("FAKE_UNREACHABLE", "primary-vps,fb-a")
+        rc, out = self._verdict()
+        decision = json.loads(out)["decision"]
+        self.assertEqual(decision["action"], "switch-to-fallback")
+        self.assertEqual(decision["reason"], "fallback_down_next_fallback")
+        self.assertEqual(decision["target_index"], 1)
+        self.assertEqual(decision["target_label"], "fb-b")
+        self.assertEqual(decision["target_label"], self.FALLBACKS.split(",")[1])
+
+    def test_c2_text_target_index_only_for_fallback_targets(self):
+        self._write_status(active="fb-a")
+        self._set_env("FAKE_UNREACHABLE", "primary-vps,fb-a")
+        rc, out = run_cli([
+            "verdict", "--state-file", str(self.state_file),
+            "--primary", "primary-vps", "--fallback", self.FALLBACKS,
+            "--status-json-file", str(self.status_file),
+            "--fail-threshold", "1", "--ok-threshold", "1", "--cooldown", "0",
+        ])
+        self.assertIn("target_index=1", out)
+        self.assertNotIn("fallback_states", out)  # JSON-only additive
+        # Primary target: no target_index line.
+        os.environ.pop("FAKE_UNREACHABLE", None)
+        rc, out = run_cli([
+            "verdict", "--state-file", str(self.tmp / "s2.json"),
+            "--primary", "primary-vps", "--fallback", self.FALLBACKS,
+            "--status-json-file", str(self.status_file),
+            "--fail-threshold", "1", "--ok-threshold", "1", "--cooldown", "0",
+        ])
+        self.assertNotIn("target_index=", out)
+
+    def test_l1_manual_selection_persists_role_index_identity(self):
+        self._write_status(active="fb-c")  # operator ran tailscale set themselves
+        rc, _out = self._verdict()
+        state = self.read_state()
+        self.assertEqual(state["active"]["role"], "fallback")
+        self.assertEqual(state["active"]["fallback_index"], 2)
+        self.assertEqual(state["active"]["configured_label"], "fb-c")
+        self.assertEqual(state["active"]["node_id"], "nodeC")
+
+    def test_l2_reorder_converges_within_one_cycle(self):
+        self._write_status(active="fb-b")
+        self._verdict()
+        self.assertEqual(self.read_state()["active"]["fallback_index"], 1)
+        # Operator reorders the list; the next cycle rebinds by label.
+        rc, _out = self._verdict(fallbacks="fb-b,fb-a,fb-c")
+        state = self.read_state()
+        self.assertEqual(state["active"]["fallback_index"], 0)
+        self.assertEqual(state["active"]["configured_label"], "fb-b")
+
+    def test_l8_unresolved_bench_candidate_still_pinged_and_excluded(self):
+        # fb-b vanishes from status: its REAL ping still runs (design: every
+        # configured node probed every cycle), it feeds hysteresis, and the walk
+        # skips it — fb-c wins despite fb-b's ping PASSING.
+        self._write_status(active="fb-a", drop_peers=("fb-b",))
+        self._set_env("FAKE_UNREACHABLE", "primary-vps,fb-a")  # fb-b ping would PASS
+        rc, out = self._verdict()
+        payload = json.loads(out)
+        decision = payload["decision"]
+        self.assertEqual(decision["action"], "switch-to-fallback")
+        self.assertEqual(decision["target_index"], 2)  # fb-b excluded though reachable
+        self.assertEqual(decision["target_label"], "fb-c")
+        self.assertTrue(payload["fallbacks"][1]["reachable"])  # real ping ran and passed
+        state = self.read_state()
+        self.assertEqual(state["nodes"]["fallbacks"][1]["ok_count"], 1)  # hysteresis fed
+
+    def test_l11_l12_delisted_preserved_two_cycles_normal_persists_live(self):
+        # Cycle 1: fb-b active, persisted normally (L12 live-derived).
+        self._write_status(active="fb-b")
+        self._verdict()
+        state = self.read_state()
+        self.assertEqual((state["active"]["role"], state["active"]["fallback_index"]), ("fallback", 1))
+        # Cycles 2+3: fb-b delisted from config while still the live exit node.
+        for _cycle in range(2):
+            rc, out = self._verdict(fallbacks="fb-a,fb-c")
+            decision = json.loads(out)["decision"]
+            self.assertEqual(decision["active_role"], "delisted")
+            state = self.read_state()
+            self.assertEqual(state["active"]["role"], "fallback")  # never the string "delisted"
+            self.assertEqual(state["active"]["configured_label"], "fb-b")  # evidence retained
+            self.assertEqual(state["active"]["node_id"], "nodeB")
+            self.assertIsNone(state["active"]["fallback_index"])
+            self.assertIn(state["active"]["role"], ("primary", "fallback", "none", "unknown"))
+
+    def test_l3_l4_delisted_recovery_both_arms(self):
+        # Arm 1: primary healthy -> delisted_restore_primary (strict bar).
+        self._write_status(active="fb-b")
+        self._verdict()
+        rc, out = self._verdict(fallbacks="fb-a,fb-c")
+        decision = json.loads(out)["decision"]
+        self.assertEqual((decision["action"], decision["reason"]),
+                         ("switch-to-primary", "delisted_restore_primary"))
+        # Arm 2: primary unreachable -> walk the bench from the top.
+        self._set_env("FAKE_UNREACHABLE", "primary-vps")
+        rc, out = self._verdict(fallbacks="fb-a,fb-c")
+        decision = json.loads(out)["decision"]
+        self.assertEqual((decision["action"], decision["reason"]),
+                         ("switch-to-fallback", "delisted_next_fallback"))
+        self.assertEqual(decision["target_index"], 0)
+        self.assertEqual(decision["target_label"], "fb-a")
+
+    def test_l15_unresolved_primary_fails_closed_in_multi(self):
+        self._write_status(active="fb-a", drop_peers=("primary-vps",))
+        rc, out = self._verdict()
+        decision = json.loads(out)["decision"]
+        self.assertEqual(decision["reason"], "live_status_incomplete")
+        self.assertEqual(decision["action"], "none")
+        self.assertFalse(self.state_file.exists())  # fail-closed: no state write
+
+    def test_l6_unresolved_active_fails_closed_cli(self):
+        # fb-b is the recorded active; it vanishes from status while still the
+        # live exit node -> unverifiable ACTIVE -> live_status_incomplete, no
+        # switch proposal, no state mutation, no tailscale set target.
+        self._write_status(active="fb-b")
+        self._verdict()
+        before = self.read_state()
+        self._write_status(active="nodeB", drop_peers=("fb-b",))  # raw id keeps old node live
+        rc, out = self._verdict()
+        payload = json.loads(out)
+        self.assertEqual(payload["decision"]["reason"], "live_status_incomplete")
+        self.assertEqual(payload["decision"]["action"], "none")
+        self.assertIsNone(payload["decision"]["target_index"])
+        self.assertEqual(self.read_state(), before)  # nothing persisted
+
+    def test_l9_single_element_unresolved_fallback_verbatim(self):
+        self._write_status(active=None, drop_peers=("fb-b", "fb-c"))
+        rc, out = self._verdict(fallbacks="fb-b")
+        decision = json.loads(out)["decision"]
+        self.assertEqual(decision["reason"], "live_status_incomplete")
+
+    def test_l10_alias_pairs_refused_cli(self):
+        # fb-c re-pointed to nodeA: two configured labels now alias one node.
+        self._write_status(active=None, repoint={"fb-c": "nodeA"})
+        rc, out = self._verdict()
+        self.assertEqual(json.loads(out)["decision"]["reason"], "candidates_not_distinct")
+
+    def test_c8_probe_json_report_schema_still_1(self):
+        rc, out = run_cli(["probe", "--node", "primary-vps", "--json"])
+        self.assertEqual(json.loads(out)["schema_version"], 1)
+
+
+class RecordSwitchPairingTests(unittest.TestCase):
+    """record-switch --fallback-index/--label fail-closed pairing (C3-C5)."""
+
+    FALLBACKS = "fb-a,fb-b,fb-c"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(self._cleanup)
+        self.state_file = self.tmp / "state.json"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _record(self, *extra, fallbacks=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc, out = run_cli([
+                "record-switch", "--state-file", str(self.state_file),
+                "--primary", "primary-vps", "--fallback", fallbacks or self.FALLBACKS,
+                *extra,
+            ])
+        return rc, out, buf.getvalue()
+
+    def test_c3_multi_missing_index_refused(self):
+        rc, _out, err = self._record("--role", "fallback", "--label", "fb-b")
+        self.assertEqual(rc, 2)
+        self.assertIn("--fallback-index is required", err)
+        self.assertFalse(self.state_file.exists())
+
+    def test_c3_multi_missing_label_refused(self):
+        rc, _out, err = self._record("--role", "fallback", "--fallback-index", "1")
+        self.assertEqual(rc, 2)
+        self.assertIn("--label is required", err)
+        self.assertFalse(self.state_file.exists())
+
+    def test_c3_out_of_range_index_refused(self):
+        for bad in ("3", "-1", "18446744073709551616"):
+            with self.subTest(index=bad):
+                rc, _out, err = self._record("--role", "fallback", "--fallback-index", bad, "--label", "fb-a")
+                self.assertEqual(rc, 2)
+                self.assertIn("out of range", err)
+                self.assertFalse(self.state_file.exists())
+
+    def test_c3_label_slot_mismatch_refused_nothing_written(self):
+        # M10's discriminator: label names a REAL configured entry but not the
+        # one at --fallback-index — the shell's and engine's views diverged.
+        rc, _out, err = self._record("--role", "fallback", "--fallback-index", "0", "--label", "fb-b")
+        self.assertEqual(rc, 2)
+        self.assertIn("does not match configured fallback slot 0", err)
+        self.assertFalse(self.state_file.exists())
+
+    def test_c3_valid_pair_writes_index_and_identity(self):
+        rc, out, _err = self._record("--role", "fallback", "--fallback-index", "1", "--label", "fb-b")
+        self.assertEqual(rc, 0)
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"]["role"], "fallback")
+        self.assertEqual(state["active"]["fallback_index"], 1)
+        self.assertEqual(state["active"]["configured_label"], "fb-b")
+        self.assertGreater(state["active"]["last_switch_epoch"], 0.0)
+
+    def test_c3_canonical_ip_label_accepted(self):
+        # --label may respell an IP-valued slot (same canonical address).
+        rc, _out, _err = self._record(
+            "--role", "fallback", "--fallback-index", "0", "--label", "FD7A:115C:A1E0:0:0:0:0:9",
+            fallbacks="fd7a:115c:a1e0::9,fb-b",
+        )
+        self.assertEqual(rc, 0)
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        # The recorded label is the CONFIGURED slot spelling, not the caller's.
+        self.assertEqual(state["active"]["configured_label"], "fd7a:115c:a1e0::9")
+
+    def test_c4_single_element_defaults_index_zero(self):
+        rc, _out, _err = self._record("--role", "fallback", fallbacks="only-fb")
+        self.assertEqual(rc, 0)
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(state["active"]["fallback_index"], 0)
+        # --label validated when given (wrong one refuses).
+        rc, _out, err = self._record("--role", "fallback", "--label", "wrong", fallbacks="only-fb")
+        self.assertEqual(rc, 2)
+
+    def test_c5_primary_role_with_pairing_flags_refused(self):
+        rc, _out, err = self._record("--role", "primary", "--fallback-index", "0")
+        self.assertEqual(rc, 2)
+        self.assertIn("only valid with --role fallback", err)
+        rc, _out, err = self._record("--role", "none", "--label", "fb-a")
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.state_file.exists())
+
+    def test_c3_primary_record_clears_index(self):
+        self._record("--role", "fallback", "--fallback-index", "1", "--label", "fb-b")
+        rc, _out, _err = self._record("--role", "primary")
+        self.assertEqual(rc, 0)
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertIsNone(state["active"]["fallback_index"])
+
+
+class ActiveRoleExpectLabelTests(unittest.TestCase):
+    """active-role --expect-label: identity-verified readback (C6)."""
+
+    FALLBACKS = "fb-a,fb-b,fb-c"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(self._cleanup)
+        self.status_file = self.tmp / "status.json"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _active_role(self, *extra, status_kwargs=None):
+        self.status_file.write_text(json.dumps(multi_status(**(status_kwargs or {}))), encoding="utf-8")
+        return run_cli([
+            "active-role", "--primary", "primary-vps", "--fallback", self.FALLBACKS,
+            "--status-json-file", str(self.status_file), *extra,
+        ])
+
+    def test_c6_match_exit_zero(self):
+        rc, out = self._active_role("--expect-label", "fb-b", status_kwargs={"active": "fb-b"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "match=1")
+
+    def test_c6_wrong_node_fails(self):
+        # The no-op-switch shape: expected fb-c, live is still fb-b.
+        rc, out = self._active_role("--expect-label", "fb-c", status_kwargs={"active": "fb-b"})
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "match=0")
+
+    def test_c6_role_class_alone_never_matches(self):
+        # Both are "fallback"-class nodes — identity, not role class, decides.
+        rc, _out = self._active_role("--expect-label", "fb-a", status_kwargs={"active": "fb-c"})
+        self.assertEqual(rc, 1)
+
+    def test_c6_no_exit_node_fails(self):
+        rc, _out = self._active_role("--expect-label", "fb-b", status_kwargs={"active": None})
+        self.assertEqual(rc, 1)
+
+    def test_c6_backend_not_running_fails(self):
+        status = multi_status(active="fb-b")
+        status["BackendState"] = "Stopped"
+        self.status_file.write_text(json.dumps(status), encoding="utf-8")
+        rc, out = run_cli([
+            "active-role", "--primary", "primary-vps", "--fallback", self.FALLBACKS,
+            "--status-json-file", str(self.status_file), "--expect-label", "fb-b",
+        ])
+        self.assertEqual(rc, 1)
+
+    def test_c6_unresolved_expect_label_fails(self):
+        rc, _out = self._active_role("--expect-label", "ghost", status_kwargs={"active": "fb-b"})
+        self.assertEqual(rc, 1)
+
+    def test_c6_canonical_ipv6_spelling_matches(self):
+        status = multi_status(active=None)
+        status["Peer"]["node6"] = {"ID": "node6", "HostName": "v6-node",
+                                   "TailscaleIPs": ["fd7a:115c:a1e0::9"], "Online": True}
+        status["ExitNodeStatus"] = {"ID": "node6", "TailscaleIPs": ["fd7a:115c:a1e0::9/128"], "Online": True}
+        self.status_file.write_text(json.dumps(status), encoding="utf-8")
+        rc, out = run_cli([
+            "active-role", "--primary", "primary-vps", "--fallback", self.FALLBACKS,
+            "--status-json-file", str(self.status_file),
+            "--expect-label", "FD7A:115C:A1E0:0:0:0:0:9",
+        ])
+        self.assertEqual(rc, 0)
+
+    def test_c6_invalid_list_refused_before_status(self):
+        # The list validation wire point in active-role: exit 2, no status read.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc, _out = run_cli([
+                "active-role", "--primary", "p", "--fallback", "a,,b",
+                "--status-json-file", str(self.tmp / "never-written.json"),
+            ])
+        self.assertEqual(rc, 2)
+        self.assertIn("empty", buf.getvalue())
+
+    def test_c6_flagless_mode_unchanged(self):
+        rc, out = self._active_role(status_kwargs={"active": "fb-b"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "fallback")
+        rc, out = self._active_role(status_kwargs={"active": None})
+        self.assertEqual(out.strip(), "none")
+
+
+class ConnectorsFallbackDefaultTests(unittest.TestCase):
+    """C7: the connectors nested default never adopts one element of a list."""
+
+    def _with_env(self, updates):
+        for key, value in updates.items():
+            old = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+            self.addCleanup(
+                lambda k=key, o=old: os.environ.__setitem__(k, o) if o is not None else os.environ.pop(k, None)
+            )
+
+    def test_c7_unset_with_comma_list_resolves_unset(self):
+        self._with_env({"FALLBACK_CONNECTOR": None, "FALLBACK_EXIT_NODE": "fb-a,fb-b"})
+        self.assertEqual(hc.connectors_fallback_default(), "")
+
+    def test_c7_unset_with_scalar_keeps_nested_default(self):
+        self._with_env({"FALLBACK_CONNECTOR": None, "FALLBACK_EXIT_NODE": "fb-a"})
+        self.assertEqual(hc.connectors_fallback_default(), "fb-a")
+
+    def test_c7_set_but_empty_stays_empty(self):
+        self._with_env({"FALLBACK_CONNECTOR": "", "FALLBACK_EXIT_NODE": "fb-a,fb-b"})
+        self.assertEqual(hc.connectors_fallback_default(), "")
+
+    def test_c7_set_wins_over_list(self):
+        self._with_env({"FALLBACK_CONNECTOR": "conn-x", "FALLBACK_EXIT_NODE": "fb-a,fb-b"})
+        self.assertEqual(hc.connectors_fallback_default(), "conn-x")
+
+    def test_c7_neither_set_empty(self):
+        self._with_env({"FALLBACK_CONNECTOR": None, "FALLBACK_EXIT_NODE": None})
+        self.assertEqual(hc.connectors_fallback_default(), "")
 
 
 class ConnectorOrderingUnitTests(unittest.TestCase):
@@ -1518,7 +2630,7 @@ class ConnectorsCliTests(unittest.TestCase):
 
     def test_json_schema_version_unchanged_by_metrics(self):
         rc, out = run_cli(self._args("--json"))
-        self.assertEqual(json.loads(out)["schema_version"], hc.STATE_SCHEMA_VERSION)
+        self.assertEqual(json.loads(out)["schema_version"], hc.REPORT_SCHEMA_VERSION)
 
     def test_degraded_when_offline(self):
         status = json.loads(json.dumps(CONN_STATUS))

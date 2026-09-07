@@ -114,7 +114,7 @@ cp examples/failover.env.example generated/failover.env
 ```bash
 # Exit-node failover controller (failover-exit-node.sh)
 PRIMARY_EXIT_NODE=home-mac          # hostname / MagicDNS name / Tailscale IP
-FALLBACK_EXIT_NODE=ai-egress-us-01
+FALLBACK_EXIT_NODE=ai-egress-us-01  # one fallback, or an ordered list: node-b,node-c,node-d
 PROBE_TARGET=https://ipinfo.io      # egress probe URL (example; use your own if preferred)
 CHECK_INTERVAL=30                   # seconds between cycles in --watch mode
 FAIL_THRESHOLD=3                    # consecutive ping failures before a node is DOWN
@@ -131,6 +131,51 @@ PRIMARY_CONNECTOR=ai-egress-jp-web-01
 FALLBACK_CONNECTOR=ai-egress-jp-aws-01
 REQUIRE_ROUTES=1                    # 1 = degrade when neither connector advertises routes
 ```
+
+### Ordered fallback list (v1.4)
+
+`FALLBACK_EXIT_NODE` accepts a **comma-separated, ordered** list of exit
+nodes; the order IS the priority (no weights, no round-robin, no automatic
+re-ordering). With a list, the controller can also fail over **between
+fallbacks**: when the active fallback goes down and the primary cannot be
+restored, the highest-priority other fallback that passed its ping this
+cycle is selected. A single-value `FALLBACK_EXIT_NODE` keeps the exact
+v1.3.0 behavior.
+
+- **Validation (fail-closed, before any probing):** an empty entry (stray
+  comma), a duplicate entry, or an entry equal to `PRIMARY_EXIT_NODE` is a
+  configuration error. Hostnames compare as exact text; IP-valued entries
+  compare by canonical address (two spellings of one IP are duplicates).
+- **Probing cost:** every configured node — the primary and ALL fallbacks —
+  is pinged every cycle with full hysteresis, each ping bounded by
+  `PING_TIMEOUT`. A long bench lengthens the cycle; `CHECK_INTERVAL` paces
+  it.
+- **Reordering resets per-node health history** (a slot is a position: its
+  counters follow the position, not the node), and the active node's bench
+  ordinal is re-derived from its label, so a reorder converges within one
+  cycle. Editing the list never resets the cooldown clock.
+- **Removing the ACTIVE node from the list** classifies the next cycle as
+  `delisted` and recovers loudly (restore the primary, or walk the new
+  bench) instead of dead-ending — see
+  [Failover](Failover.md#exit-node-failover-full-traffic).
+- **State schema:** the controller's `generated/failover-state.json` moves
+  to `schema_version: 2` (`nodes.fallbacks[]`, ordered). A pre-existing v1
+  file is read once and upgraded on the next write. The `probe`, `verdict`,
+  and `connectors` JSON reports keep `schema_version: 1` with additive
+  fields only.
+- **Connector-monitor default:** a DIRECT `health_check.py connectors` run
+  no longer borrows `FALLBACK_EXIT_NODE` as its fallback-connector default
+  when it holds a comma list (adopting one element would misreport what is
+  monitored) — set `FALLBACK_CONNECTOR` explicitly in multi-fallback
+  setups. `monitor-connectors.sh` is unaffected (it requires
+  `FALLBACK_CONNECTOR` itself).
+
+**Downgrade runbook (v1.4 state with an older build):** an older build
+reading schema-2 state defensively resets it, and with a comma list still
+configured it treats the whole list as one unresolvable hostname and stops
+evaluating (fail-closed but stuck). To downgrade: stop the watcher → set a
+single-value `FALLBACK_EXIT_NODE` → accept (or archive) the state reset →
+restart the watcher.
 
 All numeric settings are validated when the controller or monitor starts: an
 out-of-range or non-numeric value (including a bare `.`, `nan`/`inf`, or an

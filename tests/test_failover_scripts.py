@@ -27,7 +27,8 @@ import time
 args = sys.argv[1:]
 state_dir = os.environ.get("FAKE_STATE_DIR", ".")
 active_path = os.path.join(state_dir, "active")
-NODES = {"primary-vps": ("nodeP", "100.64.0.1"), "fallback-vps": ("nodeF", "100.64.0.2")}
+NODES = {"primary-vps": ("nodeP", "100.64.0.1"), "fallback-vps": ("nodeF", "100.64.0.2"),
+         "fallback2-vps": ("nodeF2", "100.64.0.3")}
 
 
 def read_active():
@@ -269,7 +270,7 @@ class FailoverControllerTests(unittest.TestCase):
         self.set_active("primary-vps")
         result = self.run_controller("--once", "--apply", FAKE_UNREACHABLE="primary-vps", FAKE_SET_NOOP="1")
         self.assertIn("apply_failed", result.stderr)
-        self.assertIn("expected 'fallback'", result.stderr)
+        self.assertIn("readback does not show 'fallback-vps' as the live exit node", result.stderr)
         self.assertEqual(self.read_active(), "primary-vps")
         self.assertEqual(self.read_state()["active"]["role"], "primary")  # not recorded as switched
 
@@ -284,7 +285,7 @@ class FailoverControllerTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("apply_failed", result.stderr)
-        self.assertIn("active role 'unknown'", result.stderr)
+        self.assertIn("readback does not show 'fallback-vps' as the live exit node", result.stderr)
         # Not recorded as switched: cooldown clock untouched.
         self.assertEqual(self.read_state()["active"]["role"], "primary")
         self.assertEqual(self.read_state()["active"]["last_switch_epoch"], 0.0)
@@ -792,6 +793,232 @@ class FailoverControllerTests(unittest.TestCase):
         result = self.run_monitor("--once", PRIMARY_CONNECTOR="")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PRIMARY_CONNECTOR is not set", result.stderr)
+
+
+class MultiFallbackControllerTests(FailoverControllerTests):
+    """Controller behavior over an ordered multi-fallback bench (H-series).
+
+    Inherits the harness (fake tailscale grows a third node) and overrides the
+    configured list; the inherited single-element tests do NOT rerun here."""
+
+    FALLBACKS = "fallback-vps,fallback2-vps"
+
+    # Neutralize the inherited single-element test methods (they already run in
+    # the parent class); this subclass exists for its own multi-bench cases.
+    def run(self, result=None):
+        if self._testMethodName.startswith(("test_h", "test_multi")):
+            return super().run(result)
+        return None
+
+    def _controller_env(self, **overrides):
+        overrides.setdefault("FALLBACK_EXIT_NODE", self.FALLBACKS)
+        return super()._controller_env(**overrides)
+
+    def _install_notify_logger(self):
+        log = self.base / "notify.log"
+        return log, (
+            'printf "%s %s %s idx=[%s]\\n" "$FAILOVER_EVENT" "$FAILOVER_ROLE" '
+            f'"$FAILOVER_LABEL" "$FAILOVER_FALLBACK_INDEX" >> "{log}"'
+        )
+
+    def test_h1_f2f_switch_records_index_and_notifies(self):
+        # Active fallback-vps goes down; primary stays down -> switch to
+        # fallback2-vps with the fail-closed index+label pair recorded and
+        # FAILOVER_FALLBACK_INDEX=1 in the notify environment.
+        self.set_active("fallback-vps")
+        log, notify_cmd = self._install_notify_logger()
+        result = self.run_controller(
+            "--once", "--apply",
+            FAKE_UNREACHABLE="primary-vps,fallback-vps",
+            FAILOVER_NOTIFY_CMD=notify_cmd,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fallback_down_next_fallback", result.stdout)
+        self.assertEqual(self.read_active(), "fallback2-vps")
+        state = self.read_state()
+        self.assertEqual(state["active"]["role"], "fallback")
+        self.assertEqual(state["active"]["fallback_index"], 1)
+        self.assertEqual(state["active"]["configured_label"], "fallback2-vps")
+        self.assertGreater(state["active"]["last_switch_epoch"], 0.0)
+        self.assertEqual(log.read_text(encoding="utf-8").strip(),
+                         "switched fallback fallback2-vps idx=[1]")
+
+    def test_h2_noop_f2f_switch_reads_back_failure_no_record(self):
+        # FAKE_SET_NOOP: `tailscale set` silently does nothing. The identity
+        # readback must fail (live is still fallback-vps, not the target), the
+        # state must NOT be recorded, no cooldown starts, and the notify event
+        # is `failed`. Under v1.3.0's role-class readback this exact case read
+        # back as SUCCESS (both nodes are "fallback"-class) — the design's
+        # motivating trap.
+        self.set_active("fallback-vps")
+        log, notify_cmd = self._install_notify_logger()
+        result = self.run_controller(
+            "--once", "--apply",
+            FAKE_UNREACHABLE="primary-vps,fallback-vps",
+            FAKE_SET_NOOP="1",
+            FAILOVER_NOTIFY_CMD=notify_cmd,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("readback does not show 'fallback2-vps'", result.stderr)
+        self.assertEqual(self.read_active(), "fallback-vps")  # unchanged
+        state = self.read_state()
+        self.assertNotEqual(state["active"].get("fallback_index"), 1)
+        self.assertEqual(state["active"]["last_switch_epoch"], 0.0)  # no cooldown restart
+        self.assertEqual(log.read_text(encoding="utf-8").strip(),
+                         "failed fallback fallback2-vps idx=[1]")
+
+    def _install_verdict_forger(self, **replacements):
+        """PATH-shadowing python3 wrapper: intercepts `verdict` calls and
+        rewrites selected k=v lines of the REAL engine's output (so the forged
+        verdict is well-formed apart from the planted divergence); every other
+        invocation (active-role, record-switch) passes through untouched."""
+        real = shlex.quote(sys.executable)
+        rewrites = "".join(
+            f'    line = "{key}={value}" if line.startswith("{key}=") else line\n'
+            for key, value in replacements.items()
+        )
+        fake_py = self.fake_bin / "python3"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do\n'
+            '  if [ "$a" = "verdict" ]; then\n'
+            f'    out="$({real} "$@")" || exit $?\n'
+            f'    exec {real} - "$out" <<\'PYEOF\'\n'
+            "import sys\n"
+            "for line in sys.argv[1].splitlines():\n"
+            f"{rewrites}"
+            "    print(line)\n"
+            "PYEOF\n"
+            "  fi\n"
+            "done\n"
+            f'exec {real} "$@"\n',
+            encoding="utf-8",
+        )
+        fake_py.chmod(0o755)
+        self.addCleanup(lambda: fake_py.exists() and fake_py.unlink())
+
+    def test_h3_missing_or_malformed_target_index_skips_loudly(self):
+        # A fallback target whose verdict lacks a usable target_index is a
+        # FAILED VERDICT: loud skip, no `tailscale set`, no notify, non-zero.
+        for planted in ("", "x1", "-1", "9", "08", "18446744073709551616"):
+            with self.subTest(planted=planted):
+                self.set_active("fallback-vps")
+                log, notify_cmd = self._install_notify_logger()
+                self._install_verdict_forger(target_index=planted)
+                result = self.run_controller(
+                    "--once", "--apply",
+                    FAKE_UNREACHABLE="primary-vps,fallback-vps",
+                    FAILOVER_NOTIFY_CMD=notify_cmd,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid verdict", result.stderr)
+                self.assertEqual(self.read_active(), "fallback-vps")  # no set
+                self.assertFalse(log.exists(), "a failed verdict must not notify")
+
+    def test_h4_target_label_slot_mismatch_skips_loudly(self):
+        # The verdict's target_label diverges from the configured slot at
+        # target_index (forged/corrupt verdict): fail closed before any set.
+        self.set_active("fallback-vps")
+        self._install_verdict_forger(target_label="fallback-vps")  # slot 1 is fallback2-vps
+        result = self.run_controller(
+            "--once", "--apply", FAKE_UNREACHABLE="primary-vps,fallback-vps",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match configured slot 1", result.stderr)
+        self.assertEqual(self.read_active(), "fallback-vps")
+
+    def test_h5_primary_restore_uses_identity_readback(self):
+        # Primary restore goes through the same --expect-label readback; a
+        # no-op set therefore fails it (v1.3.0's role compare also failed here,
+        # but only because the role differed — now the identity is checked).
+        self.set_active("fallback-vps")
+        result = self.run_controller("--once", "--apply", FAKE_SET_NOOP="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("readback does not show 'primary-vps'", result.stderr)
+        self.assertEqual(self.read_state()["active"]["last_switch_epoch"], 0.0)
+
+    def test_h6_single_element_passes_index_zero(self):
+        # Single-element config through the SAME code path: index 0 recorded,
+        # FAILOVER_FALLBACK_INDEX=0, legacy role/label values unchanged.
+        self.set_active("primary-vps")
+        log, notify_cmd = self._install_notify_logger()
+        result = self.run_controller(
+            "--once", "--apply",
+            FAKE_UNREACHABLE="primary-vps",
+            FALLBACK_EXIT_NODE="fallback-vps",
+            FAILOVER_NOTIFY_CMD=notify_cmd,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_active(), "fallback-vps")
+        state = self.read_state()
+        self.assertEqual(state["active"]["fallback_index"], 0)
+        self.assertEqual(log.read_text(encoding="utf-8").strip(),
+                         "switched fallback fallback-vps idx=[0]")
+
+    def test_h7_v1_state_on_disk_upgrades_preserving_history_and_clock(self):
+        v1 = {
+            "schema_version": 1,
+            "active": {"role": "primary", "configured_label": "primary-vps", "node_id": "nodeP",
+                       "tailscale_ips": ["100.64.0.1"], "last_switch_epoch": 333.0,
+                       "last_switch_at": "2026-01-01T00:00:00Z"},
+            "nodes": {
+                "primary": {"configured_label": "primary-vps", "node_id": "nodeP",
+                            "tailscale_ips": ["100.64.0.1"], "last_state": "UP",
+                            "fail_count": 0, "ok_count": 3, "last_checked_at": "2026-01-01T00:00:00Z"},
+                "fallback": {"configured_label": "fallback-vps", "node_id": "nodeF",
+                             "tailscale_ips": ["100.64.0.2"], "last_state": "DOWN",
+                             "fail_count": 4, "ok_count": 0, "last_checked_at": "2026-01-01T00:00:00Z"},
+            },
+        }
+        self.state_file.write_text(json.dumps(v1), encoding="utf-8")
+        self.set_active("primary-vps")
+        result = self.run_controller("--once", COOLDOWN="60")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_state()
+        self.assertEqual(state["schema_version"], 2)
+        self.assertIn("fallbacks", state["nodes"])
+        self.assertNotIn("fallback", state["nodes"])
+        # slot0 history survived the lift (one passing ping: fail 4 -> ok 1).
+        self.assertEqual(state["nodes"]["fallbacks"][0]["configured_label"], "fallback-vps")
+        self.assertEqual(state["nodes"]["fallbacks"][0]["ok_count"], 1)
+        self.assertEqual(state["active"]["last_switch_epoch"], 333.0)  # clock survived
+
+    def test_h8_delisted_recovery_end_to_end(self):
+        # The sole fallback is replaced in config while Tailscale still sits on
+        # the old node: the cycle classifies `delisted` and restores the
+        # primary (v1.3.0 dead-ended on unknown_active here).
+        self.set_active("fallback-vps")
+        seed = self.run_controller("--once", FALLBACK_EXIT_NODE="fallback-vps")
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        result = self.run_controller(
+            "--once", "--apply", FALLBACK_EXIT_NODE="fallback2-vps",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("active=delisted", result.stdout)
+        self.assertIn("delisted_restore_primary", result.stdout)
+        self.assertEqual(self.read_active(), "primary-vps")
+        state = self.read_state()
+        self.assertEqual(state["active"]["role"], "primary")
+
+    def test_h9_observe_mode_proposes_f2f_without_mutating(self):
+        self.set_active("fallback-vps")
+        result = self.run_controller(
+            "--once", FAKE_UNREACHABLE="primary-vps,fallback-vps",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[observe] proposed: switch-to-fallback -> fallback2-vps", result.stdout)
+        self.assertEqual(self.read_active(), "fallback-vps")  # untouched
+
+    def test_multi_verdict_refusal_fails_cycle(self):
+        # An invalid list (duplicate) is refused by the engine; the controller
+        # reports a failed verdict and mutates nothing.
+        self.set_active("primary-vps")
+        result = self.run_controller(
+            "--once", "--apply", FALLBACK_EXIT_NODE="fallback-vps,fallback-vps",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("health engine verdict failed", result.stderr)
+        self.assertEqual(self.read_active(), "primary-vps")
 
 
 if __name__ == "__main__":
