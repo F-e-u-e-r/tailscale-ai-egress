@@ -13,6 +13,8 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-08
+
 ### Added
 
 - **Multi-fallback exit nodes (Phase 6).** `FALLBACK_EXIT_NODE` accepts a
@@ -491,7 +493,8 @@ are summarized from project history.
 - `bootstrap.sh` connector setup, `diagnose.sh`, `check-client-routes.sh`,
   `rollback.sh`, the common domain list, and Manual Guided Mode policy snippets.
 
-[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/F-e-u-e-r/tailscale-ai-egress/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.4.0
 [1.3.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.3.0
 [1.2.0]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.2.0
 [1.1.1]: https://github.com/F-e-u-e-r/tailscale-ai-egress/releases/tag/v1.1.1
