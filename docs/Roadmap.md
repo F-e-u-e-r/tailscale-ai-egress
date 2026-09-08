@@ -1,6 +1,6 @@
 # Roadmap
 
-This is a **non-binding** planning document for direction beyond v1.3.0. It does
+This is a **non-binding** planning document for direction beyond v1.4.0. It does
 not promise dates or delivery. The binding contract is [Stability](Stability.md):
 within 1.x nothing under its "Frozen surface" changes incompatibly, and GUI /
 provider provisioning / telemetry / additional proxy protocols stay out of scope.
@@ -92,18 +92,31 @@ kept for the record.
   #27/#28/#29.)**
 ---
 
+## Shipped in v1.4.0 (`1.x additive-safe`)
+
+- **Multi-fallback exit nodes.** `1.x additive-safe` — **shipped in v1.4.0** as
+  the ordered, comma-separated `FALLBACK_EXIT_NODE` list (order is priority; the
+  controller now fails over **between fallbacks** when the active one goes down
+  and the primary cannot be restored). The exit-node controller state file moves
+  to `schema_version: 2` (`nodes.fallbacks[]`, ordered) with one-way v1
+  read-compatibility; a delisted active node recovers loudly instead of
+  dead-ending on `unknown_active`; and every switch is confirmed by an
+  identity-verified readback. The connector-switch apply mode keeps its own
+  separate state file (see
+  [design/connector-failover-apply.md](design/connector-failover-apply.md)), so
+  this bump is scoped to the exit-node controller's state alone. Design:
+  [design/multi-fallback.md](design/multi-fallback.md).
+  *Acceptance:* an ordered fallback list is tried in order; `schema_version: 2`
+  state is written and pre-existing v1 state still reads; a single-element list
+  stays behaviorally identical to v1.3.0 for steady-state, same-configuration
+  operation (the delisted-active recovery above is the deliberate config-edit
+  exception, outside that pin); tests cover ordered fallback, the v1 read-compat
+  path, and a v1.3.0-recorded semantic golden. **(met — PRs #32/#33.)**
+
+---
+
 ## Next (`1.x additive-safe`)
 
-- **Multi-fallback support.** `1.x additive-safe`.
-  `FALLBACK_EXIT_NODE` accepts a comma-separated list tried in order; state
-  schema adds `nodes.fallbacks[]` and bumps `schema_version` to 2 while keeping
-  v1 read-compatibility. The connector-switch apply mode keeps its own separate
-  state file (see
-  [design/connector-failover-apply.md](design/connector-failover-apply.md)), so
-  this bump is scoped to the exit-node controller's state alone.
-  *Acceptance:* an ordered fallback list is tried in order; `schema_version: 2`
-  state is written and pre-existing v1 state still reads; tests cover ordered
-  fallback and the v1 read-compat path.
 - **Monitoring integration.** `1.x additive-safe`.
   Step 1 (**done**): per-connector counters + liveness in the monitor's `--json`
   (`metrics` object) and an append-only `[metrics]` text line, plus a

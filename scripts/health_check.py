@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 # Kept in lock-step with the VERSION file (checked by tests/test_release_metadata.py).
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # Two DELIBERATELY separate constants (see docs/design/multi-fallback.md):
 # STATE_SCHEMA_VERSION governs ONLY the exit-node controller's state file
