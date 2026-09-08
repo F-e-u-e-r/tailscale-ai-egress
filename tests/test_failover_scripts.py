@@ -201,16 +201,36 @@ class FailoverControllerTests(unittest.TestCase):
     def test_notify_hook_fires_on_switch(self):
         self.set_active("primary-vps")
         notify_out = self.gen_dir / "notify.out"
-        cmd = f'printf "%s|%s|%s|%s" "$FAILOVER_EVENT" "$FAILOVER_ROLE" "$FAILOVER_LABEL" "$FAILOVER_REASON" > "{notify_out}"'
+        cmd = (f'printf "%s|%s|%s|%s|%s" "$FAILOVER_EVENT" "$FAILOVER_ROLE" '
+               f'"$FAILOVER_LABEL" "$FAILOVER_REASON" "$FAILOVER_FALLBACK_INDEX" > "{notify_out}"')
         result = self.run_controller("--once", "--apply", FAKE_UNREACHABLE="primary-vps", FAILOVER_NOTIFY_CMD=cmd)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.read_active(), "fallback-vps")
         self.assertTrue(notify_out.exists(), "notify hook did not run on switch")
-        event, role, label, reason = notify_out.read_text(encoding="utf-8").split("|")
+        event, role, label, reason, index = notify_out.read_text(encoding="utf-8").split("|")
         self.assertEqual(event, "switched")
         self.assertEqual(role, "fallback")
         self.assertEqual(label, "fallback-vps")
-        self.assertTrue(reason, "notify reason should be non-empty")
+        self.assertEqual(reason, "primary_down")  # the exact v1.3.0 reason string
+        self.assertEqual(index, "0")  # single-element fallback target -> index 0
+
+    def test_notify_hook_primary_target_has_empty_index(self):
+        # A primary restore's notify carries an EMPTY FAILOVER_FALLBACK_INDEX
+        # (the additive variable is fallback-target-only) and the exact
+        # v1.3.0 role/label/reason values.
+        self.set_active("fallback-vps")
+        notify_out = self.gen_dir / "notify.out"
+        cmd = (f'printf "%s|%s|%s|%s|[%s]" "$FAILOVER_EVENT" "$FAILOVER_ROLE" '
+               f'"$FAILOVER_LABEL" "$FAILOVER_REASON" "$FAILOVER_FALLBACK_INDEX" > "{notify_out}"')
+        result = self.run_controller("--once", "--apply", FAILOVER_NOTIFY_CMD=cmd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_active(), "primary-vps")
+        event, role, label, reason, index = notify_out.read_text(encoding="utf-8").split("|")
+        self.assertEqual(event, "switched")
+        self.assertEqual(role, "primary")
+        self.assertEqual(label, "primary-vps")
+        self.assertEqual(reason, "primary_recovered")
+        self.assertEqual(index, "[]")  # empty for primary targets
 
     def test_notify_hook_failure_does_not_change_outcome(self):
         # A failing hook (nonzero exit) must never change the controller result.
@@ -914,6 +934,21 @@ class MultiFallbackControllerTests(FailoverControllerTests):
                 self.assertIn("invalid verdict", result.stderr)
                 self.assertEqual(self.read_active(), "fallback-vps")  # no set
                 self.assertFalse(log.exists(), "a failed verdict must not notify")
+
+    def test_h3_h4_gate_applies_in_observe_mode_too(self):
+        # A forged verdict is a FAILED VERDICT in observe mode as well: it must
+        # exit non-zero with the invalid-verdict warning, never print a
+        # valid-looking [observe] proposal.
+        for planted in ({"target_index": "08"}, {"target_label": "fallback-vps"}):
+            with self.subTest(planted=planted):
+                self.set_active("fallback-vps")
+                self._install_verdict_forger(**planted)
+                result = self.run_controller(
+                    "--once", FAKE_UNREACHABLE="primary-vps,fallback-vps",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid verdict", result.stderr)
+                self.assertNotIn("[observe] proposed", result.stdout)
 
     def test_h4_target_label_slot_mismatch_skips_loudly(self):
         # The verdict's target_label diverges from the configured slot at

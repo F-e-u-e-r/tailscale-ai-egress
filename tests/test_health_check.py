@@ -907,12 +907,15 @@ class MultiStateMigrationTests(unittest.TestCase):
         self.assertEqual(active["last_switch_epoch"], 222.0)  # cooldown survives
 
     def test_s5_unknown_schema_resets(self):
-        for version in (0, 3, "2", None):
+        # True == 1 and 2.0 == 2 in Python: the type-strict check must reset
+        # those too, or a malformed file smuggles evidence past the reset.
+        for version in (0, 3, "2", None, True, False, 1.0, 2.0):
             stored = self._v2_state()
             stored["schema_version"] = version
             state = hc.normalize_state(stored, "p", list(self.LABELS))
-            self.assertEqual(state["active"]["role"], "unknown")
+            self.assertEqual(state["active"]["role"], "unknown", f"version={version!r}")
             self.assertEqual(state["nodes"]["fallbacks"][0]["fail_count"], 0)
+            self.assertEqual(state["active"]["last_switch_epoch"], 0.0)
 
     def test_s6_stored_index_never_trusted(self):
         stored = self._v2_state()
@@ -1070,6 +1073,25 @@ class DeriveActiveTests(unittest.TestCase):
         role, index, problem = hc.derive_active(
             self._status(exit_id="totally-foreign"), primary, fallbacks, "p", self.LABELS,
             self._record())
+        self.assertEqual((role, index, problem), ("unknown", None, None))
+
+    def test_l17_unmatched_live_with_unresolved_candidate_fails_closed(self):
+        # GPT diff finding 1: with ANY bench candidate unresolved, an unmatched
+        # live exit node cannot be proven foreign — it may BE that candidate
+        # (a fresh state file offers no claiming record). Fail closed instead
+        # of degrading into unknown_active.
+        primary, fallbacks = self._identities()
+        fallbacks[1] = (None, [])  # fb1 unresolved this round
+        for record in (None, self._record()):  # no record, and a non-matching one
+            with self.subTest(record=record is not None and "stale" or "fresh"):
+                role, index, problem = hc.derive_active(
+                    self._status(exit_id="mystery-node"), primary, fallbacks, "p", self.LABELS, record)
+                self.assertEqual(problem, "live_status_incomplete")
+        # With EVERY candidate resolved, the same unmatched node is provably
+        # foreign: unknown_active as always.
+        primary, fallbacks = self._identities()
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="mystery-node"), primary, fallbacks, "p", self.LABELS, None)
         self.assertEqual((role, index, problem), ("unknown", None, None))
 
     def test_malformed_exit_status_fails_closed(self):
@@ -1682,6 +1704,17 @@ class MultiVerdictCliTests(unittest.TestCase):
                          ("switch-to-fallback", "delisted_next_fallback"))
         self.assertEqual(decision["target_index"], 0)
         self.assertEqual(decision["target_label"], "fb-a")
+
+    def test_l17_unmatched_live_plus_unresolved_no_state_write(self):
+        # Fresh state (no claiming record), fb-b unresolved, live exit is some
+        # unmatched node: the cycle fails closed — live_status_incomplete, no
+        # switch proposal, and NO state file is written.
+        self._write_status(active="mystery-node", drop_peers=("fb-b",))
+        rc, out = self._verdict()
+        payload = json.loads(out)
+        self.assertEqual(payload["decision"]["reason"], "live_status_incomplete")
+        self.assertEqual(payload["decision"]["action"], "none")
+        self.assertFalse(self.state_file.exists())
 
     def test_l16_unresolved_cycle_keeps_identity_baseline_for_reset(self):
         # GPT plan-confirm finding: an unresolved cycle must NOT blank the

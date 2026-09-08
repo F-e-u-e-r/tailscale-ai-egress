@@ -500,12 +500,6 @@ run_cycle() {
     release_lock
     return 0
   fi
-  if [ "$APPLY" != "1" ]; then
-    note "[observe] proposed: $action -> $target_label (reason=$reason); re-run with --apply to act"
-    release_lock
-    return 0
-  fi
-
   # Pre-switch gate for fallback targets: the verdict must carry a usable
   # target_index whose configured slot text equals its target_label. Any
   # divergence means a corrupted/foreign verdict — fail the cycle loudly with
@@ -552,6 +546,12 @@ run_cycle() {
     fi
   else
     target_index=""
+  fi
+
+  if [ "$APPLY" != "1" ]; then
+    note "[observe] proposed: $action -> $target_label (reason=$reason); re-run with --apply to act"
+    release_lock
+    return 0
   fi
 
   apply_switch "$target_role" "$target_label" "$target_index"

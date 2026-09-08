@@ -140,7 +140,10 @@ re-ordering). With a list, the controller can also fail over **between
 fallbacks**: when the active fallback goes down and the primary cannot be
 restored, the highest-priority other fallback that passed its ping this
 cycle is selected. A single-value `FALLBACK_EXIT_NODE` keeps the exact
-v1.3.0 behavior.
+v1.3.0 behavior for steady-state, same-configuration operation (the one
+deliberate improvement: replacing the sole fallback while the controller
+still sits on the removed node now recovers via `delisted` instead of
+dead-ending — see below).
 
 - **Validation (fail-closed, before any probing):** an empty entry (stray
   comma), a duplicate entry, or an entry equal to `PRIMARY_EXIT_NODE` is a

@@ -351,7 +351,11 @@ def normalize_state(raw: Any, primary_label: str, fallback_labels: list[str]) ->
     defaults. ``last_switch_epoch``/``last_switch_at`` are retained in every
     readable case: the cooldown clock must survive config edits."""
     base = default_state(primary_label, fallback_labels)
-    if not isinstance(raw, dict) or raw.get("schema_version") not in (1, STATE_SCHEMA_VERSION):
+    version = raw.get("schema_version") if isinstance(raw, dict) else None
+    # Type-strict: bool is an int subclass (True == 1) and 2.0 == 2, so a
+    # malformed schema_version could otherwise smuggle a full state — active
+    # evidence, cooldown clock and all — past the defensive reset.
+    if not isinstance(version, int) or isinstance(version, bool) or version not in (1, STATE_SCHEMA_VERSION):
         return base
 
     raw_nodes = raw.get("nodes")
@@ -635,6 +639,13 @@ def derive_active(
             if not identity[0] and not identity[1]:
                 return "unknown", None, "live_status_incomplete"
         return "unknown", None, None
+    if any(not identity[0] and not identity[1] for identity in fallback_identities):
+        # An UNMATCHED live exit node while ANY bench candidate is unresolved:
+        # the live node cannot be proven foreign — it may BE that unresolved
+        # candidate (e.g. a fresh/stale state file offers no claiming record).
+        # The never-override rule needs a provable classification, so fail the
+        # cycle closed instead of degrading into a probe + state write.
+        return "unknown", None, "live_status_incomplete"
     return "unknown", None, None
 
 
