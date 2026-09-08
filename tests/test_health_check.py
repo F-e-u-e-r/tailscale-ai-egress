@@ -1087,6 +1087,17 @@ class DeriveActiveTests(unittest.TestCase):
                 role, index, problem = hc.derive_active(
                     self._status(exit_id="mystery-node"), primary, fallbacks, "p", self.LABELS, record)
                 self.assertEqual(problem, "live_status_incomplete")
+        # The REPOINTED path needs the same guard (GPT confirm-round Major):
+        # live matches the retained record, its label now resolves to a
+        # different node, AND another bench slot is unresolved — the live node
+        # may BE that unresolved candidate, so this too fails closed.
+        primary, fallbacks = self._identities()
+        fallbacks[1] = ("nodeNEW", ["100.64.0.21"])  # fb1 re-pointed
+        fallbacks[2] = (None, [])  # fb2 unresolved
+        record = self._record(label="fb1", node_id="node1", ips=["100.64.0.11"])
+        role, index, problem = hc.derive_active(
+            self._status(exit_id="node1"), primary, fallbacks, "p", self.LABELS, record)
+        self.assertEqual(problem, "live_status_incomplete")
         # With EVERY candidate resolved, the same unmatched node is provably
         # foreign: unknown_active as always.
         primary, fallbacks = self._identities()
@@ -1715,6 +1726,22 @@ class MultiVerdictCliTests(unittest.TestCase):
         self.assertEqual(payload["decision"]["reason"], "live_status_incomplete")
         self.assertEqual(payload["decision"]["action"], "none")
         self.assertFalse(self.state_file.exists())
+
+    def test_l17_preseeded_repointed_plus_unresolved_no_state_change(self):
+        # Preseeded variant (GPT confirm-round Major): the state CLAIMS the
+        # live node as fb-b; fb-b then re-points to a new node while fb-c is
+        # unresolved. The live node cannot be proven foreign — fail closed,
+        # nothing persisted.
+        self._write_status(active="fb-b")
+        self._verdict()  # seed: active fallback fb-b/nodeB
+        before = self.read_state()
+        self._write_status(active="nodeB", repoint={"fb-b": "nodeNEW"}, drop_peers=("fb-c",))
+        rc, out = self._verdict()
+        payload = json.loads(out)
+        self.assertEqual(payload["decision"]["reason"], "live_status_incomplete")
+        self.assertEqual(payload["decision"]["action"], "none")
+        self.assertIsNone(payload["decision"]["target_index"])
+        self.assertEqual(self.read_state(), before)  # nothing persisted
 
     def test_l16_unresolved_cycle_keeps_identity_baseline_for_reset(self):
         # GPT plan-confirm finding: an unresolved cycle must NOT blank the

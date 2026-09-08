@@ -630,16 +630,25 @@ def derive_active(
         and bool(record_label)
         and (record_id is not None or bool(record_ips))
     )
+    unresolved_bench = any(not identity[0] and not identity[1] for identity in fallback_identities)
     if coherent and matches(record_id, record_ips):
         configured = [(primary_label, primary_identity)] + list(zip(fallback_labels, fallback_identities))
         still_configured = [identity for label, identity in configured if _labels_equivalent(record_label, label)]
         if not still_configured:
+            # Delisted: safe even with an unresolved bench slot — recovery
+            # only restores the primary or walks, and the walk's selectability
+            # bit already skips every unresolved candidate.
             return "delisted", None, None
         for identity in still_configured:
             if not identity[0] and not identity[1]:
                 return "unknown", None, "live_status_incomplete"
+        if unresolved_bench:
+            # The retained label was re-pointed at a different node, but with
+            # ANY bench candidate unresolved the live node cannot be proven
+            # foreign (it may BE that unresolved candidate now) — fail closed.
+            return "unknown", None, "live_status_incomplete"
         return "unknown", None, None
-    if any(not identity[0] and not identity[1] for identity in fallback_identities):
+    if unresolved_bench:
         # An UNMATCHED live exit node while ANY bench candidate is unresolved:
         # the live node cannot be proven foreign — it may BE that unresolved
         # candidate (e.g. a fresh/stale state file offers no claiming record).
