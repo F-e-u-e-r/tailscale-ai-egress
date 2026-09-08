@@ -108,9 +108,10 @@ kept for the record.
   [design/multi-fallback.md](design/multi-fallback.md).
   *Acceptance:* an ordered fallback list is tried in order; `schema_version: 2`
   state is written and pre-existing v1 state still reads; a single-element list
-  stays behaviorally identical to v1.3.0; tests cover ordered fallback, the v1
-  read-compat path, and a v1.3.0-recorded semantic golden. **(met — PRs
-  #32/#33.)**
+  stays behaviorally identical to v1.3.0 for steady-state, same-configuration
+  operation (the delisted-active recovery above is the deliberate config-edit
+  exception, outside that pin); tests cover ordered fallback, the v1 read-compat
+  path, and a v1.3.0-recorded semantic golden. **(met — PRs #32/#33.)**
 
 ---
 
