@@ -386,9 +386,23 @@ Three layers, preferred first:
 
 ## Exit-Node Failover (Full Traffic)
 
-Connector failover above only covers the selected AI domains. If you also route *all* other traffic through an exit node, note that Tailscale does not provide priority-ordered exit-node failover (only `--exit-node=auto:any`, which selects by latency rather than a fixed primary/fallback order). `failover-exit-node.sh` adds a client-side primary/fallback exit-node controller for macOS and Linux.
+Connector failover above only covers the selected AI domains. If you also route *all* other traffic through an exit node, note that Tailscale does not provide priority-ordered exit-node failover (only `--exit-node=auto:any`, which selects by latency rather than a fixed primary/fallback order). `failover-exit-node.sh` adds a client-side exit-node controller for macOS and Linux: one primary plus an **ordered fallback list**.
 
-It probes a primary and fallback exit node and, when run with `--apply`, switches the local `tailscale set --exit-node` to the fallback when the primary fails its tailnet ping, then switches back when the primary recovers (unless `RESTORE_PRIMARY=0`). It is observe-first: without `--apply` it only reports the proposed action, and it only ever switches to a node that passed its ping in the same cycle.
+It probes the primary and every configured fallback each cycle and, when run with `--apply`, switches the local `tailscale set --exit-node` to the highest-priority fallback that passed its ping when the primary fails, then switches back when the primary recovers (unless `RESTORE_PRIMARY=0`). With more than one fallback (`FALLBACK_EXIT_NODE=node-b,node-c,node-d` — order is priority), the controller also fails over **between fallbacks**: when the active fallback goes down and the primary cannot be restored, the next verified fallback in configuration order takes over. It is observe-first: without `--apply` it only reports the proposed action, and it only ever switches to a node that passed its ping in the same cycle; a switch reads back against the **concrete target node's identity** (not just its role), so a switch that did not take is reported as failed — nothing is recorded and the cooldown clock is untouched.
+
+Two operational notes for the list form (details in
+[Configuration](Configuration.md#ordered-fallback-list-v14)):
+
+- **Editing the list while the controller sits on a removed node** is
+  recovered loudly: the next cycle reports `active_role=delisted` and either
+  restores the primary (under `RESTORE_PRIMARY=1`, once the primary is
+  verified UP) or walks the new bench from the top — where v1.3.0 dead-ended
+  on `unknown_active`. Cooldown still applies; a node the state file never
+  claimed is still never overridden.
+- The `FAILOVER_NOTIFY_CMD` hook additionally receives
+  `FAILOVER_FALLBACK_INDEX` (the bench ordinal for fallback targets, `0` for
+  a single-element list, empty for primary targets);
+  `FAILOVER_ROLE`/`FAILOVER_LABEL` values are unchanged.
 
 By default, the controller manages an *already selected* exit node and does not
 turn one on by itself. Select your primary once first, or explicitly let the

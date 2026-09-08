@@ -44,8 +44,10 @@ usage() {
 Usage: ./failover-exit-node.sh [--once|--watch] [--apply] [--dry-run] [--egress]
 
 Client-side exit-node failover controller (macOS + Linux). Probes a primary and
-fallback exit node via scripts/health_check.py and, when told to, switches the
-local `tailscale set --exit-node` between them.
+an ORDERED list of fallback exit nodes via scripts/health_check.py and, when
+told to, switches the local `tailscale set --exit-node` between them — including
+fallback-to-fallback when the active fallback goes down and the primary cannot
+be restored.
 
 Safety: observe-first. Without --apply this only reports the proposed action.
 iOS/Android cannot run this watcher (switch the exit node in the app); Windows
@@ -63,7 +65,11 @@ Options:
   -h, --help   Show this help.
 
 Configuration (environment or generated/failover.env):
-  PRIMARY_EXIT_NODE, FALLBACK_EXIT_NODE   exit node hostname / MagicDNS / IP
+  PRIMARY_EXIT_NODE    exit node hostname / MagicDNS / IP
+  FALLBACK_EXIT_NODE   one fallback, or a comma-separated ORDERED list
+                       (order is priority; e.g. node-b,node-c,node-d). Every
+                       node is probed every cycle; empty entries, duplicates,
+                       and a fallback equal to the primary are refused.
   PROBE_TARGET (https://ipinfo.io)        egress probe URL
   CHECK_INTERVAL (30)  FAIL_THRESHOLD (3)  OK_THRESHOLD (3)  COOLDOWN (60)
   PING_TIMEOUT (5)     PROBE_HTTP_TIMEOUT (5)
@@ -73,9 +79,12 @@ Configuration (environment or generated/failover.env):
 Notification (environment only; NOT read from generated/failover.env):
   FAILOVER_NOTIFY_CMD  opt-in command run after a real switch attempt. Receives
                        FAILOVER_EVENT (switched|failed), FAILOVER_ROLE,
-                       FAILOVER_LABEL, and FAILOVER_REASON in the environment.
-                       Its exit status is ignored and cannot change the outcome;
-                       keep it fast so it does not stall the controller.
+                       FAILOVER_LABEL, FAILOVER_REASON, and
+                       FAILOVER_FALLBACK_INDEX (the bench ordinal for fallback
+                       targets — 0 for a single-element list — empty for
+                       primary targets) in the environment. Its exit status is
+                       ignored and cannot change the outcome; keep it fast so
+                       it does not stall the controller.
 EOF
 }
 
@@ -355,15 +364,30 @@ run_verdict() {
   python3 "$HEALTH" "${args[@]}"
 }
 
-current_active_role() {
-  python3 "$HEALTH" active-role --primary "$PRIMARY_EXIT_NODE" --fallback "$FALLBACK_EXIT_NODE"
+# Trim leading/trailing whitespace, matching the engine's per-entry strip so
+# the cross-check below compares the same spelling the engine parsed.
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
 }
 
 record_switch() {
-  python3 "$HEALTH" record-switch \
-    --state-file "$STATE_FILE" \
-    --primary "$PRIMARY_EXIT_NODE" --fallback "$FALLBACK_EXIT_NODE" \
-    --role "$1" >/dev/null
+  local role="$1" index="$2" label="$3"
+  local args=(
+    record-switch
+    --state-file "$STATE_FILE"
+    --primary "$PRIMARY_EXIT_NODE" --fallback "$FALLBACK_EXIT_NODE"
+    --role "$role"
+  )
+  if [ "$role" = "fallback" ]; then
+    # The engine's fail-closed pairing: index + the readback-verified label
+    # together, so the shell's view of the bench can never silently diverge
+    # from the engine's (a mismatch refuses with nothing written).
+    args+=(--fallback-index "$index" --label "$label")
+  fi
+  python3 "$HEALTH" "${args[@]}" >/dev/null
 }
 
 run_tailscale_set() {
@@ -387,7 +411,7 @@ run_tailscale_set() {
 }
 
 apply_switch() {
-  local role="$1" label="$2"
+  local role="$1" label="$2" index="$3"
   note "[apply] switching exit node -> $label (role=$role)"
   if ! run_tailscale_set "$label"; then
     warn "apply_failed: 'tailscale set --exit-node=$label' returned non-zero"
@@ -403,21 +427,25 @@ apply_switch() {
       return 1
     fi
   fi
-  local live
-  live="$(current_active_role 2>/dev/null || printf 'error')"
-  if [ "$live" = "$role" ]; then
-    if ! record_switch "$role"; then
-      # The exit node was switched, but persisting the new role + cooldown clock
-      # failed (disk full, permissions, state lock). Report non-zero so callers
-      # and monitoring do not treat this as a clean success.
-      warn "switch_state_persist_failed: exit node is now $label (role=$role) but recording state failed; cooldown not saved"
-      return 1
-    fi
-    note "[ok] exit node is now $label (role=$role); recorded switch"
-    return 0
+  # Identity-verified readback: confirm the live exit node IS the concrete
+  # target node (never the role class alone) — a fallback-to-fallback switch
+  # that did not take must read back as FAILURE: no state record, no cooldown
+  # restart, FAILOVER_EVENT=failed.
+  if ! python3 "$HEALTH" active-role \
+    --primary "$PRIMARY_EXIT_NODE" --fallback "$FALLBACK_EXIT_NODE" \
+    --expect-label "$label" >/dev/null; then
+    warn "apply_failed: readback does not show '$label' as the live exit node"
+    return 1
   fi
-  warn "apply_failed: readback shows active role '$live', expected '$role'"
-  return 1
+  if ! record_switch "$role" "$index" "$label"; then
+    # The exit node was switched, but persisting the new role + cooldown clock
+    # failed (disk full, permissions, state lock). Report non-zero so callers
+    # and monitoring do not treat this as a clean success.
+    warn "switch_state_persist_failed: exit node is now $label (role=$role) but recording state failed; cooldown not saved"
+    return 1
+  fi
+  note "[ok] exit node is now $label (role=$role); recorded switch"
+  return 0
 }
 
 notify_hook() {
@@ -425,15 +453,18 @@ notify_hook() {
   # via the environment. It runs synchronously but its exit status is discarded
   # (`|| true`), so a broken hook can never change the switch outcome. Keep the
   # command fast: a hook that hangs will stall the controller loop.
+  # FAILOVER_FALLBACK_INDEX is additive: the bench ordinal for fallback targets
+  # (0 for a single-element list), empty for primary targets.
   [ -n "$FAILOVER_NOTIFY_CMD" ] || return 0
   FAILOVER_EVENT="$1" FAILOVER_ROLE="$2" FAILOVER_LABEL="$3" FAILOVER_REASON="$4" \
+    FAILOVER_FALLBACK_INDEX="$5" \
     sh -c "$FAILOVER_NOTIFY_CMD" || true
 }
 
 run_cycle() {
   acquire_lock
-  local decision action reason target_role target_label event active_role k v rc
-  action=""; reason=""; target_role=""; target_label=""; event=""; active_role=""
+  local decision action reason target_role target_label target_index event active_role k v rc
+  action=""; reason=""; target_role=""; target_label=""; target_index=""; event=""; active_role=""
   if ! decision="$(run_verdict)"; then
     warn "health engine verdict failed; skipping this cycle"
     release_lock
@@ -445,6 +476,7 @@ run_cycle() {
       reason) reason="$v" ;;
       target_role) target_role="$v" ;;
       target_label) target_label="$v" ;;
+      target_index) target_index="$v" ;;
       event) event="$v" ;;
       active_role) active_role="$v" ;;
     esac
@@ -468,22 +500,70 @@ run_cycle() {
     release_lock
     return 0
   fi
+  # Pre-switch gate for fallback targets: the verdict must carry a usable
+  # target_index whose configured slot text equals its target_label. Any
+  # divergence means a corrupted/foreign verdict — fail the cycle loudly with
+  # NO switch and NO notify (this is a failed verdict, not a failed attempt).
+  if [ "$target_role" = "fallback" ]; then
+    case "$target_index" in
+      ''|*[!0-9]*|0[0-9]*)
+        # Rejects non-digits AND a leading zero (except bare "0"): a
+        # leading-zero token would hit Bash's octal parsing in the array
+        # subscript below, and the engine never emits one — its presence
+        # proves a forged/corrupt verdict.
+        warn "invalid verdict: fallback target without a usable target_index ('$target_index'); skipping this cycle"
+        release_lock
+        return 1
+        ;;
+    esac
+    # Digit-count cap BEFORE any arithmetic or array subscript: an oversized
+    # decimal (e.g. 2^64) would OVERFLOW in shell arithmetic and could wrap to
+    # a valid small index.
+    if [ "${#target_index}" -gt 6 ]; then
+      warn "invalid verdict: target_index '$target_index' is absurdly large; skipping this cycle"
+      release_lock
+      return 1
+    fi
+    local slots slot raw_slot count
+    slots=()
+    while IFS= read -r raw_slot; do
+      slots+=("$(trim_ws "$raw_slot")")
+    done <<<"${FALLBACK_EXIT_NODE//,/$'\n'}"
+    count="${#slots[@]}"
+    if [ "$target_index" -ge "$count" ]; then
+      warn "invalid verdict: target_index $target_index out of range for $count configured fallback(s); skipping this cycle"
+      release_lock
+      return 1
+    fi
+    slot="${slots[$target_index]}"
+    # Exact-text against the raw slot string: both spellings come verbatim
+    # from the same FALLBACK_EXIT_NODE split (the engine never respells
+    # target_label), so a byte mismatch proves divergence -> fail closed.
+    if [ "$slot" != "$target_label" ]; then
+      warn "invalid verdict: target_label '$target_label' does not match configured slot $target_index ('$slot'); skipping this cycle"
+      release_lock
+      return 1
+    fi
+  else
+    target_index=""
+  fi
+
   if [ "$APPLY" != "1" ]; then
     note "[observe] proposed: $action -> $target_label (reason=$reason); re-run with --apply to act"
     release_lock
     return 0
   fi
 
-  apply_switch "$target_role" "$target_label"
+  apply_switch "$target_role" "$target_label" "$target_index"
   rc=$?
   release_lock
   # Fire the opt-in notification after releasing the lock (so a slow hook cannot
   # block another controller) and only for real switch attempts, not dry runs.
   if [ "$DRY_RUN" != "1" ]; then
     if [ "$rc" -eq 0 ]; then
-      notify_hook "switched" "$target_role" "$target_label" "$reason"
+      notify_hook "switched" "$target_role" "$target_label" "$reason" "$target_index"
     else
-      notify_hook "failed" "$target_role" "$target_label" "$reason"
+      notify_hook "failed" "$target_role" "$target_label" "$reason" "$target_index"
     fi
   fi
   return "$rc"

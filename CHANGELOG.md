@@ -13,6 +13,63 @@ both Python CLIs report it with `--version`.
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-fallback exit nodes (Phase 6).** `FALLBACK_EXIT_NODE` accepts a
+  comma-separated, ORDERED list (`node-b,node-c,node-d`; order is priority — no
+  weights, no round-robin). The exit-node controller can now fail over
+  **between fallbacks**: when the active fallback goes down and the primary
+  cannot be restored, the highest-priority other fallback verified this cycle
+  is selected (`fallback_down_next_fallback`), opening v1.3.0's `both_down`
+  dead end. Every configured node is probed every cycle with full hysteresis;
+  fail-closed list validation (empty entry / duplicate / equal-to-primary,
+  canonical-address-aware for IPs) runs before any probing. Multi-only reasons:
+  `all_fallbacks_down`, `no_fallback_verified`, `fallback_down_next_fallback`,
+  `all_down`. Design: docs/design/multi-fallback.md.
+- **Delisted-active recovery.** Removing the ACTIVE node from the configured
+  list no longer dead-ends on `unknown_active`: the node is provably ours by
+  the state's own retained record, classifies as the runtime-only
+  `active_role=delisted`, and recovers loudly — restore the primary under the
+  strict verified-UP bar (`delisted_restore_primary`) or walk the bench from
+  the top (`delisted_next_fallback` / `delisted_no_target`); cooldown applies.
+  A live node the state never claimed is still never overridden.
+- **Identity-verified readback.** `active-role` gains `--expect-label <label>`
+  (exit 0 only when the live exit node IS that concrete node, canonical-IP
+  aware); the controller confirms every switch against the concrete target,
+  so a fallback-to-fallback `tailscale set` that did not take reads back as
+  FAILURE: no state record, no cooldown restart, `FAILOVER_EVENT=failed`.
+- **`record-switch` fail-closed pairing.** New `--fallback-index <n>` and
+  `--label <label>`: both are required for fallback records on multi
+  configurations, the index must be in range, and the configured slot at that
+  index must match the label — a divergence between the shell's and the
+  engine's view of the bench refuses with nothing written (single-element
+  lists default the index to 0).
+- **Verdict report additives (report schema stays 1):** top-level
+  `fallbacks[]` (every bench probe, in order; the legacy `fallback` key stays
+  pinned to `fallbacks[0]`), `decision.target_index`,
+  `decision.fallback_states[]` (the legacy scalar `fallback_state` keeps
+  meaning slot 0), and a `target_index=<n>` text line for fallback targets.
+  The notify hook additionally receives `FAILOVER_FALLBACK_INDEX`.
+
+### Changed
+
+- **Exit-node controller state file moves to `schema_version: 2`**
+  (`nodes.fallbacks[]`, ordered; additive `active.fallback_index`). A
+  well-formed v1 file is read-compatible one-way (its `nodes.fallback` seeds
+  slot 0) and is upgraded on the next write. Reordering the configured list
+  resets per-node health history (slots are positional) and re-derives the
+  active index from its label; `last_switch_epoch`/`last_switch_at` survive
+  every configuration edit (a config change never unlocks a rapid re-switch).
+  The state and report schema constants are now split
+  (`STATE_SCHEMA_VERSION = 2`, `REPORT_SCHEMA_VERSION = 1`); the `probe` /
+  `verdict` / `connectors` JSON payloads keep `schema_version: 1` with
+  additive fields only. Downgrade runbook: docs/Configuration.md.
+- **Connectors nested default guard:** a DIRECT `health_check.py connectors`
+  invocation no longer adopts `FALLBACK_EXIT_NODE` as its fallback-connector
+  default when it contains a comma list — the default resolves to unset; set
+  `FALLBACK_CONNECTOR` explicitly. `monitor-connectors.sh` is unaffected (it
+  always passes `--fallback`).
+
 ## [1.3.0] - 2026-09-03
 
 ### Added
