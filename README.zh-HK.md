@@ -7,6 +7,7 @@
 ![Version](https://img.shields.io/badge/version-1.4.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20VPS%20%C2%B7%20POSIX%20shell-lightgrey)
 ![Telemetry](https://img.shields.io/badge/telemetry-none-brightgreen)
+![status](https://img.shields.io/badge/status-LIVE-2ee6a6)
 
 > `README.md` 是最新內容的主要來源。本中文文件使用香港繁體中文。
 
